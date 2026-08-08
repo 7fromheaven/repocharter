@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": ".agents/compatibility.json",
+  "title": ".agents/compatibility.json",
   "description": "The machine-readable declaration of a repository's agent-context layout. Never loaded into any model's context; read only by agentkit and the hooks. This is the anti-drift anchor: every claim here is asserted against the filesystem by `agentkit verify`, because a declaration nobody checks is how drift starts.",
   "type": "object",
   "required": ["agentkitVersion", "canonical", "enforcement", "autoMemory", "budgets"],

@@ -3,9 +3,9 @@
 The mechanical layer of the portable agent-context system. One vendored copy per
 repository, one version stamp, one command to install and one to check.
 
-**Status: in production across a private fleet of repositories.** 176 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 176 tests, no dependencies:
 `python3 kit/tests/run_tests.py`. Every rule below was found by a real migration, and the
-commentary throughout cites the failure that produced it.
+commentary cites the failure that produced it.
 
 ## Install into a repository
 

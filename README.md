@@ -320,11 +320,10 @@ kit/templates/     AGENTS.md skeleton, linter config, CI workflow
 kit/tests/         176 tests, no dependencies, mostly negative
 ```
 
-**Evidence standard.** Every measurement quoted here was taken rather than cited: byte budgets
-read from the harness's own source, gate behaviour recorded by firing commands at the installed
-hook, adherence figures taken from published experiments with the reasoning stated. Where a number
-is inferred it says so. Several vendor documentation claims were refuted by reading the shipped
-source, and those corrections are noted where they appear.
+**Evidence standard.** Every measurement quoted here was taken rather than cited: byte budgets read
+from the harness's own source, gate behaviour recorded by firing commands at the installed hook,
+adherence figures taken from published experiments with the reasoning stated. Where a number is
+inferred it says so. Several vendor documentation claims were refuted by reading the shipped source.
 
 **Provenance.** This was extracted from a private repository where it runs across a fleet of
 production projects. The migration history, per-repository measurements and open decisions stay
