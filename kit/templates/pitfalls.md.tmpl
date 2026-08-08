@@ -1,0 +1,42 @@
+# Pitfalls
+
+<!--
+  VERIFIED NEGATIVE RESULTS ONLY. What was attempted, what happened, and the observable
+  that proves it. Not a journal, not a lessons ledger, not a place for anything that went
+  right.
+
+  HARD CAP: 100 lines / 8 KB, enforced by `agentkit verify`. The cap is the point. This
+  file is REWRITTEN, never appended to — which is what keeps it inside the no-append-only
+  refusal rather than breaching it, and it is the same rule STATUS.md already lives under.
+
+  NEVER always-loaded. It is named by path in AGENTS.md's routing block and costs one
+  routing line at startup.
+
+  EVICTION, checked whenever the file is at cap:
+    1. A pitfall now caught by a mechanical gate is DELETED, citing the gate in the commit
+       message. The gate IS the knowledge; keeping both is restatement. This should be the
+       most common eviction by far.
+    2. A pitfall describing code that no longer exists is deleted.
+    3. Still at cap: the oldest `last-confirmed` goes, noted in the commit body so a
+       re-encounter reads as a regression rather than a novelty.
+
+  There is no archive. A deleted pitfall is in git history, which is the only append-only
+  store this system permits.
+
+  FORMAT: one entry per pitfall, one line of context each. Detail belongs in the decision
+  record or in the test that now covers it.
+-->
+
+## Format
+
+```
+### <short name>
+- tried: <what was attempted>
+- happened: <what actually went wrong>
+- observable: <the thing that proves it — an error, a measurement, a failing command>
+- last-confirmed: YYYY-MM-DD
+```
+
+## Entries
+
+<!-- None yet. Add the first one the next time an approach is tried and fails. -->

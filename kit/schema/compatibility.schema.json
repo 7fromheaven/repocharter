@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": ".agents/compatibility.json",
+  "description": "The machine-readable declaration of a repository's agent-context layout. Never loaded into any model's context; read only by agentkit and the hooks. This is the anti-drift anchor: every claim here is asserted against the filesystem by `agentkit verify`, because a declaration nobody checks is how drift starts.",
+  "type": "object",
+  "required": ["agentkitVersion", "canonical", "enforcement", "autoMemory", "budgets"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+
+    "policyDraft": {
+      "type": "object",
+      "description": "Output of `agentkit policy scaffold`. NOTHING HERE IS ENFORCED. Entries are harvested from the repo's existing gate scripts and AGENTS.md so review is cheap; a human promotes them into `policy`. Auto-enforcing a regex scraped from a shell script is how a gate ends up blocking honest work and getting disabled on the next repo.",
+      "additionalProperties": true
+    },
+
+    "agentkitVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Version of the kit vendored into this repo. Drives the cross-repo drift check."
+    },
+
+    "canonical": {
+      "type": "object",
+      "description": "Every path the verifier asserts exists. Paths are repo-relative and POSIX-separated.",
+      "required": ["instructions", "shim", "project", "skills"],
+      "additionalProperties": false,
+      "properties": {
+        "instructions": { "type": "string", "default": "AGENTS.md" },
+        "shim":         { "type": "string", "default": "CLAUDE.md" },
+        "project":      { "type": "string", "default": "docs/project" },
+        "skills":       { "type": "string", "default": ".agents/skills" },
+        "research":     { "type": "string", "default": "docs/research" }
+      }
+    },
+
+    "optionalFiles": {
+      "type": "array",
+      "description": "Canonical files that exist in this repo but are not required of every repo. `obligations.md` is the built-in case: roughly one repo in four has an external counterparty, and the rest should not carry a ceremonial empty file.",
+      "items": { "type": "string" },
+      "default": []
+    },
+
+    "adapters": {
+      "type": "array",
+      "description": "Every non-native reach path. The verifier resolves each one and fails on a broken link, an absolute symlink, or a target outside the canonical skills directory.",
+      "items": {
+        "type": "object",
+        "required": ["harness", "kind"],
+        "additionalProperties": false,
+        "properties": {
+          "harness": { "enum": ["claude-code", "codex", "zcode"] },
+          "kind":    { "enum": ["relative-symlink", "import", "manual-import", "native"] },
+          "from":    { "type": "string" },
+          "to":      { "type": "string" },
+          "note":    { "type": "string" }
+        }
+      }
+    },
+
+    "enforcement": {
+      "type": "object",
+      "description": "Per-harness enforcement level. `blocking` is a claim that a deny actually denies, and `agentkit verify --self-test` is what makes the claim honest: it fires a known-forbidden call and asserts refusal. Do not declare blocking without it.",
+      "additionalProperties": false,
+      "properties": {
+        "claude-code": { "$ref": "#/$defs/enforcementLevel" },
+        "codex":       { "$ref": "#/$defs/enforcementLevel" },
+        "zcode":       { "$ref": "#/$defs/enforcementLevel" }
+      }
+    },
+
+    "autoMemory": {
+      "type": "string",
+      "enum": ["on", "off"],
+      "description": "Declared state of Claude Code auto memory. Asserted against settings.json `autoMemoryEnabled`; a mismatch is an error. Default is `on` — Anthropic's own split puts learnings there. Set `off` where a data boundary exists, and say why in autoMemoryReason."
+    },
+
+    "autoMemoryReason": {
+      "type": "string",
+      "description": "Required when autoMemory is `off`. An unreviewed store the agent writes to unprompted is a data-at-rest surface; if that is the reason, name the data."
+    },
+
+    "budgets": {
+      "type": "object",
+      "description": "Every constant, each with its source. These live here and nowhere else so that 41 repos do not hardcode them.",
+      "required": ["codexProjectDocMaxBytes", "claudeLineTarget"],
+      "additionalProperties": false,
+      "properties": {
+        "codexProjectDocMaxBytes": {
+          "type": "integer",
+          "default": 32768,
+          "description": "HARD FAIL threshold for the Codex-visible chain. The real shipped default, not a fraction of it: gating below what is enforced buys nothing and costs real deletions from a safety file."
+        },
+        "codexBudgetSource": {
+          "type": "string",
+          "description": "Where the constant was read, with a commit SHA and a date. If this is stale, re-read before trusting the number."
+        },
+        "claudeLineTarget": {
+          "type": "integer",
+          "default": 200,
+          "description": "WARN threshold on the Claude-visible repo-controlled set. Anthropic publishes no byte cap, only an adherence target, and a qualitative target earns a warning rather than a build failure."
+        },
+        "skillWarnCount":     { "type": "integer", "default": 20 },
+        "skillBodyMaxTokens": { "type": "integer", "default": 5000 },
+        "pitfallsMaxLines":   { "type": "integer", "default": 100 },
+        "pitfallsMaxBytes":   { "type": "integer", "default": 8192 }
+      }
+    },
+
+    "policy": {
+      "type": "object",
+      "description": "What the mechanical gates enforce. Read at runtime by the Edit/Write and MCP hooks, and compiled into settings.json permissions.deny by `agentkit apply`. Anthropic's steer is followed here: hard tool/path blocks go to permissions.deny, and hooks carry only what permissions cannot express.",
+      "additionalProperties": false,
+      "properties": {
+        "protectedBranches": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["main", "master"],
+          "description": "Push to these asks; force-push to these is denied."
+        },
+        "denyBashPatterns": {
+          "type": "array",
+          "description": "Repo-specific Bash denials, read at runtime by the Bash gate. Harvest these with `agentkit policy scaffold` rather than writing them from scratch — a fieldbook repo's existing gate script already encodes its real fences.",
+          "items": {
+            "type": "object",
+            "required": ["pattern", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "pattern": { "type": "string", "description": "POSIX ERE, matched against the command with grep -E" },
+              "reason": { "type": "string", "description": "Shown on denial. A gate that explains itself is one people fix rather than route around." }
+            }
+          },
+          "default": []
+        },
+        "askBashPatterns": {
+          "type": "array",
+          "description": "Same shape as denyBashPatterns, but prompts instead of refusing. For the reversible-but-consequential class.",
+          "items": {
+            "type": "object",
+            "required": ["pattern", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "pattern": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          },
+          "default": []
+        },
+        "denyWritePaths": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["glob", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "glob":   { "type": "string" },
+              "reason": { "type": "string", "description": "Shown to the agent on denial. A gate that explains itself is one people fix rather than route around." }
+            }
+          },
+          "default": [],
+          "description": "Paths no agent may Edit or Write. Compiled into permissions.deny AND checked by the hook, deliberately twice: permissions.deny is the client-enforced layer, the hook is what still fires if a settings layer is missing."
+        },
+        "denyMcpTools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["pattern", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "pattern": { "type": "string", "description": "Python regex matched against the full tool name, e.g. ^mcp__.*__deploy_to_vercel$" },
+              "reason":  { "type": "string" },
+              "whenArgMatches": {
+                "type": "object",
+                "description": "Optional narrowing: deny only when a named argument matches a regex. Lets `deploy(target=preview)` through while denying `deploy(target=production)`.",
+                "additionalProperties": { "type": "string" }
+              }
+            }
+          },
+          "default": []
+        },
+        "measureOnWrite": {
+          "type": "array",
+          "description": "The external-observation gates that refusal 6 must never delete. Each entry names a path glob and a measurement to report before and after an edit. These are gates on the world, not rituals about the agent's own reasoning; deleting one removes a check that exists because a human cannot verify the output themselves.",
+          "items": {
+            "type": "object",
+            "required": ["glob", "measure", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "glob":    { "type": "string" },
+              "measure": { "enum": ["script-lengths", "byte-size", "line-count"] },
+              "scripts": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Unicode script names for `script-lengths`, e.g. [\"Cyrillic\"]. Counted per script so a change to non-Latin text is visible to an operator who cannot read it."
+              },
+              "reason":  { "type": "string" }
+            }
+          },
+          "default": []
+        }
+      }
+    },
+
+    "fallbacks": {
+      "type": "object",
+      "description": "What to do when a harness lacks a feature this layout assumes. Adopted from a repository that arrived at it independently and had something the kit did not: the portability story was written as 'these three harnesses support X' with nothing said about the fourth. A named degradation path is what stops a missing feature becoming an unrecorded gap.",
+      "additionalProperties": { "type": "string" },
+      "examples": [{
+        "missingSkillDiscovery": "Read .agents/skills/project-memory/SKILL.md directly",
+        "missingPlanMode": "Use the active conversation plus docs/project/PLAN.md",
+        "missingSubagents": "Execute independent work sequentially",
+        "missingHooks": "Run `agentkit verify` before handoff"
+      }]
+    },
+
+    "retiredPaths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Globs holding content that is retired but still checked in — a fallback mirror, a superseded nested repo, an archive kept for reference. `agentkit apply` feeds these into .agnix.toml's exclude list. Without it, a retired copy of the OLD system gets linted as if it were live: on one repo a retired nested mirror produced 84 of 91 errors, which is how a finished migration reads as a failure.",
+      "examples": [["beast/**", "archive/v1/**"]]
+    },
+
+    "harnessWritten": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Glob allowlist of paths the harness creates itself and the verifier must tolerate. Claude Code writes real skill directories under .claude/skills (`/verify` writes verify/, `/run-skill-generator` writes run-<name>/), so a verifier that errors on any non-symlink entry breaks the first time a shipped feature is used. That bug was live in a real repository and this field is its permanent fix."
+    },
+
+    "exceptions": {
+      "type": "array",
+      "description": "The only legal place for per-repo divergence. Local cleverness in 41 places is how a system stops being one system; an exception recorded here is visible to the verifier and to the next reader.",
+      "items": {
+        "type": "object",
+        "required": ["rule", "reason", "approvedBy", "date"],
+        "additionalProperties": false,
+        "properties": {
+          "rule":       { "type": "string", "description": "Which design rule is being departed from." },
+          "reason":     { "type": "string" },
+          "approvedBy": { "type": "string" },
+          "date":       { "type": "string", "format": "date" }
+        }
+      },
+      "default": []
+    }
+  },
+
+  "$defs": {
+    "enforcementLevel": {
+      "enum": ["blocking", "advisory", "none"],
+      "description": "blocking = a deny is mechanically refused and a self-test proves it. advisory = the harness reads the rules but nothing stops it. none = the harness does not participate."
+    }
+  }
+}

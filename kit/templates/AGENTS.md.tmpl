@@ -1,0 +1,78 @@
+# {{PROJECT_NAME}} — working rules
+
+<!--
+  SECTION ORDER IS A SAFETY PROPERTY, NOT TASTE.
+
+  Codex truncates the TAIL of this file silently when the project instruction chain
+  exceeds project_doc_max_bytes (32,768 bytes as shipped). Measured: the head is kept,
+  the tail is dropped mid-file, and every later file in the chain is skipped whole. A
+  tracing::warn! fires, so the truncation is silent on the user surface only.
+
+  Therefore: never-rules first, always-rules second, everything else after. If this file
+  is ever cut, what survives is what matters most.
+
+  This file is loaded at the start of every session in every harness. It holds RULES, not
+  KNOWLEDGE. Anything an agent can derive by reading the code does not belong here — it
+  dilutes the rules it cannot derive. Anthropic's test: for each line, ask whether removing
+  it would cause a mistake. If not, cut it.
+
+  Target: under 200 lines. Hard fail: 32,768 bytes. `agentkit verify` enforces both.
+-->
+
+## Never
+
+<!-- Production fences, data boundaries, credential rules. The least recoverable content
+     in the repository. Every line here should name a consequence, not just a prohibition. -->
+
+- {{NEVER_RULES}}
+
+## Always
+
+<!-- Validation commands and the definition of done. Prefer a command someone can run over
+     a description of a standard. -->
+
+- {{ALWAYS_RULES}}
+
+## Enforcement
+
+<!-- State plainly which rules are mechanically enforced and which are prose, because a
+     fence enforced in one harness of three reads as portable and is not. An instruction is
+     a request; a PreToolUse hook that blocks the call is enforcement. Anthropic:
+     "Claude treats them as context, not enforced configuration. To block an action
+     regardless of what Claude decides, use a PreToolUse hook instead." -->
+
+Mechanically enforced (the client refuses, regardless of what the agent decides):
+
+- {{ENFORCED_RULES}}
+
+Prose only — followed roughly a third of the time under measurement, so treat these as
+convention rather than protection:
+
+- everything in this file that is not listed above.
+
+Run `agentkit verify --self-test` to confirm the enforced list is true rather than declared.
+
+## Where things are
+
+<!-- The routing block. Names a PATH and a TRIGGER, never a summary of contents — a summary
+     is a second copy of the file, and restatement across files is how contradictions are
+     born. These files cost nothing at startup; only these lines do. -->
+
+Read these when the trigger applies. Do not read them by default.
+
+- `docs/project/SPEC.md` — product scope and locked constraints. Read before changing what
+  the product does or promises.
+- `docs/project/PLAN.md` — active milestones and acceptance gates. Read before starting work.
+- `docs/project/STATUS.md` — current state and blockers. Read at session start if resuming.
+- `docs/project/decisions/` — one decision each, immutable. Read the relevant record before
+  reversing an architectural choice.
+- `docs/project/pitfalls.md` — verified failed approaches. Read before choosing an approach
+  in an area where a previous attempt failed.
+- `docs/research/` — evidence, not truth. Never a constraint until promoted.
+
+## Project notes
+
+<!-- Genuinely unconditional context that is not a rule. Keep it short; this is the section
+     that grows without anyone noticing. -->
+
+{{PROJECT_NOTES}}

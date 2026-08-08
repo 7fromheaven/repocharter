@@ -1,0 +1,78 @@
+# agnix configuration — agentkit template.
+#
+# agnix carries 445 sourced rules, each with source URLs and a verified_on date. It is the
+# right tool for every check it already implements, and agentkit does not re-implement any
+# of them. What agentkit adds is the residue: the handful of checks that exist in no
+# catalogue, which live in kit/verify/residue.py.
+#
+# WHY THE SEVERITY BLOCK MATTERS. The rules that catch silent, unrecoverable failures ship
+# as MEDIUM, which renders as a warning. A warning is something people scroll past. Each
+# rule promoted below describes a way this repo's own safety file silently stops being
+# loaded — so each is an error here.
+#
+# One caveat worth carrying: XP-009 has the right threshold but the vendor documentation's
+# MODEL of truncation. Its example describes Codex dropping whole files; measurement on
+# codex-cli 0.147.0 shows the first over-budget file is TAIL-TRUNCATED and only later files
+# are skipped whole. The number is right, the mental model in the message is not.
+
+extend = []
+severity = "Warning"
+exclude = [
+  "node_modules/**",
+  ".git/**",
+  "target/**",
+  # evidence, not instructions; never loaded, so not gated
+  "docs/research/**",
+  # RETIRED content. Linting it reports the old system's defects as the new one's, which is
+  # how a successful migration reads as a failure. (Quarantine now lives outside the repo;
+  # this entry covers migrations performed before that change.)
+  ".agents/quarantine/**",
+  # immutable ADRs and on-demand facts — prose records, zero startup cost, not instructions
+  "docs/project/decisions/**",
+  "docs/project/reference/**",
+]
+target = "Generic"
+tools = []
+overrides = []
+max_files_to_validate = 10000
+
+[rules]
+skills = true
+hooks = true
+agents = true
+memory = true
+mcp = true
+imports = true
+cross_platform = true
+agents_md = true
+codex = true
+frontmatter_validation = true
+import_references = true
+required_fields = true
+tool_names = true
+xml_balance = true
+disabled_rules = []
+disabled_validators = []
+
+[rules.severity]
+# Amputation vectors — each one makes the repo's own instructions vanish, silently.
+CDX-003 = "Error" # AGENTS.override.md in version control: replaces AGENTS.md ENTIRELY
+AGM-006 = "Error" # nested AGENTS.md: three incompatible semantics across three harnesses
+XP-009 = "Error" # Codex chain over project_doc_max_bytes: the tail is cut in silence
+CDX-AG-004 = "Error" # AGENTS.md over its size limit, same failure by another route
+
+# Dead references — the class that passed every checker in the reference repo for a day.
+REF-001 = "Error" # an import that points at nothing
+CC-HK-008 = "Error" # a hook command that does not exist is a gate that never fires
+
+# Adherence, not safety: Anthropic publishes a target, not a cap. Warning is correct.
+CC-MEM-014 = "Warning"
+
+[tool_versions]
+
+[spec_revisions]
+
+[files]
+include_as_memory = []
+include_as_generic = []
+exclude = []
