@@ -95,11 +95,20 @@ footprint is excluded from that check, so it can always re-run over itself.
 
 ## Two failure modes this is built around
 
-**Installed but inert.** `apply` on its own gives you five gates with an empty policy, and
-`self-test` passes because it only exercises the built-in universal rules. That reads as
-green while protecting nothing repo-specific — the most dangerous state in the system,
-because nobody looks twice at a checkmark. `verify` now raises a **warning** for an empty
-policy, `apply` says so on the way out, and `fleet` prints `POLICY-EMPTY` in the table.
+**Installed but inert — narrowed on 2026-08-09, and the correction matters.** This used to
+say an empty policy protected nothing and `verify` raised a warning about it. That was true
+when the universal rules were thinner. It is now false: with no policy at all, `apply` still
+gives you a floor that denies force-push, checks-bypass and destructive database operations,
+and asks before recursive rm outside safe paths or history-losing git. For a repository that
+deploys nothing and holds no production data, **an empty policy is the correct state.**
+
+So it is a note rather than a warning, and it says what the floor covers. The residual risk
+is narrower and worth stating precisely: a repo that *does* deploy, hold credentials, or write
+to live data has fences no catalogue can guess, and an empty policy there is a real gap.
+`fleet` still prints `POLICY-EMPTY` so that case is visible across a fleet.
+
+A warning nobody can act on correctly is noise, and noise is what gets a checker switched off
+— which is the failure this whole kit exists to avoid.
 
 **Inert rules.** A pattern that silently matches nothing looks exactly like one that works.
 `policy scaffold` resolves the source script's shell variables, translates GNU escapes to

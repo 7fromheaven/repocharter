@@ -584,8 +584,9 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
     if not (policy.get("denyWritePaths") or policy.get("denyMcpTools")
             or policy.get("denyBashPatterns") or policy.get("askBashPatterns")
             or policy.get("measureOnWrite")):
-        say("NOTE: policy is empty — the gates are installed but enforce nothing repo-specific. "
-            "Run `agentkit policy scaffold` to harvest a draft from this repo's own rules.")
+        say("NOTE: policy is empty. The universal floor still applies — force-push, "
+            "checks-bypass, destructive database operations, recursive rm. Add repo rules "
+            "only for what this repo alone needs: deploys, credentials, live data.")
 
     # 4. Skill symlinks. Relative, so they survive a clone to any path.
     canonical_skills = repo / (compat["canonical"]["skills"])
@@ -953,8 +954,8 @@ def cmd_fleet(root: Path, as_json: bool, verify: bool) -> int:
         print(f"  {r['repo'][:28]:<28} {r['stage']:<12} {r['claudeBytes']:>9,} "
               f"{r['unscopedRules']:>9,}  {' '.join(flags)}")
     print()
-    print("  POLICY-EMPTY means the gates are installed and enforce nothing repo-specific.")
-    print("  That reads as green everywhere else, which is why it is called out here.")
+    print("  POLICY-EMPTY means no REPO-SPECIFIC rules. The universal floor still applies,")
+    print("  so this is a gap only for a repo that deploys, holds credentials or live data.")
     return 0
 
 

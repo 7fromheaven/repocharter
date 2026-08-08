@@ -159,6 +159,6 @@ def summarise(stage: str, m: Markers) -> list[str]:
         out.append(f"{len(m.nested_agents)} nested AGENTS.md")
     if not m.has_project_dir:
         out.append("no docs/project/ — canonical durable state does not exist yet")
-    if stage == MIGRATED and m.policy_empty:
-        out.append("policy is empty — the gates are installed but enforce nothing repo-specific")
+    # No policy line here: residue.py emits the full version immediately after this
+    # summary, and saying it twice is the kind of noise that trains a reader to skim.
     return out

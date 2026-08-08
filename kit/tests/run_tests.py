@@ -433,7 +433,18 @@ def test_residue(tmp: Path) -> None:
     rep = residue(repo)
     check("mid-migration repo reports stage 'mechanical'", rep.get("stage") == "mechanical", str(rep.get("stage")))
     check("unscoped rules are a TODO, not an error", has(rep, "todos", "paths"), str(rep)[:200])
-    check("an empty policy is flagged as a WARNING", has(rep, "warnings", "policy is EMPTY"), str(rep["warnings"])[:200])
+    # An empty policy used to be a WARNING saying the gates "enforce nothing". That was
+    # true when the universal rules were thinner and is now false: force-push,
+    # checks-bypass, destructive database operations and recursive rm all fire with no
+    # policy at all. For a repo that deploys nothing, empty is the CORRECT state — so
+    # this is a note, and it must NOT claim the repo is unprotected.
+    check("an empty policy is a note, not a warning",
+          has(rep, "notes", "policy is empty") and not has(rep, "warnings", "policy is EMPTY"),
+          str(rep.get("warnings"))[:160])
+    check("and it does not claim the gates enforce nothing",
+          not has(rep, "notes", "enforce nothing") and not has(rep, "warnings", "enforce nothing"))
+    check("it names the floor that IS active",
+          has(rep, "notes", "universal floor is active"), str(rep.get("notes"))[:200])
 
     # Same defect, but the repo now claims to be finished: it becomes an error.
     repo = make_repo(tmp / "r14")

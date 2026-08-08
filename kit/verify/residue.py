@@ -572,10 +572,19 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
         for line in stage_lib.summarise(rep.stage, markers):
             rep.note(f"  {line}")
         if rep.stage != stage_lib.NOT_STARTED and markers.policy_empty:
-            rep.warn(
-                "policy is EMPTY: the gates are installed and enforce nothing repo-specific. "
-                "This is the failure mode that reads as green everywhere else. Run "
-                "`agentkit policy scaffold` to harvest a draft from this repo's own rules."
+            # This was a WARNING, and the wording said the gates "enforce nothing".
+            # That was true when the universal rules were thinner. It is now false and
+            # actively misleading: an empty policy still gets the whole universal floor,
+            # and for a repo that deploys nothing and holds no production data an empty
+            # policy is the CORRECT state rather than a defect. A warning nobody can act
+            # on correctly is noise, and noise is what gets a checker switched off.
+            rep.note(
+                "policy is empty, which may well be right. The universal floor is active "
+                "regardless: force-push to a protected branch, checks-bypass, destructive "
+                "database operations, recursive rm outside safe paths, and history-losing "
+                "git. A policy adds what no catalogue can guess — production deploys, "
+                "credential strings, writes to live data. If this repo has none of those, "
+                "empty is correct."
             )
     except ImportError:
         pass
