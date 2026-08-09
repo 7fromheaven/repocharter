@@ -4,10 +4,10 @@
 
 [repocharter.com](https://repocharter.com)
 
-RepoCharter is a dependency-free toolkit for repositories shared across Claude Code, Codex,
-OpenCode, Hermes Agent, ZCode, and other coding-agent harnesses. It keeps project guidance in one
-place, loads detailed context only when it is needed, and wires one safety policy into the native
-controls each supported harness actually exposes.
+RepoCharter gives every coding agent in your repository the same map: what the project is, how work
+gets done, and which boundaries must not be crossed. It works across Claude Code, Codex, OpenCode,
+Hermes Agent, ZCode, and other coding-agent harnesses while keeping startup context lean and
+turning critical rules into testable guardrails wherever a harness exposes the controls.
 
 With RepoCharter, you get:
 
@@ -15,7 +15,8 @@ With RepoCharter, you get:
 - **Lean startup context** so more of the prompt is available for the work itself.
 - **Provider-native guardrails** for shell commands, file writes, MCP tools, and configuration.
 - **Proof that the guardrails run** before a repository reports verified enforcement.
-- **A safe migration path** that preserves existing hooks, settings, and project knowledge.
+- **Low-risk adoption** that previews every change and preserves existing hooks, settings, and
+  project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
 > Current version: **RepoCharter 0.3.0** · CLI: `kit/agentkit`
@@ -104,8 +105,8 @@ the checkout.
 kit/agentkit census --repo ~/dev/your-repo
 ```
 
-This captures the existing startup context and migration state so you can review the change against
-a real baseline.
+This captures the existing startup context and agent configuration so you can review the change
+against a real baseline.
 
 ### 2. Preview and apply the mechanical layer
 
@@ -216,10 +217,11 @@ against every alternate command spelling or access path.
 
 ---
 
-## Bringing an existing repository across
+## Add RepoCharter to an existing repository
 
-RepoCharter is designed to migrate a real repository without flattening the controls it already
-has.
+RepoCharter is designed for repositories with history. It installs its mechanical layer without
+replacing the instructions, project knowledge, hooks, or unrelated provider settings already
+there.
 
 ```sh
 kit/agentkit census --repo ~/dev/your-repo
@@ -227,30 +229,13 @@ kit/agentkit apply --repo ~/dev/your-repo --dry-run
 kit/agentkit apply --repo ~/dev/your-repo
 ```
 
-If the repository has a hand-written shell gate, RepoCharter can harvest a reviewable policy draft
-and compare the old and new gates before retiring anything:
+`census` is read-only. `apply --dry-run` previews the footprint, and `apply` reports every file it
+changes. This is the normal adoption path; no previous context system is required.
 
-```sh
-cd ~/dev/your-repo
-kit/agentkit policy scaffold --repo .
-# Review policyDraft in .agents/compatibility.json.
-kit/agentkit policy promote --repo .
-kit/agentkit apply --repo .
-kit/agentkit supersede --repo .
-kit/agentkit supersede --repo . --retire
-```
-
-`supersede` retires the legacy shell gate only when the replacement is no weaker on its probe
-corpus, does not block benign commands, and has no unresolved harvested rules. Retirement is
-quarantined and reversible.
-
-For broader legacy layouts, `migrate` performs the mechanical half and writes out the judgment
-calls instead of guessing:
-
-```sh
-kit/agentkit migrate --repo .
-kit/agentkit migrate --repo . --apply
-```
+RepoCharter also retains specialized compatibility tools for a recognized legacy context layout
+and hand-written Claude shell gates. They are not universal importers for arbitrary agent-memory or
+context systems, and most users can ignore them. Their exact scope and reversible workflow are in
+the [mechanical reference](kit/README.md#only-when-replacing-a-supported-legacy-system).
 
 ---
 
@@ -258,20 +243,16 @@ kit/agentkit migrate --repo . --apply
 
 | Command | Purpose |
 |---|---|
-| `census` | Measure context and migration state before touching the repository |
-| `fleet` | Run the census across repositories under one root |
+| `census` | Inspect startup context and existing agent configuration before changing anything |
 | `apply` | Install or update the mechanical layer idempotently |
-| `policy scaffold` | Harvest a reviewable draft from an existing repository gate |
-| `policy promote` | Move reviewed draft rules into live policy |
-| `supersede` | Compare and safely retire a legacy shell gate |
 | `self-test` | Exercise universal allow/deny behavior; optionally prove live Codex hooks |
 | `measure` | Fire every declared repository rule and report real coverage |
 | `verify` | Validate schema, adapters, budgets, residue, and repository checks |
-| `migrate` | Apply safe mechanical migration and surface judgment calls |
-| `revert` | Restore the last quarantined mechanical migration |
+| `fleet` | Run the census across repositories under one root |
 
-All default verification is offline and dependency-free. `verify --agnix` optionally adds the
-network-fetched shared rule catalogue.
+These are the commands most users need. The mechanical reference documents the specialized legacy
+commands separately. All default verification is offline and dependency-free. `verify --agnix`
+optionally adds the network-fetched shared rule catalogue.
 
 ---
 
@@ -304,7 +285,10 @@ enforcement.
   privilege.
 - OpenCode, Hermes Agent, ZCode, and generic harnesses remain advisory until live-tested safety
   adapters exist.
-- `supersede` compares shell gates; other legacy validator types require manual review.
+- The specialized migration utilities recognize a particular legacy directory layout and a narrow
+  hand-written Claude shell-gate shape; they are not universal importers for arbitrary context or
+  memory systems.
+- `supersede` compares supported shell gates; other validator types require manual review.
 - The toolkit is vendored into each repository rather than installed globally or delivered as a
   service.
 - RepoCharter does not synchronize credentials, connector authorization, environment files, or

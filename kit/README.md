@@ -7,8 +7,11 @@ RepoCharter is the product name. The 0.3.x executable and compatibility-facing p
 `agentkit` name so existing repositories and automation continue to work.
 
 **Status: in production across a fleet of repositories.** 204 tests, no dependencies:
-`python3 kit/tests/run_tests.py`. Every rule below was found by a real migration, and the
-commentary cites the failure that produced it.
+`python3 kit/tests/run_tests.py`.
+
+For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
+`verify`. The migration commands are specialized compatibility tools retained for recognized
+legacy layouts; they are not required for normal adoption.
 
 ## Install into a repository
 
@@ -34,18 +37,19 @@ truth recreates the accretion problem in a new costume. Copy
 
 ## The commands
 
-| Command | Does | Exit |
-|---|---|---|
-| `fleet` | stage + census for every repo under a root, one table | 0 |
-| `census` | the Phase-0 measurement, before anything is changed | 0 |
-| `apply` | installs the mechanical layer, idempotently (`--dry-run`) | 0 / 2 |
-| `policy scaffold` | harvests a draft policy from the repo's **own** rules | 0 / 2 |
-| `policy promote` | moves the reviewed draft into the live policy | 0 / 1 |
-| `supersede` | proves the kit's gate is never weaker, then retires the legacy one | 0 / 1 |
-| `migrate` | mechanical migration + a written plan for the judgment calls | 0 / 2 |
-| `verify` | checked-in schema/residue checks + declared validation commands; `--agnix` is optional | 0 / 1 |
-| `self-test` | fires forbidden calls at installed hooks; `--promote-codex` requires live persisted-trust proof | 0 / 1 |
-| `revert` | undoes the last mechanical migration from its manifest | 0 / 1 |
+| Use | Command | Does | Exit |
+|---|---|---|---|
+| Core | `census` | measures startup context and existing configuration before anything changes | 0 |
+| Core | `apply` | installs the mechanical layer, idempotently (`--dry-run`) | 0 / 2 |
+| Core | `self-test` | fires forbidden and benign calls at installed hooks; `--promote-codex` requires live persisted-trust proof | 0 / 1 |
+| Core | `measure` | fires repository-declared policy and reports enforced, broken, or unmeasured rules | 0 / 1 |
+| Core | `verify` | runs checked-in schema, adapter, budget, residue, and validation checks; `--agnix` is optional | 0 / 1 |
+| Team | `fleet` | runs stage + census for every repo under a root, in one table | 0 |
+| Specialized | `policy scaffold` | harvests a draft policy from a supported hand-written shell gate | 0 / 2 |
+| Specialized | `policy promote` | moves the reviewed draft into the live policy | 0 / 1 |
+| Specialized | `supersede` | proves the new gate is never weaker, then retires the supported legacy gate | 0 / 1 |
+| Specialized | `migrate` | handles recognized legacy residue and writes a plan for judgment calls | 0 / 2 |
+| Specialized | `revert` | undoes the last mechanical migration from its manifest | 0 / 1 |
 
 ### The order for one repository
 
@@ -53,23 +57,36 @@ truth recreates the accretion problem in a new costume. Copy
 kit/agentkit census  --repo ~/dev/foo             # measure before touching
 kit/agentkit apply   --repo ~/dev/foo --dry-run   # preview the footprint
 kit/agentkit apply   --repo ~/dev/foo             # refuses a dirty tree
-kit/agentkit policy scaffold --repo ~/dev/foo     # harvest its real rules
+kit/agentkit self-test --repo ~/dev/foo           # prove the gates fire
+kit/agentkit measure --repo ~/dev/foo              # test repo-declared policy
+kit/agentkit verify  --repo ~/dev/foo              # check the installed system
+# Under Codex: restart, review/trust /hooks, then:
+kit/agentkit self-test --repo ~/dev/foo --promote-codex
+kit/agentkit verify --repo ~/dev/foo --effective
+```
+
+### Only when replacing a supported legacy system
+
+The current compatibility tools recognize a specific legacy directory and retired-skill layout.
+Policy harvesting recognizes hand-written `.claude/hooks/*.sh` gates that express decisions using
+the legacy `block` / `ask` functions with nearby `grep -qE` conditions. Other context systems,
+memory stores, and validator shapes require manual review.
+
+```sh
+kit/agentkit policy scaffold --repo ~/dev/foo
 #   ... review policyDraft ...
 kit/agentkit policy promote  --repo ~/dev/foo
 kit/agentkit apply   --repo ~/dev/foo             # recompile permissions.deny
-kit/agentkit self-test --repo ~/dev/foo           # prove the gates fire
-# Under Codex: restart, review/trust /hooks, then:
-kit/agentkit self-test --repo ~/dev/foo --promote-codex
 kit/agentkit supersede --repo ~/dev/foo           # can the old gate be retired?
 kit/agentkit supersede --repo ~/dev/foo --retire  # only if the check says yes
 kit/agentkit migrate --repo ~/dev/foo             # plan; --apply does the mechanical half
 ```
 
-## Replacing the old system, not sitting beside it
+## Replacing a supported legacy shell gate
 
-`apply` only ever **adds** — that is what stops it disarming a repo mid-install. The
-consequence is that immediately after `apply` you have two systems live: the repo's
-original gate and the kit's, both wired to `PreToolUse`/`Bash`, both firing.
+When a repository already has a supported hand-written Bash gate, `apply` only ever **adds** — that
+is what stops it disarming the repo mid-install. Immediately after `apply`, both the original gate
+and RepoCharter's gate remain wired to `PreToolUse`/`Bash` and both fire.
 
 `supersede` is what ends that. It runs **both** gates over a corpus of commands and
 compares verdicts, then retires the old one only if all three hold:
@@ -129,11 +146,11 @@ policy and errors on any inert rule, however it got there.
 | Stage | Meaning |
 |---|---|
 | `not-started` | no RepoCharter layer — run `apply` |
-| `mechanical` | plumbing installed, migration incomplete — run `migrate` |
-| `migrated` | canonical layout, no fieldbook residue |
+| `mechanical` | plumbing installed, recognized legacy cleanup incomplete — run `migrate` if converting that layout |
+| `migrated` | canonical layout, no recognized legacy residue |
 
 **BLOCKING** findings (dead references, override files, absolute symlinks, budget overruns,
-inert policy rules) are errors at every stage. **MIGRATION** findings (fieldbook residue,
+inert policy rules) are errors at every stage. **MIGRATION** findings (recognized legacy residue,
 retired skills, missing `docs/project/`) are `TODO` while a repo is mid-migration and become
 errors once it claims to be done. Without the split, ten un-migrated repos produce ninety
 identical-looking errors and there is no signal at all.
