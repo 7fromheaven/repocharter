@@ -1,7 +1,10 @@
-# agentkit
+# RepoCharter mechanics
 
 The mechanical layer of the portable agent-context system. One vendored copy per
 repository, one version stamp, one command to install and one to check.
+
+RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
+`agentkit` name so existing repositories and automation continue to work.
 
 **Status: in production across a fleet of repositories.** 204 tests, no dependencies:
 `python3 kit/tests/run_tests.py`. Every rule below was found by a real migration, and the
@@ -125,7 +128,7 @@ policy and errors on any inert rule, however it got there.
 
 | Stage | Meaning |
 |---|---|
-| `not-started` | no agentkit layer — run `apply` |
+| `not-started` | no RepoCharter layer — run `apply` |
 | `mechanical` | plumbing installed, migration incomplete — run `migrate` |
 | `migrated` | canonical layout, no fieldbook residue |
 
@@ -146,11 +149,12 @@ which is what a CI runner is — cannot see a `.codex/config.toml` amputation. T
 check is the CI gate; `--effective` is the developer-machine check. They are not
 interchangeable.
 
-`self-test` is what entitles a repo to declare `enforcement: blocking` in
-`compatibility.json`. For Codex, promotion records the exact adapter hash and installed CLI
-version only after Bash, `apply_patch`, and MCP are denied through the real CLI and an ordinary
-no-bypass run proves that project trust persists. Open `/hooks` after installation or any adapter
-change; a temporary trust override proves code paths, not operational enforcement.
+`self-test` is what entitles a repo to report **verified enforcement**. The compatibility manifest
+currently serializes that state as `enforcement: blocking`; this is a technical enum, not a claim
+that RepoCharter or the repository is blocked. For Codex, promotion records the exact adapter hash
+and installed CLI version only after Bash, `apply_patch`, and MCP are denied through the real CLI
+and an ordinary no-bypass run proves that project trust persists. Open `/hooks` after installation
+or any adapter change; a temporary trust override proves code paths, not operational enforcement.
 
 ## The gates
 

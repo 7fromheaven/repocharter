@@ -1,22 +1,30 @@
-# agentkit
+# RepoCharter
 
-**Give every coding agent the same context—and make your important rules more than suggestions.**
+**One repo charter. Every coding agent.**
 
-Agentkit is a dependency-free toolkit for repositories used with Claude Code, Codex, ZCode, and
-other coding-agent harnesses. It keeps project guidance in one place, loads detailed context only
-when it is needed, and wires one safety policy into the native controls each harness actually
-supports.
+[repocharter.com](https://repocharter.com)
 
-With agentkit, you get:
+RepoCharter is a dependency-free toolkit for repositories shared across Claude Code, Codex,
+OpenCode, Hermes Agent, ZCode, and other coding-agent harnesses. It keeps project guidance in one
+place, loads detailed context only when it is needed, and wires one safety policy into the native
+controls each supported harness actually exposes.
+
+With RepoCharter, you get:
 
 - **One source of truth** instead of separate instruction sets for every agent.
 - **Lean startup context** so more of the prompt is available for the work itself.
 - **Provider-native guardrails** for shell commands, file writes, MCP tools, and configuration.
-- **Proof that the guardrails run** before a repository is allowed to call them blocking.
+- **Proof that the guardrails run** before a repository reports verified enforcement.
 - **A safe migration path** that preserves existing hooks, settings, and project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current release: **agentkit 0.3.0** · **204 tests** · **zero runtime dependencies**
+> Current version: **RepoCharter 0.3.0** · CLI: `kit/agentkit`
+>
+> **204 tests** · **zero runtime dependencies**
+
+RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
+repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
+not a second product.
 
 ---
 
@@ -32,11 +40,11 @@ plans, decisions, research, and procedures are named by path and loaded on deman
 deploy production through MCP,” or “ask before discarding work” can be expressed once and enforced
 through the harness surfaces that support them.
 
-**Know what is actually active.** Agentkit checks the installed configuration, fires real probes at
-declared policies, and records provider-backed evidence. An installed hook is not treated as a
+**Know what is actually active.** RepoCharter checks the installed configuration, fires real probes
+at declared policies, and records provider-backed evidence. An installed hook is not treated as a
 working hook merely because the file exists.
 
-**Adopt it without surrendering your repo.** Agentkit writes plumbing, not project truth. It never
+**Adopt it without surrendering your repo.** RepoCharter writes plumbing, not project truth. It never
 generates the body of `AGENTS.md` and never rewrites anything under `docs/project/`.
 
 ---
@@ -65,21 +73,29 @@ project-memory layout. Provider-specific files are adapters, not competing sourc
 
 ## Provider support
 
-| Harness | Shared context | Safety integration | Declaration |
+| Harness | Shared context | Safety integration | Enforcement status |
 |---|---|---|---|
-| **Codex** | Native `AGENTS.md` and `.agents/skills/` discovery | Project hooks for Bash, `apply_patch`, MCP, and post-write measurement | Can become **blocking** after exact-hook trust and a live proof |
+| **Codex** | Native `AGENTS.md` and `.agents/skills/` discovery | Project hooks for Bash, `apply_patch`, MCP, and post-write measurement | Eligible for **verified enforcement** after exact-hook trust and live deny/allow proof |
 | **Claude Code** | `CLAUDE.md` and skill symlinks reach the same canonical files | Hooks for Bash, writes, MCP, config changes, and post-write measurement | **Advisory** until provider-backed proof is recorded |
+| **OpenCode** | Native `AGENTS.md` and `.agents/skills/` discovery | No RepoCharter tool-call adapter yet; pre-commit verification still applies | **Advisory** |
+| **Hermes Agent** | Native `AGENTS.md`; canonical skills require an external-directory setting | No RepoCharter tool-call adapter yet; pre-commit verification still applies | **Advisory** |
 | **ZCode** | Native `AGENTS.md`; project skill imported as a symlink | No live-tested safety adapter yet | **Advisory** |
 | **Other harnesses** | Read `AGENTS.md` and canonical skill paths directly | Explicit fallback until an adapter exists | **Advisory** |
 
-Agentkit does not pretend every provider exposes the same control surface. Context portability and
-safety enforcement are reported separately.
+**Verified enforcement** means live probes showed the harness stopping tested prohibited calls
+before execution while allowing benign calls. The compatibility manifest serializes this state as
+`enforcement: "blocking"`; that internal value does not mean RepoCharter or the repository is
+blocked. Evidence is scoped to the exact checkout, adapter hash, harness version, and probe matrix.
+
+RepoCharter does not pretend every provider exposes the same control surface. Context portability
+and safety enforcement are reported separately. OpenCode and Hermes Agent can use local or
+self-hosted models; model location does not upgrade advisory integration into verified enforcement.
 
 ---
 
 ## Quick start
 
-Agentkit requires Python 3 and nothing else. Clone this repository, then run the CLI directly from
+RepoCharter requires Python 3 and nothing else. Clone this repository, then run the CLI directly from
 the checkout.
 
 ### 1. Measure before changing anything
@@ -101,7 +117,7 @@ kit/agentkit apply --repo ~/dev/your-repo
 `apply` refuses a dirty worktree by default, preserves unrelated Claude and Codex configuration,
 and reports every file it changes.
 
-Once applied, agentkit is vendored into the target repository:
+Once applied, RepoCharter is vendored into the target repository:
 
 ```sh
 cd ~/dev/your-repo
@@ -111,7 +127,7 @@ kit/agentkit verify --repo .
 ### 3. Add your project context and policy
 
 Use `kit/templates/AGENTS.md.tmpl` as a starting point when the repository does not already have
-an `AGENTS.md`. Write the project-specific rules yourself; agentkit will not invent them.
+an `AGENTS.md`. Write the project-specific rules yourself; RepoCharter will not invent them.
 
 Then review `.agents/compatibility.json` and add only boundaries that matter to this repository.
 The `policy` portion might look like this:
@@ -175,7 +191,7 @@ persisted project-hook trust is active. See the
 
 ---
 
-## What agentkit enforces
+## What RepoCharter enforces
 
 The universal policy provides a conservative floor. Repository policy adds the boundaries no
 generic tool can infer, such as production deploys, credential surfaces, generated files, and
@@ -194,13 +210,16 @@ pause for an interactive `ask`; Codex currently translates the same decision to 
 its `PreToolUse` hook cannot initiate approval safely.
 
 Hooks are guardrails, not an operating-system security boundary. Credentials and production
-capabilities should still use the narrowest permissions their providers offer.
+capabilities should still use the narrowest permissions their providers offer. Verified
+enforcement covers the tested provider paths and probe matrix; it is not an exhaustive proof
+against every alternate command spelling or access path.
 
 ---
 
 ## Bringing an existing repository across
 
-Agentkit is designed to migrate a real repository without flattening the controls it already has.
+RepoCharter is designed to migrate a real repository without flattening the controls it already
+has.
 
 ```sh
 kit/agentkit census --repo ~/dev/your-repo
@@ -208,8 +227,8 @@ kit/agentkit apply --repo ~/dev/your-repo --dry-run
 kit/agentkit apply --repo ~/dev/your-repo
 ```
 
-If the repository has a hand-written shell gate, agentkit can harvest a reviewable policy draft and
-compare the old and new gates before retiring anything:
+If the repository has a hand-written shell gate, RepoCharter can harvest a reviewable policy draft
+and compare the old and new gates before retiring anything:
 
 ```sh
 cd ~/dev/your-repo
@@ -262,30 +281,33 @@ network-fetched shared rule catalogue.
 - **Existing hooks and unrelated settings are preserved**, including user allow-lists.
 - **`AGENTS.md` and `docs/project/` remain human-owned.**
 - **Every install is idempotent**; a conforming repository reports zero changes.
-- **Pre-commit verification fails closed** if Python, agentkit, or a declared validation command is
-  missing.
+- **Pre-commit verification fails closed** if Python, the vendored CLI, or a declared validation
+  command is missing.
 - **Provider claims remain explicit**: context support does not masquerade as safety enforcement.
 
 ## Current status
 
-Agentkit 0.3.0 is used in production repositories today. Its 204-test suite is intentionally heavy
-on negative cases: dangerous calls must be refused, malformed inputs must fail closed, foreign
-configuration must survive, and a gate that never ran must not report success.
+RepoCharter 0.3.0 is used in production repositories today. Its 204-test suite is intentionally
+heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
+foreign configuration must survive, and a gate that never ran must not report success.
 
 The Codex adapter has provider-backed Bash, `apply_patch`, MCP, allow-path, and persisted-trust
 evidence. Each checkout still has to review and prove its own exact hook hash. Claude Code uses the
 same policy engine but remains advisory until equivalent provider-backed evidence is recorded.
-ZCode currently provides portable context only.
+OpenCode, Hermes Agent, and ZCode currently provide portable context without RepoCharter tool-call
+enforcement.
 
 ## Honest limits
 
 - Context is portable; enforcement is always provider- and checkout-specific.
-- Agentkit cannot make a broadly privileged credential read-only. Use provider-side least privilege.
-- ZCode and generic harnesses remain advisory until live-tested safety adapters exist.
+- RepoCharter cannot make a broadly privileged credential read-only. Use provider-side least
+  privilege.
+- OpenCode, Hermes Agent, ZCode, and generic harnesses remain advisory until live-tested safety
+  adapters exist.
 - `supersede` compares shell gates; other legacy validator types require manual review.
 - The toolkit is vendored into each repository rather than installed globally or delivered as a
   service.
-- Agentkit does not synchronize credentials, connector authorization, environment files, or
+- RepoCharter does not synchronize credentials, connector authorization, environment files, or
   customer data.
 
 ---
@@ -294,7 +316,7 @@ ZCode currently provides portable context only.
 
 ```
 README.md          this file — the design, the commands, and the honest limits
-kit/agentkit       the CLI. Python 3, no dependencies.
+kit/agentkit       the RepoCharter CLI (compatibility name). Python 3, no dependencies.
 kit/hooks/         Claude and Codex adapters over one policy engine
 kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
@@ -303,5 +325,5 @@ kit/templates/     AGENTS.md skeleton, linter config, CI workflow
 kit/tests/         204 tests, no dependencies, mostly negative
 ```
 
-**Ready to try it?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is read-only, takes
-seconds, and gives you a concrete baseline before agentkit changes a file.
+**Ready to try RepoCharter?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is
+read-only, takes seconds, and gives you a concrete baseline before RepoCharter changes a file.
