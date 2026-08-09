@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
-"""agentkit — install and verify the portable agent-context layout in a repository.
+"""Install and verify the portable agent-context layout in a repository.
 
-Two commands do the work, and the split between them is the whole design:
+Core commands:
 
   apply    writes ONLY mechanical parts -- the shim, the symlinks, the hooks block, the
            permission denials, the linter config, the declaration. It NEVER writes
-           AGENTS.md's body and never touches docs/project/. A tool that generates truth
-           recreates the accretion problem in a new costume; a tool that generates only
-           plumbing can be re-run forever.
+           AGENTS.md's body and never touches docs/project/.
 
   verify   runs the checked-in schema/residue layer plus the repository's declared
            validation commands. --agnix adds the network-fetched shared catalogue.
 
-Two more exist because a claim needs a test:
-
   self-test  fires known-forbidden calls at the installed hooks and asserts refusal. This
-             is what entitles a repo to declare `enforcement: blocking`. Every control
-             below Tier 0 fails open silently, so an untested gate is a guess.
+             is required before a repo may declare `enforcement: blocking`.
 
-  census     the Phase-0 measurement. Without a before-reading there is no way to tell
-             afterwards whether any of this helped.
+  census     records the startup-context baseline before installation.
 
 Everything is idempotent. Re-running apply on a conforming repo changes nothing.
 """
@@ -57,11 +51,9 @@ AGENTKIT_OWNED = (
     ".claude/settings.json",
     ".claude/skills/",
     ".codex/hooks.json",
-    # The vendored runtime and the hook lane. Without these, the first apply writes
-    # ~200 untracked files and the SECOND one refuses the repo as dirty — which
-    # makes an idempotent tool un-re-runnable, and re-running is the whole point
-    # across a fleet. Only `pre-commit` is claimed inside .githooks/, not the whole
-    # directory, because the operator's other hooks there are genuinely theirs.
+    # The vendored runtime and managed hook lane are excluded from the unrelated-change
+    # check so apply remains idempotent. Only `pre-commit` is claimed inside .githooks/;
+    # other hook files remain user-owned.
     "kit/",
     ".githooks/pre-commit",
 )
@@ -85,13 +77,11 @@ def _is_tombstone(path: Path) -> bool:
 def preflight(repo: Path, allow_dirty: bool) -> int | None:
     """Refuse to mutate a repository that already has UNRELATED uncommitted work.
 
-    Doing ten of these means ten reviews, and a change mixed into 222 unrelated ones is a
-    change nobody reviews. The escape hatch exists because sometimes you genuinely want to
-    stack it, but it should be a decision rather than the default.
+    Keeping installation changes separate makes the generated footprint reviewable. The
+    explicit escape hatch supports workflows that intentionally combine changes.
 
-    The kit's own footprint is excluded, because otherwise `apply` dirties the tree and then
-    refuses to run a second time -- which would make an idempotent tool un-re-runnable, and
-    re-running is the whole point across a fleet.
+    The kit's own footprint is excluded so a completed apply can be run again without
+    requiring the generated files to be committed first.
     """
     # -uall expands untracked DIRECTORIES into their files. Without it git reports a bare
     # `?? .claude/`, which matches none of the specific owned paths, and the kit refuses to
@@ -187,10 +177,8 @@ def codex_adapter_digest(repo: Path) -> str | None:
 def default_compat(repo: Path) -> dict:
     """The declaration a fresh repo starts from.
 
-    autoMemory defaults to "on" because Anthropic's own split puts learnings there and the
-    machine-local scratchpad is genuinely useful. A repo with a data boundary sets it off
-    and says why -- and `verify` asserts the declaration against settings.json either way,
-    which is what makes both choices honest rather than assumed.
+    autoMemory defaults to "on" to match Claude Code. A repository with a data boundary can
+    disable it and record why; `verify` checks the declaration against settings.json.
     """
     return {
         "$schema": "../kit/schema/compatibility.schema.json",
@@ -304,14 +292,13 @@ if [ -x kit/agentkit ]; then
       exit 1
     fi
   else
-    # A missing interpreter is not a pass. Every other silent-skip in this system
-    # turned out to be a gate that had quietly stopped running.
+    # Missing verification dependencies must block rather than silently skip the gate.
     echo "pre-commit: x python3 not found, so agentkit verify could not run -> blocked" >&2
     exit 1
   fi
 else
   echo "pre-commit: x kit/agentkit is missing -- the vendored kit is incomplete -> blocked" >&2
-  echo "pre-commit:   run \\`agentkit apply\\` from the kit source repo to restore it." >&2
+  echo "pre-commit:   run \\`agentkit apply\\` from a RepoCharter source distribution to restore it." >&2
   exit 1
 fi
 {PRECOMMIT_END}
@@ -323,17 +310,9 @@ PRECOMMIT_STANDALONE = "#!/usr/bin/env bash\nset -uo pipefail\n\n" + PRECOMMIT_L
 TOMBSTONE = """#!/usr/bin/env bash
 # agentkit tombstone. This hook was replaced; the file that lived here is gone.
 #
-# You are seeing this because a Claude Code session is running with settings from
-# BEFORE the hooks were rewired. Settings are read once, at session start, so that
-# session is still calling this path.
-#
-# Without this file the call would exit 127. Claude Code treats any exit other
-# than 2 as non-blocking, so the command would have PROCEEDED WITH NO GATE, and
-# said so only in a warning line that scrolls past. That happened here on
-# 2026-08-08 for an entire session of commits.
-#
-# So this exits 2 and blocks instead. Restart the session to pick up the current
-# hooks. Once no session references this path, the file is safe to delete.
+# Claude Code reads hook settings at session start, so an existing session may continue
+# calling the old path after rewiring. A missing script exits 127, which is non-blocking;
+# this placeholder exits 2 until the session is restarted with current settings.
 echo "agentkit: this hook was replaced and your session is running with stale settings." >&2
 echo "agentkit: RESTART this session — until you do, its commands are not being gated." >&2
 exit 2
@@ -343,9 +322,8 @@ exit 2
 def _hook_script_paths(hooks: dict, repo: Path) -> set:
     """Absolute paths of the scripts a hooks block invokes.
 
-    Parses for a path-shaped token rather than taking the first word: a command may
-    be `bash <script>` or `python3 <script>`, and a dead-reference sweep that read
-    the interpreter as the script once deleted a live hook in this repo.
+    Parse for a path-shaped token rather than taking the first word because hook commands
+    may use interpreter prefixes such as `bash <script>` or `python3 <script>`.
     """
     out = set()
     for groups in (hooks or {}).values():
@@ -433,9 +411,7 @@ def install_precommit(repo: Path, dry: bool) -> int:
     Respects an existing core.hooksPath rather than fighting it, and inserts a
     marked block into an existing hook rather than replacing somebody's work.
     """
-    # No git, no commit hook. Without this guard `git config` fails on every run in
-    # a non-git directory, so apply reported a change forever and stopped being
-    # idempotent — caught by the existing foreign-hooks test, not in a repo.
+    # A non-Git directory has no commit-hook target; return without changing state.
     if subprocess.run(["git", "rev-parse", "--git-dir"], cwd=repo,
                       capture_output=True).returncode != 0:
         return 0
@@ -493,8 +469,7 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
             return blocked
     changed = 0
 
-    # In dry-run every mutation is announced and none is performed, so the footprint can be
-    # reviewed before it exists. Ten repositories is too many to preview by cloning each one.
+    # In dry-run every mutation is announced and none is performed.
     def put_json(path: Path, data: dict, label: str) -> None:
         if dry:
             say(f"[dry-run] {label}")
@@ -535,8 +510,8 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
                  f"{'updated' if existing else 'created'} .agents/compatibility.json")
         changed += 1
 
-    # 2. Hooks. Copied, not symlinked: a vendored copy survives a fresh clone with no
-    #    submodule init, which is the case this system exists to serve.
+    # 2. Hooks. Copied rather than symlinked so a fresh clone has a complete runtime without
+    #    submodule initialization or an external source checkout.
     hook_dir = repo / HOOK_DIR_NAME
     ensure_dir(hook_dir)
     for name in CLAUDE_HOOKS:
@@ -550,15 +525,8 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
         if not dry and name.endswith((".sh", ".py")) and not name.startswith("_"):
             dst.chmod(0o755)
 
-    # 2b. Vendor the CLI itself. kit/README has claimed "one vendored copy per
-    #     repository" since the beginning and it was never true: the hooks were
-    #     vendored, the COMMAND was not. Measured 2026-08-09 across all six migrated
-    #     repos -- `kit/agentkit` absent from every one. So every repo depended on
-    #     the kit's source checkout existing at one exact path on one laptop, the CI
-    #     template's `[ ! -x kit/agentkit ]` guard would have failed instantly
-    #     everywhere, and no pre-commit hook could call the checks at all.
-    #
-    #     Tests and caches are left behind; this is the runtime, not the workshop.
+    # 2b. Vendor the CLI and runtime modules so verification works from a fresh clone and in
+    #     CI without a separate source checkout. Tests and caches are not part of the runtime.
     changed += vendor_kit(repo, dry, put_file)
 
     # 2c. The local check, wired to fire on commit rather than when someone remembers.
@@ -635,12 +603,8 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
     #    else -- the operator's allow list, their statusLine, and crucially THEIR HOOKS --
     #    is preserved untouched.
     #
-    #    This merges rather than replaces, and the distinction is not academic. A fieldbook
-    #    repo can carry eight hook entries across five events, including a working safety
-    #    gate and its whole session-state router. Assigning settings["hooks"] wholesale
-    #    would delete all of them in silence -- an apply that disarms a repo while reporting
-    #    success is the exact failure class this kit exists to prevent. Claude Code runs
-    #    every matching hook group, so agentkit's entries sit ALONGSIDE existing ones.
+    #    Merge rather than replace so foreign hook groups remain installed. Claude Code runs
+    #    every matching hook group, so agentkit's entries can coexist with existing ones.
     settings_path = repo / ".claude" / "settings.json"
     settings = read_json(settings_path, {}) or {}
     before = json.dumps(settings, sort_keys=True)
@@ -702,9 +666,7 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
                  f"updated .claude/settings.json (hooks + {len(permissions['deny'])} deny rule(s))")
         changed += 1
 
-    # askBashPatterns belongs here. Without it, a repo whose policy is entirely
-    # ask-rules is told it "enforces nothing repo-specific" — which is false, and
-    # invites someone to re-run `policy scaffold` and harvest the duplicates back.
+    # Include askBashPatterns when deciding whether the repository policy is empty.
     if not (policy.get("denyWritePaths") or policy.get("denyMcpTools")
             or policy.get("denyBashPatterns") or policy.get("askBashPatterns")
             or policy.get("measureOnWrite")):
@@ -855,13 +817,12 @@ def cmd_policy(repo: Path, action: str) -> int:
                   f"(stated in AGENTS.md, no obvious mechanism)")
         print(f"\n  {count} candidate(s) written to policyDraft in {path.relative_to(repo)}.")
         print("  NOTHING IS ENFORCED YET. Review, then move entries into `policy` to turn them on.")
-        print("  Harvested regexes are the repo's own; they still deserve a read before they bite.")
+        print("  Review every imported regex against its source control flow before promotion.")
         return 0
 
     if action == "repair":
-        # Split allOf rules that can never fire into one rule per pattern. An inert
-        # conjunction is what a harvested `||` chain becomes, and it looks exactly like a
-        # working fence from the outside — 53 of them shipped across six repositories.
+        # Split allOf rules that cannot fire into one rule per alternative. This repairs the
+        # representation produced when a source `||` chain is imported as a conjunction.
         #
         # Splitting is safe in the direction that matters (strictly more denial), and the
         # benign corpus guards the other direction: a split pattern that would block ordinary
@@ -914,8 +875,7 @@ def cmd_policy(repo: Path, action: str) -> int:
             return 1
         policy = compat.setdefault("policy", {})
         moved = 0
-        # Union, never replace: a declared list narrower than the gate being retired silently
-        # un-protects a branch, and that mistake has been made twice.
+        # Union rather than replace so promotion cannot remove an existing protected branch.
         harvested_branches = draft.get("protectedBranches") or []
         if harvested_branches:
             existing = policy.get("protectedBranches") or []
@@ -1002,8 +962,8 @@ def cmd_supersede(repo: Path, gate: str | None, do_retire: bool, allow_dirty: bo
                   f"— RETIREMENT BLOCKED:")
             for d in result.false_positives:
                 print(f"    {d.command[:56]:<56} old={d.old} new={d.new}")
-            print("    A rule that denies everything is trivially 'never weaker'. It is also the")
-            print("    thing that gets a gate switched off. Usually an over-broad harvested rule:")
+            print("    A rule that denies everything is trivially 'never weaker' but invalid.")
+            print("    Check for an over-broad imported rule, especially a flattened conjunction:")
             print("    check for a conjunction that was flattened to one pattern.")
         if result.uncovered:
             covered = not result.weaker
@@ -1046,7 +1006,7 @@ def cmd_supersede(repo: Path, gate: str | None, do_retire: bool, allow_dirty: bo
 # ── fleet ─────────────────────────────────────────────────────────────────────────────
 
 def cmd_fleet(root: Path, as_json: bool, verify: bool) -> int:
-    """One table for every repository under a root. Ten repos is too many to hold in a head."""
+    """Report stage and census data for repositories under one root."""
     repos = sorted(p.parent for p in root.glob("*/.git"))
     rows = []
     for repo in repos:
@@ -1061,7 +1021,7 @@ def cmd_fleet(root: Path, as_json: bool, verify: bool) -> int:
         except json.JSONDecodeError:
             row["claudeBytes"] = row["unscopedRules"] = 0
         row["policyEmpty"] = markers.policy_empty
-        row["fieldbook"] = bool(markers.fieldbook_dirs)
+        row["legacyLayout"] = bool(markers.legacy_dirs)
         if verify:
             proc = subprocess.run([sys.executable, str(KIT_ROOT / "verify" / "residue.py"),
                                    "--repo", str(repo), "--json"], capture_output=True, text=True)
@@ -1081,8 +1041,8 @@ def cmd_fleet(root: Path, as_json: bool, verify: bool) -> int:
     print("  " + "-" * (len(header) - 2))
     for r in rows:
         flags = []
-        if r["fieldbook"]:
-            flags.append("fieldbook")
+        if r["legacyLayout"]:
+            flags.append("legacy-layout")
         if r["stage"] != stage_lib.NOT_STARTED and r["policyEmpty"]:
             flags.append("POLICY-EMPTY")
         if verify and r.get("errors"):
@@ -1144,12 +1104,8 @@ def cmd_revert(repo: Path) -> int:
                 say(f"undeclared {action['path']}")
                 undone += 1
 
-    # NEVER delete a quarantine that gave nothing back. The original unconditionally
-    # rmtree'd after replaying the manifest, so a manifest whose paths no longer resolve —
-    # which is exactly what happens when a quarantine is relocated — undid zero actions and
-    # then destroyed the only copy of the retired content. That happened once, in this
-    # session, to a quarantine holding a retired safety gate. A restore tool that can delete
-    # is worse than no restore tool.
+    # Preserve a quarantine when no action was restored. Unresolved manifest paths must not
+    # cause the only recoverable copy of retired content to be deleted.
     if not undone:
         print(f"\nrevert: nothing was restored from {latest.name} — its manifest paths do not "
               f"resolve against this repository.", file=sys.stderr)
@@ -1169,12 +1125,8 @@ def cmd_verify(repo: Path, effective: bool, strict: bool, as_json: bool,
                agnix: bool = False) -> int:
     """The residue checks always run. agnix is opt-in.
 
-    agnix was default-on and fetched per-run via `npx -y agnix@latest`, which made
-    every verify depend on a network round-trip and on whatever version shipped
-    that morning. Measured across six repos it reported 0 errors and ~30 warnings
-    each, none of which anyone acted on, while the residue checks below are the
-    ones that find real defects. So it is opt-in: `--agnix` when you want the
-    shared catalogue, nothing fetched when you do not.
+    Default verification is checked in, dependency-free, and offline. Use ``--agnix`` to
+    add the network-fetched shared catalogue explicitly.
     """
     print(f"agentkit verify -> {repo}\n")
     failed = False
@@ -1194,9 +1146,7 @@ def cmd_verify(repo: Path, effective: bool, strict: bool, as_json: bool,
             if proc.returncode != 0:
                 failed = True
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            # This used to warn and exit 0 — a caller checking the exit code saw
-            # success with 445 rules unevaluated. If you ask for agnix and it
-            # cannot run, that is a failure, not a pass.
+            # An explicitly requested verifier must fail the command if it cannot run.
             print(f"  ERROR: --agnix was requested and agnix could not run ({exc}). "
                   f"Refusing to report a pass with the shared rule set unevaluated.",
                   file=sys.stderr)
@@ -1634,10 +1584,8 @@ def cmd_census(repo: Path, as_json: bool) -> int:
     on_demand = sum(p.stat().st_size for p in project.rglob("*.md")) if project.is_dir() else 0
     n_skills = len([p for p in skills_dir.iterdir() if p.is_dir()]) if skills_dir.is_dir() else 0
 
-    # Unscoped .claude/rules are always-loaded too — "loaded at launch with the same
-    # priority as .claude/CLAUDE.md" — and on a fieldbook repo they can outweigh both
-    # canonical files put together. A census that omits them flatters exactly the repos
-    # that most need an honest before-reading.
+    # Unscoped .claude/rules load at launch with the same priority as .claude/CLAUDE.md, so
+    # include them in the startup-context baseline.
     rules_bytes, rules_lines, rules_files = 0, 0, []
     rules_dir = repo / ".claude" / "rules"
     if rules_dir.is_dir():

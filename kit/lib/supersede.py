@@ -1,21 +1,12 @@
-"""Prove the new gate is never weaker than the old one, then retire the old one.
+"""Compare a replacement gate with a supported legacy gate before retirement.
 
-The gap this closes: `policy scaffold` copies a repo's rules out of its existing gate
-script, and nothing ever turns that script off. The result is both gates running, the same
-rule denying twice, and a "single source of truth" claim that is false. Worse, the obvious
-fix -- delete the old gate once you have harvested it -- is unsafe, because harvesting is
-best-effort: any rule that landed in `needsManualPattern` was NOT carried over, and
-deleting the source would silently drop a production fence.
+Policy harvesting is best-effort, so deleting the source gate immediately could remove a
+rule that still requires manual translation. This module runs both gates over probes mined
+from the source patterns plus fixed dangerous and benign corpora. Retirement is allowed
+only when the replacement is never weaker, does not block benign commands, and has no
+unresolved source rules.
 
-So retirement is gated on evidence, and the evidence is DIFFERENTIAL REPLAY rather than
-pattern comparison. Two regexes that look different can behave identically and two that
-look similar can differ on the one command that matters, so both gates are actually run
-over a corpus of commands and their decisions compared. The new gate must be at least as
-strict as the old one on every probe. One weaker verdict blocks retirement.
-
-This is a sample, not a proof, and the report says so. The corpus is built from literals
-mined out of the old gate's OWN patterns -- so every rule it encodes is exercised by a
-command derived from that rule -- plus a fixed set of universally dangerous commands.
+Differential replay is a sample rather than a formal proof; the report states that limit.
 """
 
 from __future__ import annotations
@@ -52,16 +43,9 @@ BASE_CORPUS = [
 
 ALTERNATION = re.compile(r"\(([^()|]+(?:\|[^()|]+)+)\)")
 
-# Commands that must NEVER be gated, whatever a repo's policy says. They exist because
-# "never weaker" is not a sufficient bar on its own: a rule that denies everything is
-# trivially never weaker, passes the comparison, and then blocks honest work until someone
-# turns the gate off. That is the failure mode this whole system is built to avoid, so it
-# gets its own corpus and its own blocking verdict.
-#
-# Every one of these mentions a protected branch name or a dangerous-looking token on
-# purpose -- an over-broad harvested rule is exactly what catches them. A real case:
-# harvesting a push-to-protected rule's branch matcher alone produced a policy that denied
-# `ls main.py`.
+# Commands that must never be gated. "Never weaker" alone is insufficient because a rule
+# that denies everything satisfies it. These probes intentionally contain protected-branch
+# names and other dangerous-looking tokens to detect over-broad patterns.
 BENIGN_CORPUS = [
     "ls main.py",
     "echo main",
@@ -95,7 +79,7 @@ class Result:
 
     @property
     def safe_to_retire(self) -> bool:
-        """Behavioural evidence decides. Provenance bookkeeping only warns.
+        """Behavioral replay decides whether retirement is safe; provenance gaps warn.
 
         `uncovered` lists rules the scaffold could not turn into a portable pattern. That is
         a real signal, but it is NOT proof the rule is unenforced: the kit ships built-in
@@ -104,10 +88,9 @@ class Result:
 
         Since the probe corpus is mined from the OLD script's patterns, every rule it
         encodes gets exercised. If the replay shows no weakness on any of those probes, the
-        behaviour is covered whatever the provenance ledger says. Blocking anyway taught the
-        operator to override the check, which is how a safety tool stops being consulted.
+        behavior is covered even when the provenance ledger is incomplete.
 
-        So: weakness blocks, over-broadness blocks, unharvested-but-behaviourally-covered
+        So: weakness blocks, over-broadness blocks, unharvested-but-behaviorally-covered
         warns.
         """
         return not self.weaker and not self.false_positives
@@ -265,15 +248,9 @@ def retire(repo: Path, old_gate: Path) -> list[str]:
     rel = old_gate.relative_to(repo)
     dst = quarantine / rel
 
-    # ORDER MATTERS, and the manifest is written before anything moves. An earlier version
-    # moved the file first and computed the manifest path with `relative_to(repo)` — which
-    # raises once the quarantine lives outside the repo. The crash landed between the move
-    # and the settings edit, leaving the gate quarantined but still referenced: the exact
-    # dead-reference defect this kit exists to catch, produced by the kit. Manifest first, so
-    # a failure at any later point is still revertable.
-    #
-    # `from` is relative to the QUARANTINE, not the repo, so it survives the directory being
-    # moved or the repo being renamed.
+    # Write recovery metadata before moving the gate so any later failure remains
+    # reversible. `from` is relative to the quarantine directory, which keeps the manifest
+    # valid if the repository moves or is renamed.
     manifest = [{"op": "rename", "from": str(rel), "to": str(rel), "base": "quarantine"}]
     (quarantine / "manifest.json").write_text(
         json.dumps({"stamp": stamp, "actions": manifest}, indent=2) + "\n", encoding="utf-8")

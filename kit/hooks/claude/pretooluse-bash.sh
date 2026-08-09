@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # pretooluse-bash.sh — universal PreToolUse Bash safety gate.
-# agentkit template. Derived from the ctx-fieldbook gate, whose regex discipline is the
-# part worth keeping; the fail-open below it is the part that was wrong.
+# The initial implementation was adapted from the ctx-fieldbook gate.
 #
 # Reads stdin JSON per the Claude Code hook spec:
 #   { "tool_name": "Bash", "tool_input": { "command": "..." } }
@@ -11,14 +10,10 @@
 #   `ask`  = reversible-but-consequential  (rm -r, git reset --hard, push to protected)
 #   `deny` = unambiguous foot-gun          (force-push to protected, checks-bypass flags)
 #
-# ── WHY THIS FAILS CLOSED ─────────────────────────────────────────────────────────────
-# The ancestor of this script began with `command -v jq >/dev/null 2>&1 || exit 0`, on the
-# reasoning that a missing tool should not brick the session. Under the hook spec that is
-# a SILENT ALLOW of every Bash call: Claude Code treats exit 1 as a non-blocking error and
-# proceeds, and "only exit code 2 blocks the action... If your hook is meant to enforce a
-# policy, use `exit 2`." A policy gate that cannot read its input must refuse, loudly.
-# So: try jq, fall back to python3, and exit 2 with an actionable message if neither is
-# present. Both are near-universal; needing neither is not worth a silent hole.
+# ── FAIL-CLOSED BEHAVIOR ──────────────────────────────────────────────────────────────
+# Claude Code treats exit 1 as a non-blocking hook error and exit 2 as a blocking decision.
+# The parser therefore tries jq, falls back to Python 3, and exits 2 with an actionable
+# message when neither can evaluate the request.
 #
 # ── REGEX DISCIPLINE (do not weaken) ──────────────────────────────────────────────────
 # 1. Anchor EVERY rule to COMMAND POSITION via CSEP: start-of-line (leading-whitespace
@@ -92,7 +87,7 @@ ask() {
   if [ "$AGENTKIT_HARNESS" = "codex" ]; then
     # Codex 0.147 parses a PreToolUse `ask` decision but does not implement it: the
     # hook is marked failed and the command CONTINUES. A hard denial is the only
-    # honest fail-closed translation until hook-initiated approvals are supported.
+    # fail-closed translation until hook-initiated approvals are supported.
     block "$1 Codex cannot request approval from PreToolUse, so this is blocked; the operator may run it directly after review."
   fi
   decide ask "$1"
@@ -126,8 +121,7 @@ if [ -f "$COMPAT" ]; then
   # Emitted as: verb <TAB> reason <TAB> pattern [<TAB> pattern ...]
   # A rule may carry `pattern` (one) or `allOf` (several, ALL of which must match). The
   # conjunction form exists because gate scripts chain `grep A && grep B && block`, and
-  # collapsing that to one pattern changes what the rule denies -- in one measured case it
-  # turned a push-to-protected rule into one that denied `ls main.py`.
+# collapsing that to one pattern changes what the rule denies.
   if command -v jq >/dev/null 2>&1; then
     RULES=$(jq -r '
       ((.policy.denyBashPatterns // []) | map({v:"deny"} + .)) +
@@ -169,12 +163,8 @@ PYEOF
     if [ "$RULE_HIT" = "1" ]; then
       case "$RULE_VERB" in
         deny) block "Repo policy: ${RULE_WHY}" ;;
-        # An `ask` is HELD rather than emitted, and the universal rules below get
-        # their turn first. Measured 2026-08-09: one repo's broad WP-CLI ask-rule
-        # matched `wp db drop` before the universal database block could run, and
-        # because the gate exits on first match, a repo's own policy silently
-        # downgraded a hard block to a prompt. A floor a repo can lower is not a
-        # floor. A repo `deny` still fires immediately — that only strengthens.
+        # Hold `ask` decisions until the universal rules run so a repository prompt cannot
+        # downgrade a universal denial. Repository `deny` decisions can fire immediately.
         ask)  [ -z "${PENDING_ASK:-}" ] && PENDING_ASK="${RULE_WHY}" ;;
       esac
     fi
@@ -186,11 +176,8 @@ fi
 
 # 1. Git push to a protected branch (block on --force same-line; else ask).
 #
-# The branch set comes from `policy.protectedBranches` in .agents/compatibility.json. It was
-# previously hardcoded to (main|master) while the schema documented the field, so the
-# declaration was dead config: a repo whose live deploy branch is `beast` could force-push it
-# freely while believing it was protected. A declared setting that nothing reads is worse
-# than no setting, because it reads as configured.
+# The branch set comes from `policy.protectedBranches` in .agents/compatibility.json, with
+# main and master as defaults.
 PROTECTED="${AGENTKIT_PROTECTED_BRANCHES:-}"
 if [ -z "$PROTECTED" ] && [ -f "$COMPAT" ]; then
   if command -v jq >/dev/null 2>&1; then
@@ -216,9 +203,7 @@ if echo "$CMD" | grep -qE "${CSEP}git +(.*[^[:alnum:]_])?(commit|push|rebase|mer
 fi
 
 # 2b. Bypassing the hooks path itself (block). `git -c core.hooksPath=/dev/null push`
-#     defeats every git-hook control at once, and the fieldbook's --no-verify regex never
-#     saw it. Named here because git hooks are a Tier-3 control the agent can rewrite:
-#     this rule makes the bypass loud, not impossible.
+#     disables Git hook controls without using --no-verify.
 if echo "$CMD" | grep -qE "${CSEP}git +.*-c +core\.hooksPath="; then
   block "Safety gate: overriding core.hooksPath bypasses every git hook in one flag. BLOCKED. If a hook is wrong, fix the hook."
 fi
@@ -227,10 +212,8 @@ fi
 echo "$CMD" | grep -qE "${CSEP}git +reset +--hard([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git reset --hard' destroys uncommitted changes. Confirm cwd and target with the operator."
 
-# 3b. Working-tree-revert cousins of reset --hard (ask). Each destroys uncommitted work
-#     with no recovery path. Field incident: a verifier's `git checkout -- <file>` on an
-#     UNCOMMITTED change-under-review reverted to HEAD and discarded the fix. checkout is
-#     exempt ONLY for -b/-B (new-branch creation, always safe).
+# 3b. Working-tree-revert cousins of reset --hard (ask). Each can discard uncommitted work.
+#     checkout is exempt only for -b/-B branch creation.
 if echo "$CMD" | grep -qE "${CSEP}git +checkout([^[:alnum:]_]|$)" &&
   ! echo "$CMD" | grep -qE "${CSEP}git +checkout +-[bB]([^[:alnum:]_]|$)"; then
   ask "Safety gate: 'git checkout' (other than -b/-B) can irrecoverably revert uncommitted changes. Confirm the target — and to un-apply a change under review, reverse the edit in place; never discard the working tree."
@@ -241,8 +224,7 @@ echo "$CMD" | grep -qE "${CSEP}git +restore([^[:alnum:]_]|$)" &&
 # form (--force), anywhere within the clean invocation — but never across a command
 # separator (;&|), so a force flag on a LATER command cannot false-fire. The dash must
 # follow whitespace (a real flag token), so a filename containing "-f" stays silent.
-# The f/F match is ANYWHERE in the cluster: `git clean -fd` must not slip because f is not
-# the last character. That was a real first-ship bug, caught only by testing the gate.
+# The f/F match is anywhere in the cluster so forms such as `git clean -fd` are covered.
 echo "$CMD" | grep -qE "${CSEP}git +clean( +[^;&|]*)? +(-[A-Za-z]*[fF][A-Za-z]*|--force)([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git clean' with a force flag (any position: -f/-fd/-d -f/--force) deletes untracked files irrecoverably. Confirm the target."
 echo "$CMD" | grep -qE "${CSEP}git +stash +(drop|clear)([^[:alnum:]_]|$)" &&
@@ -258,9 +240,8 @@ fi
 
 # 5. Destructive database operations.
 #    Requires BOTH a database tool AND a destructive verb, deliberately. A rule that
-#    fired on the words alone would block `grep -rn "DROP TABLE" .` — auditing FOR the
-#    danger must stay possible, which is the same trap that once made a harvested rule
-#    deny `ls main.py`. Underscores do not count as the separator, so a filename like
+#    fired on the words alone would block `grep -rn "DROP TABLE" .`; auditing for the
+#    danger must remain possible. Underscores do not count as the separator, so a filename like
 #    `001_drop_table.sql` reads as a name and not as a verb.
 #
 #    Split by severity for one reason: a gate that blocks routine work gets switched
@@ -275,9 +256,8 @@ DB_RESET='(migrate|db) +reset|db:(drop|reset)|migrate:(reset|fresh)|db +push +--
 
 # Database tools are almost never invoked bare: `npx prisma`, `php artisan`,
 # `bundle exec rails`, `python3 manage.py`. Anchoring at command position alone
-# missed four of eight real destructive commands on the first test run, so an
-# optional runner is allowed in front — while still requiring command position,
-# which is what keeps `grep -rn "DROP TABLE" .` out of the match.
+# requires an optional runner prefix while retaining command-position anchoring, which
+# keeps `grep -rn "DROP TABLE" .` out of the match.
 DB_RUNNER='npx +(-y +)?|bunx +|pnpm +(exec +|dlx +)|yarn +(exec +|dlx +)?|npm +exec +|php +|python3? +|bundle +exec +|poetry +run +|docker +(compose +)?(exec|run) +[^;&|]*'
 
 if echo "$CMD" | grep -qiE "${CSEP}(${DB_RUNNER})?(${DB_TOOL})([^[:alnum:]_]|$)"; then

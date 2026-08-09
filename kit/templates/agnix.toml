@@ -5,15 +5,12 @@
 # of them. What agentkit adds is the residue: the handful of checks that exist in no
 # catalogue, which live in kit/verify/residue.py.
 #
-# WHY THE SEVERITY BLOCK MATTERS. The rules that catch silent, unrecoverable failures ship
-# as MEDIUM, which renders as a warning. A warning is something people scroll past. Each
-# rule promoted below describes a way this repo's own safety file silently stops being
-# loaded — so each is an error here.
+# The severity overrides promote instruction-truncation and dead-reference findings to
+# errors because they can disable repository guidance or enforcement.
 #
-# One caveat worth carrying: XP-009 has the right threshold but the vendor documentation's
-# MODEL of truncation. Its example describes Codex dropping whole files; measurement on
-# codex-cli 0.147.0 shows the first over-budget file is TAIL-TRUNCATED and only later files
-# are skipped whole. The number is right, the mental model in the message is not.
+# XP-009 uses the correct threshold. Its diagnostic may describe whole-file omission, while
+# current Codex behavior can tail-truncate the first over-budget file before omitting later
+# files.
 
 extend = []
 severity = "Warning"
@@ -61,7 +58,7 @@ AGM-006 = "Error" # nested AGENTS.md: three incompatible semantics across three 
 XP-009 = "Error" # Codex chain over project_doc_max_bytes: the tail is cut in silence
 CDX-AG-004 = "Error" # AGENTS.md over its size limit, same failure by another route
 
-# Dead references — the class that passed every checker in the reference repo for a day.
+# Dead references to instruction imports and hook commands.
 REF-001 = "Error" # an import that points at nothing
 CC-HK-008 = "Error" # a hook command that does not exist is a gate that never fires
 

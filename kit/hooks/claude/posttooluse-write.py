@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""PostToolUse sibling of pretooluse-write.py — the after-measurement and the delta.
+"""PostToolUse sibling of pretooluse-write.py.
 
-This is the half that makes the measurement real. A prose rule saying "report HY string
-lengths before and after any change near bilingual content" is a Tier-3 control: measured
-strict compliance with long-standing instructions runs around 36% at best configuration,
-so roughly two times in three it simply does not happen, and nobody finds out.
-
-Taking the measurement here instead means it happens on every matching edit regardless of
-what the agent decides to do -- which is the difference Anthropic draws between context
-and enforced configuration.
-
-This hook never blocks. A PostToolUse denial cannot un-write the file, and pretending
-otherwise would be theatre. Its job is to make the change VISIBLE, in a number, to an
-operator who cannot read the content.
+For each matching edit, this hook records the configured after-measurement and reports its
+delta from the pre-write value. It never blocks because the write has already occurred.
 """
 
 from __future__ import annotations
@@ -97,8 +87,7 @@ def main() -> None:
                 "hookEventName": "PostToolUse",
                 "additionalContext": (
                     "[agentkit measurement — AFTER] " + " | ".join(lines) +
-                    " . Report these numbers to the operator with the change. A count that "
-                    "moved unexpectedly in text you cannot read is the signal this gate exists for."
+                    " . Report these numbers with the change and review unexpected deltas."
                 ),
             }
         }))

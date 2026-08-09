@@ -1,19 +1,11 @@
-"""Harvest a draft policy from what a repository already enforces.
+"""Build a reviewable policy draft from a supported repository configuration.
 
-The failure this exists to prevent: `apply` installs five gates with an empty policy, and
-`self-test` passes because it only exercises the built-in universal rules. The repo now has
-the APPEARANCE of protection and none of the substance, and nobody looks again because the
-checkmark was green. Across ten repositories that is ten inert installs.
+The importer reads ``block`` and ``ask`` decisions from compatible shell gates and surfaces
+prose instructions as a checklist. It does not infer executable patterns from prose.
 
-The material to fix it is already in each repo. A fieldbook repo's own
-`pretooluse-safety-gates.sh` encodes its real production fences in `block`/`ask` calls with
-human-written reasons; its `AGENTS.md` states the same rules in prose. Both are better
-sources than anything invented from outside.
-
-WHAT THIS DELIBERATELY DOES NOT DO: write to `policy`. Harvested rules land in
-`policyDraft`, and a human promotes them. An auto-enforced regex scraped out of a shell
-script is how you get a gate that blocks honest work on the third repo and gets disabled on
-the fourth. The scaffold's job is to make review cheap, not to skip it.
+Imported rules are written to ``policyDraft`` rather than the active ``policy`` section.
+Review and explicit promotion are required because translating shell control flow into a
+portable policy can change rule semantics.
 """
 
 from __future__ import annotations
@@ -23,7 +15,7 @@ import re
 import subprocess
 from pathlib import Path
 
-# `block "reason"` / `ask "reason"` — the fieldbook gate's own vocabulary.
+# Decision vocabulary used by supported legacy shell gates.
 DECISION_CALL = re.compile(r'^\s*(block|ask)\s+"((?:[^"\\]|\\.)*)"', re.M)
 GREP_PATTERN = re.compile(r'grep\s+-qE\s+"((?:[^"\\]|\\.)*)"')
 
@@ -40,11 +32,9 @@ NON_PORTABLE = re.compile(r"\\[bswdBSWD]")
 def _resolve_vars(pattern: str, assignments: dict[str, str], depth: int = 0) -> str:
     """Substitute the script's own shell variables into a harvested pattern.
 
-    A pattern lifted out of a shell script carries references like ${CSEP} that mean
-    something only inside that script. Passed to grep as a literal JSON string it matches
-    NOTHING, silently — which is the precise failure this whole scaffold exists to prevent,
-    reintroduced by the fix for it. So resolve what the script defines, and refuse to ship
-    what remains unresolved.
+    A pattern lifted out of a shell script can contain references such as ``${CSEP}`` that
+    have meaning only inside that script. Resolve variables defined by the source and reject
+    unresolved references before promotion.
     """
     if depth > 5:
         return pattern
@@ -76,17 +66,8 @@ CLASS_EQUIV = {
 def portable_boundaries(pattern: str) -> str:
     r"""Rewrite GNU-only escapes into POSIX so the pattern means the same everywhere.
 
-    `\b \s \S \w \W \d \D` are GNU extensions, not POSIX ERE. MEASURED on this machine:
-    macOS's /usr/bin/grep reports itself as "BSD grep, GNU compatible 2.6.0-FreeBSD" and
-    DOES honour them, so a gate using them is not broken here — the translation is
-    portability hygiene, not a live bug fix. Do not oversell it.
-
-    It still earns its place. The escapes are genuinely absent from busybox grep and from
-    minimal CI images, the failure mode when they are absent is silent rather than loud
-    (the pattern matches less than it should and nothing reports it), and the source gates
-    being harvested prescribe POSIX classes in their own headers. Normalising to the
-    spelling those headers ask for costs nothing and removes a whole class of "works on my
-    laptop".
+    `\b \s \S \w \W \d \D` are not part of POSIX ERE and are unavailable in some grep
+    implementations. Normalize them to explicit POSIX classes before validation.
 
     `\b` is context-dependent: a boundary after a word character is trailing, otherwise
     leading. Everything else is a straight class substitution.
@@ -132,11 +113,9 @@ def grep_accepts(pattern: str) -> tuple[bool, str]:
 # Commands that must never be gated. A harvested pattern matching any of these is
 # over-broad and is refused rather than promoted.
 #
-# This is the counterweight to "never weaker". A rule that denies everything is trivially
-# never weaker than the rule it replaces, and it is also precisely what gets a safety gate
-# switched off by the third repository. MEASURED case: harvesting a push-to-protected rule
-# picked up its bare `main|master` branch matcher without the `git push` half, producing a
-# policy that denied `ls main.py`.
+# This complements the "never weaker" check. A rule that denies everything is trivially
+# never weaker than the rule it replaces, but it is still invalid because it blocks benign
+# commands.
 BENIGN_PROBES = [
     "ls main.py", "echo main", "cat README.md", "grep -r master .",
     "git status", "git log --oneline -5", "git diff main",
@@ -172,10 +151,6 @@ def unsatisfiable(patterns: list[str]) -> bool:
     fire on a command matching all three simultaneously — which, for mutually exclusive
     alternatives, is never. The rule then sits in the policy looking exactly like a working
     fence.
-
-    That is not hypothetical: it silently disabled the `vercel --prod` / alias / dns denial
-    and a write-token denial in a live repository, while AGENTS.md declared them mechanically
-    enforced.
 
     Detection is empirical rather than analytical: mine probes from each pattern, and if no
     probe drawn from any of them satisfies every pattern, treat the conjunction as
@@ -285,13 +260,11 @@ def from_hook_scripts(root: Path) -> list[dict]:
             raw = [_clean(p) for p in GREP_PATTERN.findall(window)]
             resolved = [_resolve_vars(p, assignments) for p in raw]
 
-            # HOW THE PATTERNS ARE JOINED DECIDES EVERYTHING. A gate writes either
+            # Preserve the source control flow. A gate writes either
             #   grep A && grep B && block   (conjunction — both must hold)
             # or
             #   grep A || grep B; then block  (alternatives — either suffices)
-            # and reading the second as the first produces a rule that CAN NEVER FIRE.
-            # That mistake shipped 53 dead fences across six repositories, including live
-            # production denials, while the policy looked fully populated.
+            # and reading the second as the first produces a rule that cannot fire.
             joiner = "or" if ("||" in window and "&&" not in window) else \
                      ("mixed" if ("||" in window and "&&" in window) else "and")
             out.append({
@@ -306,24 +279,11 @@ def from_hook_scripts(root: Path) -> list[dict]:
 
 
 def from_agents_md(root: Path) -> list[dict]:
-    """List the prose rules. Deliberately does NOT infer a pattern or glob from any of them.
+    """Return prose rules as a checklist without inferring executable patterns.
 
-    Inference from prose was tried and removed. Across two repositories it produced zero
-    usable rules and seven actively harmful ones:
-
-      - a write-path glob mined from a sentence about a git STASH, denying an entire
-        directory the sentence never mentioned;
-      - an MCP deny pattern invented for a rule that names no tool at all;
-      - and four globs that were literal SENTENCE FRAGMENTS -- `without explicit consent.**`
-        used as a file glob -- because the path-detecting regex treated the `*` in markdown
-        `**bold**` as a wildcard and matched the prose BETWEEN two backticked spans.
-
-    A gate script yields a real regex with a script:line. A sentence yields a guess. The
-    guesses all had to be pruned by hand, which is worse than not offering them: a plausible
-    wrong rule costs more review than a blank field.
-
-    So prose rules are surfaced as a CHECKLIST of things a human might choose to mechanise,
-    carrying their text and nothing else.
+    Natural-language instructions do not reliably identify command regexes, tool names, or
+    path globs. Each item therefore retains its source text for human classification and no
+    enforcement fields are synthesized.
     """
     agents = root / "AGENTS.md"
     if not agents.exists():
@@ -339,12 +299,10 @@ def from_agents_md(root: Path) -> list[dict]:
 
 
 def protected_branches(root: Path) -> list[str]:
-    """Recover the protected-branch set from the gate being replaced.
+    """Recover protected branches from the source gate's shell assignment.
 
-    Declared by hand, this gets narrowed by accident. I set it to ["main"] on two separate
-    repositories whose legacy gates covered main AND master, silently un-protecting master
-    both times — `supersede` caught it both times, but only because it replays. The list is
-    sitting in the old script as a PROTECTED/PROTECTED_BRANCHES assignment, so read it.
+    Reading the source list prevents migration from narrowing protection to a manually
+    supplied subset.
     """
     hooks_dir = root / ".claude" / "hooks"
     if not hooks_dir.is_dir():
@@ -380,10 +338,7 @@ def build_draft(root: Path) -> dict:
         if not item["patterns"]:
             continue
         # A gate that chains `grep A && grep B && block` means A AND B. Taking only the
-        # first is wrong in both directions, and catastrophically so in one real case: a
-        # push-to-protected rule chains a `git push` pattern with a bare `main|master`
-        # branch matcher, and harvesting the branch matcher alone produced a rule that
-        # denied `ls main.py`. Conjunctions are preserved as allOf.
+        # first changes the rule in both directions. Conjunctions are preserved as allOf.
         raw_patterns = [p for p in item["patterns"] if p.strip()]
         translated_all = [portable_boundaries(p) for p in raw_patterns]
         was_translated = translated_all != raw_patterns
@@ -456,8 +411,8 @@ def build_draft(root: Path) -> dict:
         "_generated": "agentkit policy scaffold",
         "_contract": (
             "NOTHING HERE IS ENFORCED. Move entries into `policy` (dropping the _source/_review "
-            "keys) to turn them on. An auto-enforced regex scraped from a shell script is how a "
-            "gate ends up blocking honest work and getting disabled."
+            "keys) to turn them on. Review every imported regex against the source control flow "
+            "before promotion."
         ),
         "protectedBranches": protected_branches(root),
         "denyBashPatterns": deny_bash,

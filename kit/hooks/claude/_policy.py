@@ -54,11 +54,9 @@ def project_dir() -> Path:
 def harness() -> str:
     """The hook wire protocol in use.
 
-    Claude is the historical default because its settings cannot inject an environment
-    marker without rewriting every existing repository. The generated Codex adapter sets
-    ``AGENTKIT_HARNESS=codex`` explicitly. Unknown values fail closed: silently guessing
-    the response semantics is exactly how Codex's unsupported ``ask`` decision became an
-    allow during the compatibility audit.
+    Claude is the default because its settings do not inject a harness marker. The Codex
+    adapter sets ``AGENTKIT_HARNESS=codex`` explicitly. Unknown values fail closed to avoid
+    emitting a decision in the wrong wire format.
     """
     value = os.environ.get("AGENTKIT_HARNESS", "claude-code")
     if value not in {"claude-code", "codex"}:
@@ -219,10 +217,8 @@ def path_matches(candidate: str, glob: str) -> bool:
 def script_lengths(text: str, scripts: list[str]) -> dict[str, int]:
     """Count characters per Unicode script.
 
-    This exists so that a change to text the operator cannot read is still VISIBLE to
-    them as a number. It is a measurement, not an assurance -- which is exactly why it
-    survives the anti-verification-ritual rule: it is a gate on the world, not an
-    instruction for the agent to double-check itself.
+    This makes changes to configured writing systems quantitatively visible. It is a
+    measurement rather than a semantic validation of the text.
     """
     counts = {name: 0 for name in scripts}
     for ch in text:

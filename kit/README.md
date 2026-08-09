@@ -31,9 +31,9 @@ conforming repo reports `0 change(s)`.
 - `.agnix.toml` — linter config with severities raised on the six rules that matter
 - `CLAUDE.md` — a relative symlink to `AGENTS.md`, **only if absent**
 
-**Never writes:** `AGENTS.md`'s body, anything under `docs/project/`. A tool that generates
-truth recreates the accretion problem in a new costume. Copy
-`kit/templates/AGENTS.md.tmpl` and fill it in yourself.
+**Never writes:** `AGENTS.md`'s body or anything under `docs/project/`. Those files contain
+project-specific knowledge and remain human-authored. Copy `kit/templates/AGENTS.md.tmpl`
+and fill it in yourself.
 
 ## The commands
 
@@ -100,38 +100,25 @@ back. The probe corpus is mined from the **old gate's own patterns**, so every r
 encodes is exercised by a command derived from that rule — plus a fixed dangerous set. It
 is a sample, not a proof, and the report says so.
 
-### Why check 2 exists
+### Why benign probes are required
 
-"Never weaker" alone is not a bar. A rule that denies everything is trivially never weaker,
-passes the comparison, and then blocks honest work until somebody switches the gate off —
-which is the failure this entire system is built to avoid.
-
-It is not hypothetical. Harvesting one repository's push-to-protected rule picked up its
-bare `main|master` branch matcher without the `git push` half, producing a policy that
-**denied `ls main.py`**. Two defenses now: `policy scaffold` tests every candidate against
-a benign corpus and refuses to promote an over-broad one, and gate rules support `allOf`
-so a chained `grep A && grep B` keeps both halves instead of being flattened to one.
+"Never weaker" alone is insufficient because a rule that denies everything satisfies it.
+`policy scaffold` therefore tests candidates against a benign corpus and refuses to promote
+over-broad patterns. Gate rules also support `allOf`, preserving both halves of a chained
+`grep A && grep B` condition.
 
 `apply` **refuses a dirty working tree** unless you pass `--allow-dirty`, so an install
 stays reviewable on its own rather than mixed into someone's in-progress work. Its own
 footprint is excluded from that check, so it can always re-run over itself.
 
-## Two failure modes this is built around
+## Policy verification semantics
 
-**Installed but inert — narrowed on 2026-08-09, and the correction matters.** This used to
-say an empty policy protected nothing and `verify` raised a warning about it. That was true
-when the universal rules were thinner. It is now false: with no policy at all, `apply` still
-gives you a floor that denies force-push, checks-bypass and destructive database operations,
-and asks before recursive rm outside safe paths or history-losing git. For a repository that
-deploys nothing and holds no production data, **an empty policy is the correct state.**
-
-So it is a note rather than a warning, and it says what the floor covers. The residual risk
-is narrower and worth stating precisely: a repo that *does* deploy, hold credentials, or write
-to live data has fences no catalogue can guess, and an empty policy there is a real gap.
-`fleet` still prints `POLICY-EMPTY` so that case is visible across a fleet.
-
-A warning nobody can act on correctly is noise, and noise is what gets a checker switched off
-— which is the failure this whole kit exists to avoid.
+**Empty repository policy.** The universal floor remains active when `policy` is empty: it
+covers force-push, checks bypass, destructive database operations, recursive removal outside
+safe paths, and history-losing Git commands. Repository-specific policies are needed only for
+boundaries a general catalogue cannot know, such as production deploys, credential surfaces,
+generated files, and live-data operations. `fleet` reports `POLICY-EMPTY` for visibility but
+`verify` does not treat it as an error by itself.
 
 **Inert rules.** A pattern that silently matches nothing looks exactly like one that works.
 `policy scaffold` resolves the source script's shell variables, translates GNU escapes to
@@ -139,7 +126,7 @@ POSIX, and validates every pattern with `grep -E` itself — anything it cannot 
 goes to `needsManualPattern` instead of shipping. `verify` independently lints the **live**
 policy and errors on any inert rule, however it got there.
 
-## Stage, so ten repos don't look like ten failures
+## Migration stages
 
 `verify` derives a stage from the filesystem and splits findings accordingly:
 
@@ -152,19 +139,17 @@ policy and errors on any inert rule, however it got there.
 **BLOCKING** findings (dead references, override files, absolute symlinks, budget overruns,
 inert policy rules) are errors at every stage. **MIGRATION** findings (recognized legacy residue,
 retired skills, missing `docs/project/`) are `TODO` while a repo is mid-migration and become
-errors once it claims to be done. Without the split, ten un-migrated repos produce ninety
-identical-looking errors and there is no signal at all.
+errors once it claims to be done. This keeps incomplete migration work distinct from defects
+in repositories that already claim the canonical layout.
 
 Stage is deliberately structural. Unscoped rules and nested `AGENTS.md` are *not* stage
 markers, because a finished repo can acquire either by committing one bad file — and if
 they counted, that commit would silently demote the repo and downgrade its own error.
 
-`verify --effective` additionally diffs Codex's real model-visible prompt against the
-declared ledger. **It has a measured false negative:** `codex debug prompt-input` reports
-different content depending on machine-local workspace trust, so an untrusted checkout —
-which is what a CI runner is — cannot see a `.codex/config.toml` amputation. The static
-check is the CI gate; `--effective` is the developer-machine check. They are not
-interchangeable.
+`verify --effective` additionally diffs Codex's model-visible prompt against the declared
+ledger. Its result depends on machine-local workspace trust, so an untrusted CI checkout
+cannot observe trusted-workspace configuration. Use the static verifier in CI and
+`--effective` on a trusted developer checkout; they cover different surfaces.
 
 `self-test` is what entitles a repo to report **verified enforcement**. The compatibility manifest
 currently serializes that state as `enforcement: blocking`; this is a technical enum, not a claim
@@ -186,11 +171,9 @@ or any adapter change; a temporary trust override proves code paths, not operati
 Codex does not support an interactive `ask` decision in `PreToolUse`; the shared engine converts
 that verdict to deny so confirmation rules cannot fail open.
 
-**Everything fails closed.** A gate that cannot parse its input, read its policy, or
-compile a pattern exits 2. Claude Code treats exit 1 as non-blocking and proceeds; only
-exit 2 blocks. The ancestor of the Bash gate exited **0** when `jq` was missing, which was
-a silent allow of every command, and nothing noticed. That specific regression is covered
-by a test.
+**Everything fails closed.** A gate that cannot parse its input, read its policy, or compile
+a pattern exits 2. Claude Code treats exit 1 as non-blocking and proceeds; exit 2 blocks.
+The missing-parser path is covered directly by the test suite.
 
 ## Policy lives in one file
 
@@ -207,8 +190,8 @@ There is no second config file, and the hooks are not edited per repo.
       "whenArgMatches": { "target": "^production$" } }
   ],
   "measureOnWrite": [
-    { "glob": "lib/content/**", "measure": "script-lengths", "scripts": ["Cyrillic"],
-      "reason": "the operator cannot read Cyrillic and needs a number." }
+    { "glob": "content/localized/**", "measure": "script-lengths", "scripts": ["Cyrillic"],
+      "reason": "report a quantitative change for localized content." }
   ]
 }
 ```
@@ -218,20 +201,11 @@ deliberately twice: the permission system is the client-enforced layer Anthropic
 for hard path blocks, and the hook is what still fires if a settings layer is missing or
 overridden.
 
-### `measureOnWrite` is the important one
+### `measureOnWrite`
 
-It exists for rules like *"report Cyrillic string lengths before and after any change near
-bilingual content"* — a measurement that exists because a human **cannot read the output**
-and needs a number to sanity-check against.
-
-The kit does not ask the agent to take that measurement. It takes it, before and after, and
-reports the delta. Measured strict compliance with long-standing prose instructions runs
-around 36% at best configuration, so as prose this happens roughly one time in three and
-nobody finds out which. As a hook it happens every time.
-
-That is the whole argument for keeping these rules when the "delete verification
-scaffolding" guidance says to cut them: they are gates on the world, not rituals about the
-agent's own reasoning.
+`measureOnWrite` records a configured metric before and after each matching edit and reports
+the delta. Supported measurements include Unicode-script character counts, byte size, and
+line count. The hook performs the measurement directly instead of relying on a prose reminder.
 
 ## Testing
 
@@ -244,26 +218,15 @@ because a gate that allows everything passes any happy-path suite.
 
 ## CI
 
-Copy `kit/templates/ci-workflow.yml` to `.github/workflows/agentkit.yml`. On a personal
-plan CI **detects and cannot block** — branch protection returns 403 without GitHub Pro —
-so the workflow's job is to be loud after the fact, not to be a fence.
+Copy `kit/templates/ci-workflow.yml` to `.github/workflows/agentkit.yml`. The workflow blocks
+merges only when branch protection or a repository ruleset requires the job to pass; otherwise
+it reports violations after a push.
 
 ## What this deliberately does not do
 
-- **No distribution/generation layer.** `ruler` and `rulesync` fan one source out into 30+
-  agents' native formats. That is right for a design that duplicates instructions per
-  harness and wrong for this one, which keeps `AGENTS.md` canonical and uses only declared,
-  verifier-checked adapters: a root Claude symlink and a manual ZCode skill import.
+- **No instruction duplication layer.** RepoCharter keeps `AGENTS.md` canonical and uses
+  declared, verifier-checked provider adapters.
 - **No re-implementation of agnix.** The shared catalogue remains opt-in through
   `verify --agnix`; default verification is checked in, dependency-free, and offline.
-- **No submodule.** Vendored copy with a version stamp, because submodules break on fresh
-  clone in exactly the automated contexts this serves. A weaker consistency guarantee,
-  traded knowingly.
-
-## Honest note on size
-
-The design estimated the bespoke residue at ~150 lines. `verify/residue.py` came out at
-roughly 400, because the budget gates, the amputation vectors, and the frontmatter checks
-turned out to need real logic rather than a shell out to agnix. The ratio the estimate was
-defending still holds — 445 shared rules reused against ~400 lines written — but the number
-was optimistic and is corrected here rather than quietly.
+- **No submodule.** Each repository receives a versioned vendored runtime so fresh clones and
+  CI do not depend on submodule initialization.

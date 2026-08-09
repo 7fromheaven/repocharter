@@ -1,20 +1,16 @@
-"""Migration planning: do the mechanical parts, write down the judgment calls.
-
-The division is the whole point, so it is worth stating precisely.
+"""Plan legacy-layout migration and separate mechanical work from judgment calls.
 
 MECHANICAL means the correct action is fully determined by what is on disk, and the tool
 can perform it without reading anyone's mind: neutralising a nested AGENTS.md inside an
 archive, creating the canonical directory skeleton, declaring a harness-written directory.
 These are applied with --apply.
 
-JUDGMENT means the right answer depends on what the content MEANS: which of six fieldbook
-skills is a real procedure worth porting, how a 12,950-byte rules file splits into
-path-scoped pieces, what in 1,446 archived files is durable project truth. The tool refuses
-to guess and writes a plan instead, with the evidence needed to decide.
+JUDGMENT means the correct action depends on the content's meaning, such as whether a
+retired skill remains useful or which archived facts are still current. The tool records a
+review plan instead of guessing.
 
-NOTHING IS EVER DELETED. Mechanical actions quarantine into .agents/quarantine/<stamp>/
-with a manifest, so `agentkit revert` can put everything back. A migration you cannot undo
-is one nobody will run on the tenth repository.
+Mechanical retirements move content to an external quarantine with a manifest so
+``agentkit revert`` can restore it.
 """
 
 from __future__ import annotations
@@ -65,15 +61,9 @@ def _quarantine_dir(root: Path, stamp: str) -> Path:
 def quarantine_root(repo: Path, stamp: str) -> Path:
     """Where retired content goes: OUTSIDE the repository.
 
-    In-tree quarantine loses. `.gitignore` keeps it out of git but not out of the repo's own
-    tooling: on one repo the pre-commit eslint gate began reporting unused-variable warnings
-    from quarantined hook fixtures, and eslint's flat config does not read .gitignore.
-    Prettier, tsc, ruff and every doc-linter each have their own ignore mechanism, so
-    in-tree means fighting all of them in all 14 repositories.
-
-    Out-of-tree means no in-repo tool can see it, no ignore entry is needed anywhere, and
-    the retirement still shows up in git as a plain deletion — with the originals recoverable
-    from history regardless.
+    Keeping quarantine out of tree prevents linters, type checkers, formatters, and other
+    repository tooling from processing retired files. The manifest retains the information
+    required for restoration.
     """
     state = Path(os.environ.get("AGENTKIT_STATE_DIR") or (Path.home() / ".agentkit"))
     return state / "quarantine" / repo.resolve().name / stamp
@@ -139,7 +129,7 @@ def build(root: Path) -> Plan:
         plan.judgment.append(Decision(
             kind="skill-disposition",
             subject=f".claude/skills/{name}",
-            question=f"Does `{name}` hold a real repeatable procedure, or is it fieldbook bookkeeping?",
+            question=f"Does `{name}` hold a repeatable procedure, or only legacy-system bookkeeping?",
             evidence=[
                 f"SKILL.md is {size:,} bytes",
                 f"first line: {first_line[:100]}" if first_line else "no readable heading",
@@ -174,12 +164,12 @@ def build(root: Path) -> Plan:
             ],
         ))
 
-    for marker in m.fieldbook_dirs:
+    for marker in m.legacy_dirs:
         d = root / marker
         files = [p for p in d.rglob("*") if p.is_file()]
         total = sum(p.stat().st_size for p in files)
         plan.judgment.append(Decision(
-            kind="fieldbook-content",
+            kind="legacy-content",
             subject=marker,
             question=(
                 "What in here is durable project truth, and what is process exhaust? Only truth "
@@ -301,9 +291,8 @@ def apply_mechanical(root: Path, plan: Plan, kit_root: Path) -> list[str]:
                 else:
                     target.write_text(
                         f"# {name.replace('.md', '')}\n\n"
-                        f"<!-- Created empty by `agentkit migrate`. Filling it is a judgment call:\n"
-                        f"     see the migration plan. An empty canonical file is honest; a\n"
-                        f"     generated one would be truth nobody wrote. -->\n",
+                        f"<!-- Created empty by `agentkit migrate`. See the migration plan and\n"
+                        f"     add reviewed project content; migration does not synthesize facts. -->\n",
                         encoding="utf-8")
                 created.append(name)
                 manifest.append({"op": "created", "path": str(target.relative_to(root))})

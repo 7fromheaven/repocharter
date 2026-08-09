@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""agentkit test suite. No dependencies — `python3 kit/tests/run_tests.py`.
+"""Dependency-free agentkit test suite: ``python3 kit/tests/run_tests.py``.
 
-Deliberately dependency-free: this has to run in 41 repositories, in CI, and on a fresh
-clone with nothing installed. A test suite that needs its own install is a test suite
-people skip.
-
-The tests that matter most are the NEGATIVE ones. A safety gate that allows everything
-passes any test that only checks the happy path, and that is precisely the failure this
-kit was built to fix: the ancestor gate exited 0 when it could not parse its input, and
-nothing noticed for months. So: every gate is tested for what it must REFUSE, and the
-fail-closed path is tested directly.
+Negative cases exercise commands each gate must refuse, malformed inputs, and fail-closed
+paths. Positive cases ensure the same policies do not block ordinary work.
 """
 
 from __future__ import annotations
@@ -137,10 +130,8 @@ def test_bash_gate(tmp: Path) -> None:
         ("checkout a file",             "git checkout -- src/app.ts",                "ask"),
         ("recursive rm outside safe",   "rm -rf /Users/someone/important",           "ask"),
 
-        # Databases. Measured 2026-08-09: before this rule the gate ALLOWED every
-        # one of these. Wiping is blocked; resetting asks, because resetting a local
-        # dev database is an everyday command and a gate that blocks routine work is
-        # a gate somebody switches off.
+        # Database wipes are denied; reset operations request confirmation because they can
+        # be valid in local development.
         ("DROP TABLE via psql",         "psql -c 'DROP TABLE users'",                "deny"),
         ("drop database, lowercase",    'psql -c "drop database prod"',              "deny"),
         ("redis FLUSHALL",              "redis-cli FLUSHALL",                        "deny"),
@@ -184,9 +175,8 @@ def test_bash_gate(tmp: Path) -> None:
         ("rm -rf a build dir",       "rm -rf ./dist/"),
         ("--no-verify inside a message body", "git commit -m 'note\nmentions --no-verify here'"),
 
-        # The database rule must not eat the ability to AUDIT for the danger. A rule
-        # that fires on the words alone blocks the search for them — the same trap
-        # that once made a harvested rule deny `ls main.py`.
+        # Database rules must not block searches for dangerous SQL or reads of migration
+        # files; both require a database command in addition to the destructive verb.
         ("grepping FOR 'DROP TABLE'",  "grep -rn 'DROP TABLE' ."),
         ("reading a migration file",   "cat migrations/001_drop_table.sql"),
         ("a plain SELECT",             "psql -c 'SELECT * FROM users'"),
@@ -205,11 +195,7 @@ def test_bash_gate(tmp: Path) -> None:
         check(f"{label} -> allow", got in ("allow",), f"got {got}")
 
     section("Bash gate — a repo cannot lower the universal floor")
-    # Measured on a real repo 2026-08-09: its broad WP-CLI ask-rule matched
-    # `wp db drop` before the universal database block ran, and because the gate
-    # exits on first match, repo policy silently downgraded a hard block to a
-    # prompt. A floor a repo can lower is not a floor. So a repo `ask` is HELD
-    # until every universal block has had its turn.
+    # A repository `ask` is held until universal denials have been evaluated.
     shadow = make_repo(tmp / "shadow", policy={"askBashPatterns": [
         {"pattern": "(^|[^[:alnum:]_])wp([^[:alnum:]_]|$)",
          "reason": "a deliberately broad rule that matches everything wp"}]})
@@ -243,7 +229,7 @@ def test_write_gate(tmp: Path) -> None:
         ],
         "measureOnWrite": [
             {"glob": "lib/content/**", "measure": "script-lengths", "scripts": ["Cyrillic"],
-             "reason": "the operator cannot read Cyrillic and needs a number."},
+             "reason": "report a quantitative change for localized content."},
         ],
     }
     repo = make_repo(tmp, policy)
@@ -310,7 +296,7 @@ def test_write_gate(tmp: Path) -> None:
     )
     check("an unrecognised Codex patch shape fails closed", code == 2, f"exit {code}: {err[:120]}")
 
-    section("Edit/Write gate — the measurement that must never be deleted")
+    section("Edit/Write gate — configured before/after measurement")
     target = repo / "lib" / "content" / "loc.json"
     target.write_text(json.dumps({"title": "Привет мир"}, ensure_ascii=False), encoding="utf-8")
     code, out, _ = run_hook("pretooluse-write.py", {"tool_name": "Edit", "tool_input": {"file_path": str(target)}}, repo)
@@ -321,7 +307,7 @@ def test_write_gate(tmp: Path) -> None:
     code, out, _ = run_hook("posttooluse-write.py", {"tool_name": "Edit", "tool_input": {"file_path": str(target)}}, repo)
     ctx = context_of(out)
     check("after-measurement reports a delta", "AFTER" in ctx and "Cyrillic" in ctx, ctx[:200])
-    check("a shrinking Cyrillic count is flagged CHANGED", "CHANGED" in ctx, ctx[:200])
+    check("a shrinking script count is flagged CHANGED", "CHANGED" in ctx, ctx[:200])
 
     section("Edit/Write gate — corrupt policy fails CLOSED")
     broken = make_repo(tmp / "broken")
@@ -494,8 +480,8 @@ def test_residue(tmp: Path) -> None:
           not has(rep, "errors", "paths") and not has(rep, "todos", "paths"), str(rep)[:200])
 
     section("Residue verifier — stage separates 'not migrated' from 'broken'")
-    # Ten un-migrated repos must not look like ten broken ones. Migration findings are TODOs
-    # while the repo is mid-migration; a genuinely broken thing is an error at every stage.
+    # Migration findings are TODOs while a repo is mid-migration; defects that are invalid
+    # at every stage remain errors.
     repo = make_repo(tmp / "r13")
     (repo / ".agent-docs").mkdir(exist_ok=True)
     rules = repo / ".claude" / "rules"
@@ -504,11 +490,7 @@ def test_residue(tmp: Path) -> None:
     rep = residue(repo)
     check("mid-migration repo reports stage 'mechanical'", rep.get("stage") == "mechanical", str(rep.get("stage")))
     check("unscoped rules are a TODO, not an error", has(rep, "todos", "paths"), str(rep)[:200])
-    # An empty policy used to be a WARNING saying the gates "enforce nothing". That was
-    # true when the universal rules were thinner and is now false: force-push,
-    # checks-bypass, destructive database operations and recursive rm all fire with no
-    # policy at all. For a repo that deploys nothing, empty is the CORRECT state — so
-    # this is a note, and it must NOT claim the repo is unprotected.
+    # An empty repository policy is valid because the universal floor remains active.
     check("an empty policy is a note, not a warning",
           has(rep, "notes", "policy is empty") and not has(rep, "warnings", "policy is EMPTY"),
           str(rep.get("warnings"))[:160])
@@ -587,7 +569,7 @@ def test_residue(tmp: Path) -> None:
     check("a repo claiming 'migrated' turns the same finding into an ERROR",
           rep.get("stage") == "migrated" and has(rep, "errors", "paths"), str(rep)[:220])
 
-    section("Residue verifier — skills adapter, including the bug that broke the ancestor")
+    section("Residue verifier — skills adapter and harness-written directories")
 
     repo = make_repo(tmp / "r9")
     skill = repo / ".agents" / "skills" / "demo"
@@ -599,8 +581,7 @@ def test_residue(tmp: Path) -> None:
     rep = residue(repo)
     check("a conforming relative symlink passes", not has(rep, "errors", "demo"), str(rep["errors"])[:200])
 
-    # This is the exact shape that hard-failed the reference repo's validator: Claude Code
-    # writes a REAL directory here when /verify runs.
+    # Claude Code writes a real directory here when /verify runs; it is not an adapter error.
     (claude_skills / "verify").mkdir(exist_ok=True)
     (claude_skills / "verify" / "SKILL.md").write_text("---\nname: verify\ndescription: d\n---\n", encoding="utf-8")
     rep = residue(repo)
@@ -703,8 +684,7 @@ def test_apply(tmp: Path) -> None:
     check("second apply is idempotent", "0 change(s)" in second.stdout, second.stdout[-200:])
 
     section("apply — must NOT disarm a repo that already has hooks")
-    # Found against a real fieldbook repo carrying 8 hook entries across 5 events. Assigning
-    # settings["hooks"] wholesale deleted every one of them while reporting success.
+    # Applying agentkit must merge hook groups instead of replacing foreign entries.
     legacy = tmp / "legacy-hooks"
     legacy.mkdir(parents=True, exist_ok=True)
     git_init(legacy)
@@ -789,8 +769,7 @@ def test_apply(tmp: Path) -> None:
     check("unrelated user key preserved", after.get("customUserKey") == "kept")
 
     section("revert — must never destroy a quarantine it could not restore")
-    # It did exactly that once: a manifest whose paths no longer resolved undid zero actions
-    # and the tool then rmtree'd the only copy of a retired safety gate.
+    # A failed restore must leave the quarantine intact.
     stale = tmp / "stale-quarantine"
     stale.mkdir(parents=True, exist_ok=True)
     git_init(stale)
@@ -834,8 +813,7 @@ def test_policy_and_supersede(tmp: Path) -> None:
           sc.portable_boundaries(r"\bmain") == "(^|[^[:alnum:]_])main")
 
     section("policy harvest — over-broad rules are refused, not promoted")
-    # The measured failure: harvesting a push-to-protected rule's bare branch matcher
-    # produced a policy that denied `ls main.py`.
+    # A bare branch-name matcher is over-broad without the git-push condition.
     branch_only = "(^|[^[:alnum:]_])main([^[:alnum:]_]|$)|(^|[^[:alnum:]_])master([^[:alnum:]_]|$)"
     blocked = sc.over_broad([branch_only])
     check("a bare branch matcher is caught as over-broad", "ls main.py" in blocked, str(blocked))
@@ -861,13 +839,11 @@ def test_policy_and_supersede(tmp: Path) -> None:
         check(f"{cmd!r} -> {expected}", got == expected, f"got {got}")
 
     section("protectedBranches is read from policy, not hardcoded")
-    # Found on a repo whose live deploy branch is `beast`: the gate hardcoded (main|master)
-    # while the schema documented policy.protectedBranches, so force-pushing the deploy
-    # branch was allowed by a repo that believed it was protected.
-    repo = make_repo(tmp / "branches", {"protectedBranches": ["main", "beast"]})
+    # The gate must use the declared branch list rather than hardcoding main and master.
+    repo = make_repo(tmp / "branches", {"protectedBranches": ["main", "release"]})
     for cmd, expected in [
-        ("git push --force origin beast", "deny"),
-        ("git push origin beast", "ask"),
+        ("git push --force origin release", "deny"),
+        ("git push origin release", "ask"),
         ("git push --force origin main", "deny"),
         ("git push origin feature/x", "allow"),
     ]:
@@ -900,13 +876,7 @@ def test_policy_and_supersede(tmp: Path) -> None:
 
 
 def test_measure(tmp: Path) -> None:
-    """`measure` is what makes an enforcement claim a measurement.
-
-    The bar it has to clear is not "finds broken fences". It is "never calls a
-    working fence broken, and never calls an unmeasured fence passing". The
-    previous detector failed the first half on 9 rules, so most of these are
-    negative tests about restraint.
-    """
+    """Test live policy measurement, including inconclusive and negative cases."""
     sys.path.insert(0, str(KIT / "lib"))
     import measure as me
 
@@ -925,8 +895,7 @@ def test_measure(tmp: Path) -> None:
           all(me._matches_all(c, [negated]) for c in got))
 
     section("measure — a real conjunction is NOT called inert")
-    # These three shipped as `allOf` and the shape heuristic called them broken.
-    # `npm install -g x` satisfies all three at once, so they are real fences.
+    # `npm install -g x` satisfies this valid three-part conjunction.
     real = [r"(^[[:space:]]*|[;&|][[:space:]]*)([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+ +)*(npm|pnpm|yarn|bun)([^[:alnum:]_]|$)",
             r"(^|[[:space:]])(install|i|add)([[:space:]]|$)",
             r"(^|[[:space:]])(-g|--global)([[:space:]]|=|$)"]
@@ -939,8 +908,7 @@ def test_measure(tmp: Path) -> None:
     contradiction = [r"(^|[[:space:]])vercel([[:space:]]|$)",
                      r"(^|[[:space:]])supabase([[:space:]]|$)"]
     probes, note = me.compose_probes(contradiction)
-    # Only inert if nothing satisfies both. A composite "vercel supabase" would
-    # satisfy both, so this asserts the honest outcome either way.
+    # Only inert if nothing satisfies both. A validated composite is also a correct result.
     if probes:
         check("a composite satisfying both is validated before use",
               all(me._matches_all(p, contradiction) for p in probes))
@@ -967,17 +935,12 @@ def test_measure(tmp: Path) -> None:
     # LIVE and never that it is RIGHT. This is the independent check.
     check("checks-bypass family covers the natural argument order",
           "git commit --no-verify -m x" in me.COVERAGE_FAMILIES["checks-bypass"])
-    check("and the order that a real repo's pattern matched instead",
+    check("and the alternate argument order",
           "git commit -m x --no-verify" in me.COVERAGE_FAMILIES["checks-bypass"])
 
 
 def test_vendor_and_precommit(tmp: Path) -> None:
-    """A repo has to be able to check itself, on any machine, with no network.
-
-    Measured 2026-08-09: `kit/agentkit` was absent from all six migrated repos, so
-    every one of them depended on the kit's source checkout existing at one path on one
-    laptop, and nothing ran the checks on commit anywhere.
-    """
+    """A fresh clone can run vendored verification without a network or source checkout."""
     repo = tmp / "repo"
     repo.mkdir(parents=True, exist_ok=True)
     run = lambda *a: subprocess.run(list(a), cwd=repo, capture_output=True, text=True)
@@ -1049,13 +1012,7 @@ def test_vendor_and_precommit(tmp: Path) -> None:
 
 
 def test_stale_session_tombstone(tmp: Path) -> None:
-    """A hook referenced but not on disk must BLOCK, not wave the command through.
-
-    Measured 2026-08-08: a migration rewired the hooks, a session already open kept
-    calling the deleted script, the shell returned 127, Claude Code treats anything
-    but 2 as non-blocking — and an entire session of commits ran with no Bash gate,
-    announced only by a warning line that scrolled past.
-    """
+    """A hook referenced by a stale session must block after its implementation moves."""
     repo = tmp / "repo"
     (repo / ".claude" / "hooks").mkdir(parents=True, exist_ok=True)
     run = lambda *a: subprocess.run(list(a), cwd=repo, capture_output=True, text=True)
@@ -1074,7 +1031,7 @@ def test_stale_session_tombstone(tmp: Path) -> None:
     run("git", "commit", "-qm", "init")
 
     section("stale sessions — the interpreter is not read as the script")
-    # A sweep that took the first token once deleted a live hook in a real repo.
+    # Interpreter-prefixed hook commands must resolve to the script rather than the binary.
     paths = agentkit_mod._hook_script_paths({"PreToolUse": [{"hooks": [
         {"command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/real.sh"}]}]}, repo)
     check("`bash <script>` resolves to the script, not to bash",

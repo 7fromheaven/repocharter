@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse gate for Edit|Write — path denials and before-measurements.
-
-Two jobs, and they are different in kind.
+"""PreToolUse gate for Edit|Write path denials and before-measurements.
 
 DENIALS. `policy.denyWritePaths` names files no agent may edit. These are ALSO compiled
 into settings.json `permissions.deny` by `agentkit apply`, deliberately twice: the
@@ -10,16 +8,9 @@ permission system is the client-enforced layer Anthropic points at for hard path
 hook is what still fires when a settings layer is missing, excluded, or overridden. Two
 independent layers, neither of which is the other's excuse.
 
-BEFORE-MEASUREMENTS. `policy.measureOnWrite` names the observations that must accompany a
-change -- string lengths in a script the operator does not read being the case this was built
-for. Those exist because a human cannot read the output and needs a NUMBER to sanity-check
-against. The retired design would have deleted them as "verification ritual"; they are not
-ritual, they are gates on the world.
-
-The important move is that this hook does not ASK the agent to take the measurement. It
-takes it, and its PostToolUse sibling takes it again afterwards and reports the delta.
-That converts a prose instruction followed roughly a third of the time into something that
-happens whether or not the agent cooperates.
+BEFORE-MEASUREMENTS. `policy.measureOnWrite` names quantitative observations that must
+accompany a change. This hook records the pre-write value; its PostToolUse sibling records
+the new value and reports the delta.
 """
 
 from __future__ import annotations

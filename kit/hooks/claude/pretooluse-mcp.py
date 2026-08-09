@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""PreToolUse gate for MCP tools — the surface a Bash-only matcher cannot see.
+"""PreToolUse gate for MCP calls, which do not pass through the Bash hook.
 
-The reference repo declared exactly one PreToolUse matcher, "Bash". That made every MCP
-tool invisible to every safety rule in the repository, including a deploy tool whose
-schema takes target: "production" and which is loadable in an ordinary session. No amount
-of Bash regex reaches it, because no shell command is involved.
-
-`mcp__.*` has been a supported matcher the entire time. This gate closes that hole.
-
-Denials are declared in `policy.denyMcpTools`, each optionally narrowed by argument, so a
-preview deploy stays available while a production deploy does not -- the goal is a gate
-people keep, not one they disable the first time it blocks legitimate work.
+Denials are declared in ``policy.denyMcpTools`` and can be narrowed by argument so allowed
+uses of the same tool remain available.
 """
 
 from __future__ import annotations
@@ -28,8 +20,7 @@ def arg_matches(tool_input: dict, conditions: dict) -> bool:
     """True when EVERY declared argument condition matches.
 
     An absent argument does not match: a rule saying `target: ^production$` should not
-    fire on a call that omits target entirely, because the tool's own default may well be
-    the safe one. Denying what we cannot see would train people to remove the rule.
+        fire on a call that omits target entirely because the tool may define a safe default.
     """
     for name, pattern in conditions.items():
         value = tool_input.get(name)

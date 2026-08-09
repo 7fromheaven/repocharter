@@ -1,28 +1,19 @@
-"""measure — fire every fence a repo declares and record what actually happened.
+"""Exercise every declared policy rule against the installed gate.
 
-Nothing in this system's record suggests the failure mode is a missing rule. Every
-time, it has been a rule that looks installed and enforces nothing: 53 harvested
-conjunctions that could never fire, a detector for those that called 9 working
-fences broken, and a deny rule the harness does not implement. The verifier caught
-none of the three. Two were caught by someone else and one by a startup warning.
+Configuration alone cannot establish that a rule is active. For each rule, this module
+constructs a probe that matches the declared pattern, validates it with ``grep -E``, runs
+it through the installed gate, and compares the observed decision with the declaration.
 
-So this command does not inspect rules. It runs them. For every rule it constructs
-a probe that provably matches the rule's own pattern(s) — validated with `grep -E`
-against those patterns before it is used — fires that probe at the INSTALLED gate,
-and compares the decision observed to the verb declared.
-
-The distinction that keeps this honest, and the one the previous detector got
-wrong:
+Two inconclusive outcomes are reported separately:
 
   INERT       every sub-pattern yields probes on its own, yet no combination of
               them satisfies all sub-patterns at once. The conditions contradict.
-              This is demonstrated, not suspected — the shape a harvested `||`
-              chain takes when it is read as `&&`.
+              This is the shape produced when alternatives are represented as a
+              conjunction.
 
   UNPROBEABLE the miner could not build a matching probe at all. That is a
               statement about the miner, not about the rule. Reported separately
-              and never counted as a broken fence, because calling an unmeasured
-              rule broken is exactly the error that produced 9 false positives.
+              and never counted as a broken rule.
 
 A rule this command cannot measure is reported as unmeasured. It is never reported
 as passing.
@@ -66,17 +57,14 @@ _MAX_COMPOSITES = 400
 
 # ── ERE expansion ─────────────────────────────────────────────────────────────
 #
-# `mine_probes` strips a pattern down with substitutions, which works for flat
-# patterns and fails on every interesting one: nested optional groups like
+# `mine_probes` strips a pattern down with substitutions. That is insufficient for
+# nested optional groups like
 # `(npx +|pnpm +(exec +|dlx +))?`, negated classes like `[^[:alnum:]_$]`, escaped
-# literals like `\$\{?`. Measured on one repo, it could not build a probe for the
-# Sanity write fence, the write-token fence, or the production-deploy fence — the
-# three that matter most there.
+# literals like `\$\{?`, and similar production policy patterns.
 #
-# So this is a small recursive-descent expander over the ERE subset these patterns
-# actually use. It is approximate ON PURPOSE and it is allowed to be: every string
-# it produces is validated with `grep -E` against the source pattern before use, so
-# a bug here yields UNPROBEABLE (honest) and can never yield a false pass.
+# This bounded recursive-descent expander covers the ERE subset used by those patterns.
+# Every generated string is validated with `grep -E` against the source pattern, so an
+# unsupported construct yields UNPROBEABLE rather than a false pass.
 
 _POSIX_REP = {
     "alnum": "x", "alpha": "x", "digit": "1", "lower": "x", "upper": "X",
@@ -252,10 +240,8 @@ def expand_ere(pattern: str, limit: int = 6) -> list[str]:
     return out
 
 
-# Realistic commands for fence shapes that recur across repos. Tried last, when
-# both provers fail. Generating a string from a regex is approximate; a real
-# command that happens to match the rule is better evidence than either, because a
-# reader can see at a glance what was actually refused.
+# Concrete commands for common policy shapes. These are tried after both pattern-based
+# generators fail and remain subject to the same source-pattern validation.
 FALLBACK_CORPUS = [
     "git commit --no-verify -m x",
     "git commit --no-gpg-sign -m x",
@@ -496,16 +482,9 @@ def measure_mcp_rule(rule: dict, gate: Path, repo: Path) -> dict:
 # prove a pattern is live and can never prove it is RIGHT. A pattern written
 # wrongly produces a probe that is equally wrong, and both agree.
 #
-# Found in three repos: a checks-bypass fence whose `git +.*(^|[^[:alnum:]_])`
-# prefix demands a non-alphanumeric between `git` and the verb, which the `git +`
-# before it has already consumed. It fires on `git commit -m x --no-verify` and
-# misses `git commit --no-verify -m x`, `git push --no-verify origin main`, and a
-# bare `git commit --no-verify`. Pattern-derived probing certified it as live.
-#
-# So: an INDEPENDENT corpus, written as commands a person would actually type,
-# grouped by the danger they represent. If a repo gates any member of a family it
-# has taken a position on that danger, and every sibling that walks through is a
-# hole in a fence somebody believes they have.
+# An independent command corpus catches coverage gaps that pattern-derived probes cannot.
+# Commands are grouped by danger; if any member is gated, ungated siblings are reported as
+# narrow coverage.
 COVERAGE_FAMILIES = {
     "checks-bypass": [
         "git commit --no-verify -m x",
@@ -559,7 +538,7 @@ def measure_overbroad(gate: Path, repo: Path) -> list[dict]:
     """Commands that must never be gated, whatever the policy says.
 
     "Never weaker" is not a sufficient bar on its own: a rule denying everything is
-    trivially never weaker. One harvested rule really did deny `ls main.py`.
+    trivially never weaker. Benign probes detect that class of over-broad rule.
     """
     out = []
     for command in BENIGN_CORPUS:

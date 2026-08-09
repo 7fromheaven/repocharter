@@ -1,14 +1,7 @@
 # agentkit conformance. Copy to .github/workflows/agentkit.yml
 #
-# WHAT THIS CAN AND CANNOT DO, stated up front because the previous design got it wrong.
-#
-# On a personal GitHub plan with a private repository, branch protection and rulesets both
-# return 403 "Upgrade to GitHub Pro or make this repository public to enable this feature".
-# Verified live. Actions IS available and enabled, so this workflow is a DETECTOR that runs
-# after the push it would have wanted to stop.
-#
-# That makes its job to be LOUD, not to be a fence. A genuine server-side block costs
-# GitHub Pro, a self-hosted bare mirror with a pre-receive hook, or making the repo public.
+# This workflow detects violations after a push. It blocks merges only when the repository's
+# branch-protection or ruleset configuration requires this job to pass.
 #
 # Note also that CI cannot see the machine-local half of the Claude-visible startup set:
 # ~/.claude/CLAUDE.md, ancestor CLAUDE.md files, and MEMORY.md when auto memory is on. Those
@@ -38,9 +31,8 @@ jobs:
           node-version: "20"
 
       - name: agentkit verify
-        # --strict promotes warnings to errors. Drop it during a migration and put it back
-        # once the repo is clean, but do not leave it off: a gate people route around has
-        # already failed.
+        # --strict promotes warnings to errors. It can be omitted temporarily during a
+        # migration and restored after the repository is conforming.
         run: |
           if [ ! -x kit/agentkit ]; then
             echo "::error::kit/agentkit is missing or not executable — the vendored kit is incomplete"
@@ -54,8 +46,7 @@ jobs:
         run: kit/agentkit self-test --repo .
 
       - name: census (recorded, never gated)
-        # The before/after evidence. Not a pass/fail: a number nobody can act on should not
-        # break a build, but a number nobody records cannot answer "did this help?".
+        # Record context measurements without changing the job's pass/fail result.
         if: always()
         run: kit/agentkit census --repo . --json | tee census.json
 

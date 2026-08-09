@@ -1,0 +1,19 @@
+{
+  "name": "repocharter",
+  "version": "0.3.0",
+  "private": true,
+  "description": "One repo charter. Every coding agent.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "16.3.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  }
+}

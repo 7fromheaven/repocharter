@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
-"""agentkit conformance checks — the part no shipped linter covers.
+"""Offline conformance checks that require repository-specific declarations.
 
 agnix carries a broad sourced catalogue and remains available through `verify --agnix`.
 The default commit path cannot fetch dependencies, so this checked-in module owns the
 load-bearing offline checks directly.
 
-What lives here is the residue: the checks that exist in no rule catalogue, plus the ones
-that must read `.agents/compatibility.json` to know what this repo declared. Every check
-below was written because something actually slipped past everything else:
+This module covers checks absent from the shared catalogue and checks that must read
+``.agents/compatibility.json``:
 
-  1. Symlink conformance for the .claude/skills adapter, tolerating the real directories
-     Claude Code writes there itself. A verifier that errored on those broke the first
-     time someone used a shipped feature -- a live bug in the reference repo.
+  1. Symlink conformance for the .claude/skills adapter, including directories created by
+     Claude Code itself.
   2. The declaration matching the filesystem, including autoMemory against settings.json.
-     A declaration nobody checks is how drift starts.
-  3. Dead references across settings.json permissions.allow, not just hooks blocks. Four
-     dead entries sat in the reference repo passing its own validator AND agnix at zero
-     errors, because all of them looked only at hooks blocks.
+  3. Dead references across settings.json permissions.allow as well as hook blocks.
   4. A repo .codex/config.toml lowering project_doc_max_bytes or declaring fallback
-     filenames. Measured honoured in a trusted workspace, present in no rule catalogue,
-     and a single committed line silently amputates the repo's own safety file.
+     filenames, either of which can truncate or replace repository instructions.
   5. claudeMdExcludes, the same amputation shape on the Claude side.
 
 Exit codes: 0 clean or warnings only, 1 errors found, 2 the checker could not run.
@@ -43,30 +37,21 @@ SPEC_SKILL_FIELDS = {
 # Fields Claude Code accepts locally but which break the claude.ai upload path. Present =
 # warn, never fail: the skill still loads where it is used.
 #
-# Verbatim from code.claude.com/docs/en/skills, retrieved 2026-08-08. The earlier list held
-# three of these and errored on the rest — which meant a real project skill using
-# `user-invocable: true` hard-failed the verifier. A rejection list built from memory rather
-# than from the published table is how a linter starts failing valid work, and a linter that
-# fails valid work gets switched off.
+# From the Claude Code skills documentation. These fields are valid locally but may be
+# incompatible with the claude.ai upload path, so they produce warnings rather than errors.
 CLAUDE_ONLY_SKILL_FIELDS = {
     "paths", "disable-model-invocation", "user-invocable", "argument-hint", "arguments",
     "disallowed-tools", "model", "effort", "context", "agent", "background", "hooks",
 }
 
-RETIRED_FIELDBOOK_SKILLS = {
+RETIRED_LEGACY_SKILLS = {
     "checkpoint", "handoff", "lessons", "plan-sync", "state-router",
     "dispatch-gate", "frontmatter-lint", "id-spine",
 }
 
-# Paths Claude Code writes into .claude/skills ITSELF, tolerated whether or not a repo
-# remembered to declare them.
-#
-# This is a built-in floor rather than a template default on purpose. The bug this replaces
-# hard-failed the reference repo's validator the first time a shipped feature was used
-# (`/verify` commits .claude/skills/verify/SKILL.md, `/run-skill-generator` commits
-# .claude/skills/run-<name>/), and a fix that depends on every one of 41 repos remembering
-# a config key is a fix that comes back. compatibility.json `harnessWritten` ADDS to this
-# set; it cannot shrink it.
+# Paths Claude Code creates under .claude/skills. These defaults are tolerated without a
+# repository declaration; compatibility.json `harnessWritten` can extend but not shrink the
+# set.
 DEFAULT_HARNESS_WRITTEN = (".claude/skills/verify", ".claude/skills/run-*")
 
 CODEX_ADAPTER_FILES = (
@@ -100,9 +85,7 @@ class Report:
     def stage_error(self, msg: str) -> None:
         """Expected until the migration finishes; an error once the repo claims to be done.
 
-        Without this split, ten un-migrated repositories produce ninety identical-looking
-        errors and there is no way to tell progress from failure -- which is the same as
-        having no signal.
+        This keeps incomplete migration work distinct from regressions in migrated repos.
         """
         if self.stage == "migrated":
             self.errors.append(msg)
@@ -349,9 +332,9 @@ def check_skills(root: Path, compat: dict, rep: Report) -> None:
         name = entry.name
         if name.startswith("."):
             continue
-        if name in RETIRED_FIELDBOOK_SKILLS:
+        if name in RETIRED_LEGACY_SKILLS:
             rep.stage_error(
-                f".claude/skills/{name} is a retired fieldbook skill. Delete it; its procedure "
+                f".claude/skills/{name} is a retired legacy-layout skill. Delete it; its procedure "
                 "belongs in .agents/skills or nowhere."
             )
             continue
@@ -375,9 +358,8 @@ def check_skills(root: Path, compat: dict, rep: Report) -> None:
             if not resolved.exists():
                 rep.error(f".claude/skills/{name} is a broken symlink (target {resolved} does not exist)")
             continue
-        # A real directory. Legal only when declared as harness-written -- Claude Code
-        # creates these itself (/verify, /run-skill-generator) and erroring on them turned
-        # one use of a shipped feature into a hard validator failure.
+        # A real directory is valid only when declared as harness-written. Claude Code can
+        # create these for features such as /verify and /run-skill-generator.
         rel = f".claude/skills/{name}"
         if any(_glob_match(rel, pattern) for pattern in harness_written):
             rep.note(f"{rel} is a harness-written directory, allowed by compatibility.json")
@@ -412,7 +394,7 @@ def check_declaration(root: Path, compat: dict, rep: Report) -> None:
     if declared and declared != actual:
         rep.error(
             f"compatibility.json declares autoMemory = {declared!r} but settings.json yields "
-            f"{actual!r}. One of them is lying, and this check is what makes either choice honest."
+            f"{actual!r}. Update the declaration or the setting so they agree."
         )
     if declared == "off" and not compat.get("autoMemoryReason"):
         rep.error("autoMemory is 'off' but autoMemoryReason is empty. Say what data boundary it protects.")
@@ -669,10 +651,8 @@ def check_dead_references(root: Path, rep: Report) -> None:
                 referenced.append(("permissions.allow", match.group(1)))
 
         # An interpreter prefix hides the real target: `bash "$CLAUDE_PROJECT_DIR/x.sh"`
-        # has `bash` as its first token, so first-token logic checks the wrong thing — it
-        # misses a deleted script, and anything that PRUNES on that basis deletes a live
-        # hook. Both happened: this checker silently skipped such hooks, and an ad-hoc sweep
-        # built on the same assumption removed a working budget gate.
+        # has `bash` as its first token. Skip interpreter tokens before checking the script
+        # path.
         INTERPRETERS = {"bash", "sh", "zsh", "python", "python3", "node", "npx", "uv", "env"}
 
         for where, raw in referenced:
@@ -710,8 +690,8 @@ def check_codex_config(root: Path, rep: Report) -> None:
     text = path.read_text(encoding="utf-8", errors="replace")
     if re.search(r"^\s*project_doc_max_bytes\s*=", text, re.M):
         rep.error(
-            ".codex/config.toml sets project_doc_max_bytes. Measured: this key is honoured "
-            "once the workspace is trusted, and nothing in Codex's project-local denylist "
+            ".codex/config.toml sets project_doc_max_bytes. This key is honored once the "
+            "workspace is trusted, and nothing in Codex's project-local denylist "
             "blocks it. One committed line silently truncates this repo's own AGENTS.md for "
             "every developer. Remove it."
         )
@@ -741,8 +721,8 @@ def check_override_and_nesting(root: Path, rep: Report) -> None:
         if ".git" in override.parts:
             continue
         rep.error(
-            f"{override.relative_to(root)} exists. Measured on codex-cli 0.147.0: an override "
-            "file makes AGENTS.md vanish from the model prompt ENTIRELY, not merge with it."
+            f"{override.relative_to(root)} exists. Codex uses an override file instead of "
+            "AGENTS.md at that directory level; it does not merge the two."
         )
     roots = [p for p in root.rglob("AGENTS.md")
              if ".git" not in p.parts and "node_modules" not in p.parts]
@@ -770,11 +750,8 @@ def check_rules(root: Path, rep: Report) -> None:
     for rule in sorted(rules_dir.rglob("*.md")):
         meta = frontmatter(rule.read_text(encoding="utf-8", errors="replace")) or {}
 
-        # The author SAID on-demand, in a key this harness does not read. Reported
-        # separately because it is a different failure from simply forgetting to scope a
-        # file: the intent is already recorded, in the wrong dialect. Measured on one repo:
-        # 15 files and 45,556 bytes — 44% of its entire always-loaded set — every one of
-        # them marked `alwaysApply: false` and loaded in full on every session.
+        # A foreign on-demand key records scope intent in a dialect Claude Code does not
+        # read. Report it separately from an instruction file with no scope metadata.
         foreign = [k for k in FOREIGN_ONDEMAND_KEYS if k in meta]
         if foreign and not meta.get("paths"):
             intent_mismatch.append((rule.relative_to(root), rule.stat().st_size, foreign[0]))
@@ -831,8 +808,7 @@ def check_budgets(root: Path, compat: dict, rep: Report) -> None:
     # Unscoped .claude/rules count too, and they are the half that hides. Anthropic:
     # "Rules without `paths` frontmatter are loaded at launch with the same priority as
     # `.claude/CLAUDE.md`." Counting only CLAUDE.md and AGENTS.md understates the real
-    # startup cost of exactly the repos that most need measuring -- a fieldbook repo can
-    # carry more always-loaded bytes here than in both canonical files combined.
+    # startup cost of repositories whose legacy rule directories contain unscoped files.
     rules_dir = root / ".claude" / "rules"
     unscoped_bytes = 0
     if rules_dir.is_dir():
@@ -880,11 +856,9 @@ def check_effective(root: Path, rep: Report) -> None:
     This asserts against the harness's own ledger rather than a model of it, which catches
     an override file, a fallback filename, a lowered cap and a truncation at once.
 
-    IT HAS A MEASURED FALSE NEGATIVE, and the note below is not decoration. `codex debug
-    prompt-input` reports different content depending on machine-local workspace trust: an
-    untrusted checkout -- which is what a CI runner is -- cannot see a .codex/config.toml
-    that amputates AGENTS.md. So this is a developer-machine check, and the static
-    check_codex_config above is the one that must be mandatory in CI. They are not parallel.
+    `codex debug prompt-input` depends on machine-local workspace trust. An untrusted
+    checkout cannot observe trusted-workspace configuration, so this is a developer-machine
+    check; ``check_codex_config`` provides the static CI check.
     """
     agents = root / "AGENTS.md"
     if not agents.exists():
@@ -937,12 +911,8 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
         for line in stage_lib.summarise(rep.stage, markers):
             rep.note(f"  {line}")
         if rep.stage != stage_lib.NOT_STARTED and markers.policy_empty:
-            # This was a WARNING, and the wording said the gates "enforce nothing".
-            # That was true when the universal rules were thinner. It is now false and
-            # actively misleading: an empty policy still gets the whole universal floor,
-            # and for a repo that deploys nothing and holds no production data an empty
-            # policy is the CORRECT state rather than a defect. A warning nobody can act
-            # on correctly is noise, and noise is what gets a checker switched off.
+            # An empty repository policy is valid because the universal floor remains
+            # active. Report it as configuration context rather than a warning.
             rep.note(
                 "policy is empty, which may well be right. The universal floor is active "
                 "regardless: force-push to a protected branch, checks-bypass, destructive "
@@ -971,14 +941,9 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
     try:
         import scaffold as scaffold_lib
         for problem in scaffold_lib.lint_policy(compat.get("policy") or {}):
-            # The unsatisfiable-conjunction check is HEURISTIC and has both error modes. It
-            # synthesises probe strings from each pattern and asks whether any satisfies all
-            # of them; when it cannot construct a witness it reports inert, and it was
-            # measured calling nine WORKING rules broken (`npm publish` satisfies both halves
-            # of a manager+verb conjunction that the synthesiser could not build). So it
-            # warns rather than fails — a check that fails valid work is one people switch
-            # off, and correctness at harvest time now comes from reading the source's actual
-            # `&&`/`||` joiner instead of guessing after the fact.
+            # The unsatisfiable-conjunction check is heuristic: failure to synthesize a
+            # witness does not prove that none exists. Warn rather than fail, and rely on the
+            # source control-flow parser plus live measurement for definitive results.
             if "CAN NEVER FIRE" in problem:
                 rep.warn(f"POSSIBLY INERT (heuristic) — {problem} "
                          "Verify by running the command its reason names before acting.")

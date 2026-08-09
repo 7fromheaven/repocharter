@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/7fromheaven/repocharter/kit/schema/compatibility.schema.json",
   "title": ".agents/compatibility.json",
-  "description": "The machine-readable declaration of a repository's agent-context layout. Never loaded into any model's context; read only by agentkit and the hooks. This is the anti-drift anchor: every claim here is asserted against the filesystem by `agentkit verify`, because a declaration nobody checks is how drift starts.",
+  "description": "The machine-readable declaration of a repository's agent-context layout. It is read by agentkit and the hooks, not loaded into model context. `agentkit verify` checks declared paths and settings against the filesystem.",
   "type": "object",
   "required": ["agentkitVersion", "canonical", "enforcement", "autoMemory", "budgets"],
   "additionalProperties": false,
@@ -10,7 +11,7 @@
 
     "policyDraft": {
       "type": "object",
-      "description": "Output of `agentkit policy scaffold`. NOTHING HERE IS ENFORCED. Entries are harvested from the repo's existing gate scripts and AGENTS.md so review is cheap; a human promotes them into `policy`. Auto-enforcing a regex scraped from a shell script is how a gate ends up blocking honest work and getting disabled on the next repo.",
+      "description": "Output of `agentkit policy scaffold`. Entries are not enforced until a human reviews and promotes them into `policy`.",
       "additionalProperties": true
     },
 
@@ -36,7 +37,7 @@
 
     "optionalFiles": {
       "type": "array",
-      "description": "Canonical files that exist in this repo but are not required of every repo. `obligations.md` is the built-in case: roughly one repo in four has an external counterparty, and the rest should not carry a ceremonial empty file.",
+      "description": "Canonical files that are optional for repositories where they do not apply, such as `obligations.md`.",
       "items": { "type": "string" },
       "default": []
     },
@@ -93,7 +94,7 @@
 
     "budgets": {
       "type": "object",
-      "description": "Every constant, each with its source. These live here and nowhere else so that 41 repos do not hardcode them.",
+      "description": "Context-budget constants used by the verifier and their documented sources.",
       "required": ["codexProjectDocMaxBytes", "claudeLineTarget"],
       "additionalProperties": false,
       "properties": {
@@ -131,7 +132,7 @@
         },
         "denyBashPatterns": {
           "type": "array",
-          "description": "Repo-specific Bash denials, read at runtime by the Bash gate. Harvest these with `agentkit policy scaffold` rather than writing them from scratch — a fieldbook repo's existing gate script already encodes its real fences.",
+          "description": "Repository-specific Bash denials read at runtime by the Bash gate. `agentkit policy scaffold` can import candidates from a supported legacy shell gate.",
           "items": { "$ref": "#/$defs/bashRule" },
           "default": []
         },
@@ -175,7 +176,7 @@
         },
         "measureOnWrite": {
           "type": "array",
-          "description": "The external-observation gates that refusal 6 must never delete. Each entry names a path glob and a measurement to report before and after an edit. These are gates on the world, not rituals about the agent's own reasoning; deleting one removes a check that exists because a human cannot verify the output themselves.",
+          "description": "Measurements to report before and after edits to matching paths. Each entry names a path glob, measurement type, and reason.",
           "items": {
             "type": "object",
             "required": ["glob", "measure", "reason"],
@@ -186,7 +187,7 @@
               "scripts": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Unicode script names for `script-lengths`, e.g. [\"Cyrillic\"]. Counted per script so a change to non-Latin text is visible to an operator who cannot read it."
+                "description": "Unicode script names for `script-lengths`, for example [\"Cyrillic\"]. Counts are reported separately for each configured script."
               },
               "reason":  { "type": "string" }
             }
@@ -225,7 +226,7 @@
 
     "fallbacks": {
       "type": "object",
-      "description": "What to do when a harness lacks a feature this layout assumes. Adopted from a repository that arrived at it independently and had something the kit did not: the portability story was written as 'these three harnesses support X' with nothing said about the fourth. A named degradation path is what stops a missing feature becoming an unrecorded gap.",
+      "description": "Documented behavior when a harness lacks a feature assumed by the canonical layout. Naming the fallback keeps provider-specific gaps explicit.",
       "additionalProperties": { "type": "string" },
       "examples": [{
         "missingSkillDiscovery": "Read .agents/skills/project-memory/SKILL.md directly",
@@ -239,20 +240,20 @@
       "type": "array",
       "items": { "type": "string" },
       "default": [],
-      "description": "Globs holding content that is retired but still checked in — a fallback mirror, a superseded nested repo, an archive kept for reference. `agentkit apply` feeds these into .agnix.toml's exclude list. Without it, a retired copy of the OLD system gets linted as if it were live: on one repo a retired nested mirror produced 84 of 91 errors, which is how a finished migration reads as a failure.",
-      "examples": [["beast/**", "archive/v1/**"]]
+      "description": "Globs for retired content that remains checked in, such as fallback mirrors or archived versions. `agentkit apply` adds these paths to the agnix exclude list.",
+      "examples": [["archive/legacy/**", "archive/v1/**"]]
     },
 
     "harnessWritten": {
       "type": "array",
       "items": { "type": "string" },
       "default": [],
-      "description": "Glob allowlist of paths the harness creates itself and the verifier must tolerate. Claude Code writes real skill directories under .claude/skills (`/verify` writes verify/, `/run-skill-generator` writes run-<name>/), so a verifier that errors on any non-symlink entry breaks the first time a shipped feature is used. That bug was live in a real repository and this field is its permanent fix."
+      "description": "Glob allowlist of paths created by the harness and accepted by the verifier. Claude Code can create skill directories under .claude/skills, including verify/ and run-<name>/."
     },
 
     "exceptions": {
       "type": "array",
-      "description": "The only legal place for per-repo divergence. Local cleverness in 41 places is how a system stops being one system; an exception recorded here is visible to the verifier and to the next reader.",
+      "description": "Documented per-repository deviations that the verifier and future maintainers can inspect.",
       "items": {
         "type": "object",
         "required": ["rule", "reason", "approvedBy", "date"],

@@ -1,19 +1,14 @@
-"""Migration stage detection.
+"""Derive migration stage from the filesystem and classify verification findings.
 
-The problem this solves: `verify` on a repo that has not been migrated yet reports nine
-errors, and so does a repo that is genuinely broken. Across ten repositories that is ninety
-undifferentiated errors with no way to tell progress from failure, which is the same as
-having no signal at all.
-
-So findings are split by whether they depend on migration progress:
+Findings are split by whether they depend on migration progress:
 
   BLOCKING   wrong at every stage. A dead hook reference, an AGENTS.override.md, an
              absolute symlink, a file over the Codex cap. These are errors the moment they
              appear and they never become acceptable.
 
-  MIGRATION  expected until the migration finishes. A fieldbook directory, a retired skill,
-             an unscoped rules file, a missing docs/project. These are TODO items while the
-             repo is mid-migration and only become errors once it claims to be done.
+  MIGRATION  expected until the migration finishes. A recognized legacy directory, a
+             retired skill, an unscoped rules file, or a missing docs/project directory.
+             These are TODO items during migration and errors afterwards.
 
 A repo's stage is derived from the filesystem rather than declared, because a declared
 stage is a thing that goes stale silently.
@@ -34,11 +29,11 @@ STAGE_ORDER = [NOT_STARTED, MECHANICAL, MIGRATED]
 STAGE_HELP = {
     NOT_STARTED: "no agentkit layer yet — run `agentkit apply`",
     MECHANICAL: "plumbing installed, migration incomplete — run `agentkit migrate`",
-    MIGRATED: "canonical layout, no fieldbook residue",
+    MIGRATED: "canonical layout, no recognized legacy residue",
 }
 
-# Directories that mean a ctx-fieldbook (or similar) system is still live.
-FIELDBOOK_MARKERS = (".agent-docs", ".claude/handoffs")
+# Directories recognized by the supported legacy-layout adapter.
+LEGACY_MARKERS = (".agent-docs", ".claude/handoffs")
 
 RETIRED_SKILLS = {
     "checkpoint", "handoff", "lessons", "plan-sync", "state-router",
@@ -52,7 +47,7 @@ class Markers:
     """Everything stage detection looked at, kept so the tool can explain itself."""
     has_compat: bool = False
     has_project_dir: bool = False
-    fieldbook_dirs: list[str] = field(default_factory=list)
+    legacy_dirs: list[str] = field(default_factory=list)
     retired_skills: list[str] = field(default_factory=list)
     unscoped_rules: list[str] = field(default_factory=list)
     nested_agents: list[str] = field(default_factory=list)
@@ -73,7 +68,7 @@ class Markers:
         wrong". Conflating them means a regression can never escalate.
         """
         return bool(
-            self.fieldbook_dirs or self.retired_skills or not self.has_project_dir
+            self.legacy_dirs or self.retired_skills or not self.has_project_dir
         )
 
 
@@ -101,9 +96,9 @@ def scan(root: Path) -> Markers:
     project = root / (compat.get("canonical", {}).get("project") or "docs/project")
     m.has_project_dir = project.is_dir()
 
-    for marker in FIELDBOOK_MARKERS:
+    for marker in LEGACY_MARKERS:
         if (root / marker).is_dir():
-            m.fieldbook_dirs.append(marker)
+            m.legacy_dirs.append(marker)
 
     skills_dir = root / ".claude" / "skills"
     if skills_dir.is_dir():
@@ -149,8 +144,8 @@ def summarise(stage: str, m: Markers) -> list[str]:
     if not m.has_compat:
         out.append("no .agents/compatibility.json")
         return out
-    if m.fieldbook_dirs:
-        out.append(f"fieldbook still present: {', '.join(m.fieldbook_dirs)}")
+    if m.legacy_dirs:
+        out.append(f"supported legacy layout still present: {', '.join(m.legacy_dirs)}")
     if m.retired_skills:
         out.append(f"{len(m.retired_skills)} retired skill(s): {', '.join(m.retired_skills)}")
     if m.unscoped_rules:
