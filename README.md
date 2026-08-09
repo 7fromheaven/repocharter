@@ -14,8 +14,10 @@ This is two things that address that:
    safety rules into real interceptors, and refuses to let a repo claim enforcement it has not
    tested.
 
-Works with Claude Code, Codex, and ZCode for context. **Enforcement is Claude Code only today** —
-see [Honest limits](#honest-limits), because that asymmetry matters more than anything else here.
+Works with Claude Code, Codex, and ZCode for context. Claude Code and Codex have native safety
+adapters; ZCode remains advisory. Codex deliberately requires a human to review and trust each
+project hook configuration, so the declaration stays advisory until a live no-bypass self-test has
+observed that exact trusted adapter deny real calls.
 
 ---
 
@@ -29,7 +31,7 @@ Investigating why produced three findings, two of which contradicted the obvious
 - **Skills were innocent.** All three harnesses lazy-load them. Twelve skills carrying ~48 KB of
   bodies grew the startup prompt by 4,272 characters and contributed **zero** body bytes. Deleting
   them to save cost would have removed the one component already working correctly.
-- **The cost was `CLAUDE.md` and its `@`-imports.** Anthropic is explicit that imports load at
+- **The cost was the predecessor's `CLAUDE.md` and its `@`-imports.** Anthropic is explicit that imports load at
   launch, recursive to four hops. A 70-file system wired through imports is an always-loaded system
   wearing a lazy-loading costume. `.claude/rules/*.md` without `paths:` frontmatter loads at launch
   too — that surface alone is **74% of the remaining cost across our fleet.**
@@ -43,7 +45,7 @@ Investigating why produced three findings, two of which contradicted the obvious
 
 ```
 AGENTS.md                    always-loaded. Rules, not knowledge. Safety first.
-CLAUDE.md                    always-loaded. A shim: `@AGENTS.md` and nothing else.
+CLAUDE.md                    always-loaded. A relative symlink to `AGENTS.md`.
                              ── those two, and no third, ever ──
 docs/project/*               named by path in AGENTS.md's routing block. Never imported.
   SPEC.md PLAN.md STATUS.md  Zero startup cost. Read on demand.
@@ -93,7 +95,7 @@ Requires Python 3 and nothing else. No install step — the kit is vendored as a
 ```sh
 kit/agentkit census --repo ~/dev/your-repo    # read-only measurement
 kit/agentkit fleet  --root ~/dev              # every repo under a root, one table
-python3 kit/tests/run_tests.py                # 176 tests, no dependencies
+python3 kit/tests/run_tests.py                # 204 tests, no dependencies
 ```
 
 **A fresh repo:**
@@ -108,6 +110,15 @@ kit/agentkit apply    --repo .          # recompile permissions from the policy
 kit/agentkit self-test --repo .         # fire forbidden calls, assert refusal
 kit/agentkit verify   --repo .          # lint; exits non-zero on error
 ```
+
+For Codex, restart after `apply`, open `/hooks`, review and trust `.codex/hooks.json`, then run:
+
+```sh
+kit/agentkit self-test --repo . --promote-codex
+```
+
+Promotion requires both disposable live-denial probes and an ordinary no-bypass run in the target
+repository. A temporary CLI trust override is deliberately insufficient evidence.
 
 **A repo that already has a hand-rolled gate script** adds two steps — harvest its existing rules
 into portable policy, then retire the old script only once the new one is proven no weaker:
@@ -127,8 +138,9 @@ running from before the install keeps calling the old hooks — and a missing ho
 ### What `apply` writes, and what it refuses to write
 
 **Writes** — all mechanical, all regenerable: the declaration file, the vendored gate scripts, the
-`hooks` and `permissions.deny` keys in settings (every other key preserved, including your
-allow-list), skill symlinks, linter config, and the `CLAUDE.md` shim if absent.
+Claude `hooks` and `permissions.deny` keys in settings (every other key preserved, including your
+allow-list), merged Codex project hooks, skill symlinks, linter config, and a relative
+`CLAUDE.md -> AGENTS.md` symlink if absent.
 
 **Never writes:** `AGENTS.md`'s body, or anything under `docs/project/`.
 
@@ -147,9 +159,9 @@ Everything is idempotent — re-running `apply` on a conforming repo reports `0 
 | `apply` | Install the mechanical layer, idempotently. |
 | `policy scaffold` / `promote` | Harvest a draft policy from the repo's own existing rules. |
 | `supersede` | Prove the new gate is never weaker, then retire the legacy one. |
-| `self-test` | Fire genuinely forbidden calls at the installed hooks and assert refusal. |
+| `self-test` | Fire forbidden and benign calls at installed hooks; `--promote-codex` uses the real CLI and persisted-trust proof. |
 | `measure` | Fire every rule the repo *itself* declares at its gate and report which held. |
-| `verify` | 445 sourced rules via `agnix`, plus the residue checks no catalogue covers. |
+| `verify` | Dependency-free schema/residue checks plus every validation command declared by the repo; `--agnix` adds the network-fetched catalogue. |
 | `migrate` | Mechanical migration plus a written plan for the judgment calls. |
 | `revert` | Undo the last mechanical migration from its manifest. |
 
@@ -165,9 +177,9 @@ how much they appear to block.
   qualify: if a provider's token API accepts no permission field at any price, and a
   full-privilege token sits in a file owned by the same uid the agent runs as, then "that deploy
   command is blocked" is a regex that does not survive a direct API call.
-- **Tier 1 — hooks.** Reachable, but not silently. Five interceptors: shell commands, file writes,
-  MCP tool calls, a post-write measurement, and a guard that refuses any config edit which would
-  disable hooks or empty the deny list — i.e. it stops the agent disarming its own alarm.
+- **Tier 1 — hooks.** Reachable, but not silently. Claude installs five interceptors; Codex maps
+  the same shell, write, MCP, and post-write policy surfaces to its native project hooks. Each
+  adapter guards its own local configuration from its write-tool surface.
 - **Tier 2 — CI detection.** Renamed from "blocking," because on a private repo without a paid plan
   branch protection returns 403. CI is a detector that runs *after* the push it wanted to stop.
 - **Tier 3 — the agent enforcing a rule on itself.** The floor, and `AGENTS.md` is required to say
@@ -211,8 +223,13 @@ rules that check *the world* stay; rules that are rituals about the agent's own 
 
 ## Where we are
 
-**Working and used daily.** `agentkit 0.2.0`, 176 tests, zero dependencies, verified from a fresh
-clone. Six repositories migrated out of a nineteen-repo fleet.
+**Working and used daily.** `agentkit 0.3.0`, 204 tests, zero dependencies. Six repositories are
+migrated, and the source repository now dogfoods both provider adapters. The Codex adapter has been
+live-tested to deny forbidden and permit benign Bash, `apply_patch`, and MCP calls; this checkout
+remains honestly advisory until its exact project hook hash is trusted through `/hooks` and the
+ordinary live probe passes.
+
+The original fleet measurements remain:
 
 | repo | always-loaded before | after |
 |---|---:|---:|
@@ -230,36 +247,26 @@ Thirteen repos remain, 354,597 bytes, three-quarters of it unscoped rules files.
 
 ### What is not working, stated plainly
 
-Three inert-fence bugs surfaced in a single week, and none was caught by the verifier whose entire
-job that is:
+Codex project hooks are installed but not yet persistently trusted on this machine. A live run with
+the adapter loaded denied forbidden and permitted benign Bash, `apply_patch`, and MCP probes. An
+ordinary run without an automation trust override then allowed the forbidden Bash probe, proving
+that repository trust — not adapter logic — is the remaining activation boundary. The manifest
+therefore says `advisory`; it will say `blocking` only after `/hooks` approval and a repeated
+ordinary live denial.
 
-1. **53 dead fences shipped across all six migrated repos.** The policy harvester read shell `||` as
-   `&&`, turning a rule with *alternatives* into a conjunction that **can never fire** while looking
-   exactly like a working fence — covering production deploys, write-credential strings, and
-   database pushes. Found by a colleague, not by us. Fixed, with the joiner now read from the
-   source, and a `policy repair` command to split already-shipped ones.
-2. **The detector written to catch that then produced 9 false positives**, calling working fences
-   broken. It now warns rather than errors and states that it is heuristic.
-3. **`apply` emits a deny rule the harness does not enforce** — caught by a startup warning from
-   Claude Code itself, minutes after `verify` returned zero errors on the same repo.
-
-Additionally: a migration that rewires hooks **invalidates every running agent session**, and stale
-sessions fail open — every command in them proceeds ungated, with only a scrolling warning to say
-so. Nothing in the kit currently tells you to restart.
-
-We keep these in the README rather than in a private issue tracker because the entire premise of
-this system is that a declaration of enforcement nobody measured is worse than no declaration at
-all — and the system committed that error itself, on the same day one repo's `AGENTS.md` described
-those exact dead rules as "mechanically enforced."
+The earlier inert-fence failures remain the reason for this standard. Fifty-three harvested fences
+could never fire, a detector then mislabeled nine working fences, and a generated Claude deny rule
+was unsupported. Those classes now have negative tests, schema checks, live deny-and-observe tests,
+and provider-neutral pre-commit validation. A hook rewire still requires a session restart because
+both harnesses load project settings at session start.
 
 ---
 
 ## What's planned
 
-**Now — earn back trust in the fences.**
-Re-measure every enforcement claim in every migrated repo by running the command it names. One repo
-has a script that proves its own claims; the other five need an equivalent. Ship the deny-rule fix
-and a residue check that catches the whole class.
+**Now — activate and certify the Codex adapter.**
+Review the project hooks through `/hooks`, then run `self-test --promote-codex`. Roll the same
+adapter and trust ceremony through each migrated repository; never copy a `blocking` declaration.
 
 **Next — make repos 7-19 cheap.**
 Six mechanical steps are still done by hand on every migration. Six worked examples now exist, which
@@ -268,36 +275,31 @@ is enough to fold them into `migrate --apply`. This is the highest-value remaini
 **Then — the fresh-repo story.**
 `apply` already does the complete mechanical job on a clean repo; every remaining manual step is
 migration-specific. The gap is policy: `policy scaffold` is a *harvester*, so a fresh repo with no
-existing gate harvests nothing and lands in an empty-policy state — five hooks installed, enforcing
-nothing, `self-test` passing because it only exercises the universal rules. Green checkmark, no
-fence. The fix is the inverse of a harvester: **a starter policy library by stack** shipping
-opinionated fences on day one. This is the main blocker to anyone using this out of the box.
+existing gate harvests nothing and lands in an empty-policy state. The universal floor is active,
+but there is no repository-specific deploy, credential, or live-data fence because no tool can
+infer those boundaries safely. A future starter policy library by stack may narrow that gap; it
+must not turn guesses into automatic production policy.
 
-**Then — make the portability claim true for safety, not just context.**
-Enforcement is Claude Code only. A second harness's interceptors would close the gap between what
-the context layer promises and what the fence delivers.
-
-**Open, not blocking:** one safety tier rests on OS-owned config that has never been tested on our
-machines and remains an assertion until it passes a deny-and-observe test. And this repo has never
-had `agentkit` applied to itself. It should dogfood.
+**Open, not blocking:** ZCode has no live-tested safety adapter. Its context path remains portable
+through a declared manual skill import, but its production boundaries are instructions only.
 
 ---
 
 ## Honest limits
 
-- **"Portable" describes context, not enforcement.** `AGENTS.md` is read natively by two harnesses
-  and by the third through a two-line shim — that part is real. All five interceptors are Claude
-  Code hooks. Under the others the production boundary is **advisory**, and a rule believed to be
-  enforced when it is not is worse than one known to be advisory.
+- **Context is portable; enforcement is per harness and per checkout.** Codex and ZCode read
+  `AGENTS.md` natively; Claude reads the same bytes through a relative symlink. Claude and Codex
+  have adapters over one policy engine. Codex has provider-backed live promotion; this source
+  repository keeps Claude advisory until an equivalent provider-backed claim exists. ZCode has no
+  safety adapter yet.
 - **`supersede` handles shell gates only.** Retiring other validator types deserves the same replay
   proof and does not have it yet.
 - **No distribution or generation layer.** Tools that fan one source out into 30+ agents' native
   formats are right for a design that duplicates per harness and wrong for this one, which converges
   on a single file with one shim.
-- **No re-implementation of `agnix`.** 445 sourced rules with verification dates is a higher
-  evidentiary standard than anything we would write. `verify` calls it and adds only the checks no
-  catalogue covers — notably the amputation vectors, which we tested `agnix` against and measured at
-  zero detections.
+- **No re-implementation of `agnix`.** The network-fetched catalogue remains available through
+  `verify --agnix`; the default commit path is dependency-free and runs the checked-in schema,
+  residue checks, and repository-declared validation commands.
 - **Vendored, not packaged.** A copy per repo with a version stamp. Submodules break on fresh clone
   in exactly the automated contexts this serves; that is a weaker consistency guarantee, traded
   knowingly.
@@ -312,12 +314,12 @@ had `agentkit` applied to itself. It should dogfood.
 ```
 README.md          this file — the design, the commands, and the honest limits
 kit/agentkit       the CLI. Python 3, no dependencies.
-kit/hooks/         the five interceptors, vendored into each repo by `apply`
+kit/hooks/         Claude and Codex adapters over one policy engine
 kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         176 tests, no dependencies, mostly negative
+kit/tests/         204 tests, no dependencies, mostly negative
 ```
 
 **Evidence standard.** Every measurement quoted here was taken rather than cited: byte budgets read

@@ -32,8 +32,38 @@ def fail_closed(message: str) -> None:
 
 
 def project_dir() -> Path:
-    """Repo root. CLAUDE_PROJECT_DIR is set by Claude Code; cwd is the fallback."""
-    return Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    """Return the repo root under either supported harness.
+
+    Claude supplies ``CLAUDE_PROJECT_DIR``. Codex deliberately does not expose an
+    equivalent stable variable and may launch a session from a subdirectory, so walking
+    upward to the declaration is the provider-neutral fallback. Hook commands also run
+    from the session cwd, which makes this work in a worktree without resolving through a
+    machine-specific absolute path.
+    """
+    explicit = os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("CODEX_PROJECT_DIR")
+    if explicit:
+        return Path(explicit).resolve()
+
+    cwd = Path(os.getcwd()).resolve()
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / ".agents" / "compatibility.json").exists():
+            return candidate
+    return cwd
+
+
+def harness() -> str:
+    """The hook wire protocol in use.
+
+    Claude is the historical default because its settings cannot inject an environment
+    marker without rewriting every existing repository. The generated Codex adapter sets
+    ``AGENTKIT_HARNESS=codex`` explicitly. Unknown values fail closed: silently guessing
+    the response semantics is exactly how Codex's unsupported ``ask`` decision became an
+    allow during the compatibility audit.
+    """
+    value = os.environ.get("AGENTKIT_HARNESS", "claude-code")
+    if value not in {"claude-code", "codex"}:
+        fail_closed(f"unknown AGENTKIT_HARNESS value {value!r}.")
+    return value
 
 
 def load_policy() -> dict:
@@ -69,6 +99,53 @@ def read_payload() -> dict:
     if not isinstance(payload, dict):
         fail_closed("the hook payload was not a JSON object.")
     return payload
+
+
+_PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$")
+_PATCH_MOVE = re.compile(r"^\*\*\* Move to:\s*(.+?)\s*$")
+
+
+def write_paths(payload: dict) -> list[str]:
+    """Return every path affected by a Claude write or Codex ``apply_patch`` call.
+
+    Claude sends an absolute ``file_path``/``notebook_path``. Codex sends the entire patch
+    in ``tool_input.command`` and may change several files in one tool call. Treating that
+    command as one path silently allowed forbidden writes, so every Add/Update/Delete and
+    Move destination is extracted and checked independently.
+    """
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        fail_closed("the write hook payload has no object-valued tool_input.")
+
+    direct = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if direct:
+        if not isinstance(direct, str):
+            fail_closed("the write hook file path is not a string.")
+        return [direct]
+
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        fail_closed(
+            "the write hook payload names neither a file path nor an apply_patch command. "
+            "The gate cannot determine what would be written."
+        )
+
+    paths: list[str] = []
+    for line in command.splitlines():
+        match = _PATCH_FILE.match(line) or _PATCH_MOVE.match(line)
+        if not match:
+            continue
+        candidate = match.group(1).strip()
+        if not candidate or "\x00" in candidate:
+            fail_closed("the apply_patch payload contains an empty or invalid file path.")
+        if candidate not in paths:
+            paths.append(candidate)
+    if not paths:
+        fail_closed(
+            "the apply_patch payload contains no Add/Update/Delete file header. "
+            "The gate refuses an unrecognised patch shape rather than allowing it uninspected."
+        )
+    return paths
 
 
 def deny(reason: str) -> None:

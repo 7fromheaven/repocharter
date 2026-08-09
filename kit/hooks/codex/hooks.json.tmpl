@@ -1,32 +1,48 @@
 {
-  "_comment": [
-    "Codex hook configuration. agentkit writes this into the repo's .codex/hooks.json.",
-    "",
-    "TRUST CAVEAT, and it is the reason this file is not the safety story on its own:",
-    "hooks discovered from the PROJECT layer and the USER layer (~/.codex/hooks.json) are",
-    "both non-managed, which means they carry Codex's hash-trust requirement and are",
-    "disableable. The design's earlier claim that the user layer was trust-independent was",
-    "refuted against the shipped source at rust-v0.147.0: ConfigLayerSource::User maps to",
-    "is_managed = false, exactly like the project layer.",
-    "",
-    "The trust-FREE layer is the SYSTEM layer: /etc/codex/config.toml with an inline",
-    "[hooks] table, which is is_managed = true and cannot be disabled. It needs one sudo,",
-    "no MDM and no paid plan. That is Tier 0b in the design, and it is the layer to use for",
-    "anything that must hold regardless of what the workspace says.",
-    "",
-    "Also measured: Codex's trust hash covers the config-derived hook IDENTITY, never the",
-    "invoked script's bytes. Editing a gate script costs zero re-trust and produces zero",
-    "signal. Do not treat the hash as tamper-evidence for the script itself."
-  ],
+  "description": "agentkit safety and write-measurement hooks. Review and trust this project layer with /hooks after installation or change.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
-        "command": ["${CODEX_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-bash.sh"]
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGENTKIT_HARNESS=codex \"$(git rev-parse --show-toplevel)/.claude/hooks/agentkit/pretooluse-bash.sh\"",
+            "statusMessage": "Checking command policy"
+          }
+        ]
       },
       {
-        "matcher": "apply_patch",
-        "command": ["${CODEX_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-write.py"]
+        "matcher": "^apply_patch$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGENTKIT_HARNESS=codex \"$(git rev-parse --show-toplevel)/.claude/hooks/agentkit/pretooluse-write.py\"",
+            "statusMessage": "Checking write policy"
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__.*$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGENTKIT_HARNESS=codex \"$(git rev-parse --show-toplevel)/.claude/hooks/agentkit/pretooluse-mcp.py\"",
+            "statusMessage": "Checking MCP policy"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^apply_patch$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGENTKIT_HARNESS=codex \"$(git rev-parse --show-toplevel)/.claude/hooks/agentkit/posttooluse-write.py\"",
+            "statusMessage": "Measuring written content"
+          }
+        ]
       }
     ]
   }

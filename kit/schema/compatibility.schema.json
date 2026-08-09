@@ -43,13 +43,13 @@
 
     "adapters": {
       "type": "array",
-      "description": "Every non-native reach path. The verifier resolves each one and fails on a broken link, an absolute symlink, or a target outside the canonical skills directory.",
+      "description": "Every harness reach path. The verifier checks native Codex discovery, exact import lines, and relative symlinks against their declared targets; manual imports remain explicitly unmeasured.",
       "items": {
         "type": "object",
         "required": ["harness", "kind"],
         "additionalProperties": false,
         "properties": {
-          "harness": { "enum": ["claude-code", "codex", "zcode"] },
+          "harness": { "type": "string", "minLength": 1 },
           "kind":    { "enum": ["relative-symlink", "import", "manual-import", "native"] },
           "from":    { "type": "string" },
           "to":      { "type": "string" },
@@ -60,12 +60,23 @@
 
     "enforcement": {
       "type": "object",
-      "description": "Per-harness enforcement level. `blocking` is a claim that a deny actually denies, and `agentkit verify --self-test` is what makes the claim honest: it fires a known-forbidden call and asserts refusal. Do not declare blocking without it.",
-      "additionalProperties": false,
+      "description": "Per-harness enforcement level. `blocking` is a claim that a deny actually denies, and a provider-backed live self-test is what makes the claim honest. Unknown providers may be declared, but self-test refuses their blocking claim until a provider-specific probe exists.",
+      "additionalProperties": { "$ref": "#/$defs/enforcementLevel" },
       "properties": {
         "claude-code": { "$ref": "#/$defs/enforcementLevel" },
         "codex":       { "$ref": "#/$defs/enforcementLevel" },
         "zcode":       { "$ref": "#/$defs/enforcementLevel" }
+      }
+    },
+
+    "enforcementEvidence": {
+      "type": "object",
+      "description": "Latest provider-specific live deny-and-observe result. `agentkit self-test` rewrites one snapshot per harness; the verifier invalidates it when the installed adapter bytes change.",
+      "additionalProperties": { "$ref": "#/$defs/enforcementEvidence" },
+      "properties": {
+        "codex": { "$ref": "#/$defs/enforcementEvidence" },
+        "claude-code": { "$ref": "#/$defs/enforcementEvidence" },
+        "zcode": { "$ref": "#/$defs/enforcementEvidence" }
       }
     },
 
@@ -121,29 +132,13 @@
         "denyBashPatterns": {
           "type": "array",
           "description": "Repo-specific Bash denials, read at runtime by the Bash gate. Harvest these with `agentkit policy scaffold` rather than writing them from scratch — a fieldbook repo's existing gate script already encodes its real fences.",
-          "items": {
-            "type": "object",
-            "required": ["pattern", "reason"],
-            "additionalProperties": false,
-            "properties": {
-              "pattern": { "type": "string", "description": "POSIX ERE, matched against the command with grep -E" },
-              "reason": { "type": "string", "description": "Shown on denial. A gate that explains itself is one people fix rather than route around." }
-            }
-          },
+          "items": { "$ref": "#/$defs/bashRule" },
           "default": []
         },
         "askBashPatterns": {
           "type": "array",
-          "description": "Same shape as denyBashPatterns, but prompts instead of refusing. For the reversible-but-consequential class.",
-          "items": {
-            "type": "object",
-            "required": ["pattern", "reason"],
-            "additionalProperties": false,
-            "properties": {
-              "pattern": { "type": "string" },
-              "reason": { "type": "string" }
-            }
-          },
+          "description": "Same shape as denyBashPatterns. Claude prompts; Codex hard-denies because PreToolUse cannot currently initiate an approval without failing open.",
+          "items": { "$ref": "#/$defs/bashRule" },
           "default": []
         },
         "denyWritePaths": {
@@ -201,6 +196,33 @@
       }
     },
 
+    "validation": {
+      "type": "object",
+      "description": "Provider-neutral clean-code commands run by `agentkit verify`, and therefore by the installed pre-commit hook. Commands are argv arrays rather than shell strings so quoting cannot change what executes.",
+      "required": ["commands"],
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "argv"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "argv": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
+            }
+          },
+          "default": []
+        }
+      }
+    },
+
     "fallbacks": {
       "type": "object",
       "description": "What to do when a harness lacks a feature this layout assumes. Adopted from a repository that arrived at it independently and had something the kit did not: the portability story was written as 'these three harnesses support X' with nothing said about the fourth. A named degradation path is what stops a missing feature becoming an unrecorded gap.",
@@ -247,9 +269,49 @@
   },
 
   "$defs": {
+    "bashRule": {
+      "type": "object",
+      "required": ["reason"],
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "One POSIX ERE matched against the command with grep -E."
+        },
+        "allOf": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "A conjunction harvested from chained gate conditions; every pattern must match."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Shown on denial. A gate that explains itself is one people fix rather than route around."
+        },
+        "_repaired": {
+          "type": "string",
+          "description": "Legacy repair provenance retained for declarations already emitted by agentkit 0.2.x."
+        }
+      },
+      "oneOf": [
+        { "required": ["pattern"], "not": { "required": ["allOf"] } },
+        { "required": ["allOf"], "not": { "required": ["pattern"] } }
+      ]
+    },
+    "enforcementEvidence": {
+      "type": "object",
+      "required": ["verifiedOn", "harnessVersion", "adapterSha256", "method"],
+      "additionalProperties": false,
+      "properties": {
+        "verifiedOn": { "type": "string", "format": "date" },
+        "harnessVersion": { "type": "string", "minLength": 1 },
+        "adapterSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "method": { "enum": ["live-deny-and-observe"] }
+      }
+    },
     "enforcementLevel": {
       "enum": ["blocking", "advisory", "none"],
-      "description": "blocking = a deny is mechanically refused and a self-test proves it. advisory = the harness reads the rules but nothing stops it. none = the harness does not participate."
+      "description": "blocking = a deny is mechanically refused and a provider-specific live self-test proves the installed wire path. advisory = the harness reads the rules or has untrusted hooks but nothing proven stops it. none = the harness does not participate."
     }
   }
 }

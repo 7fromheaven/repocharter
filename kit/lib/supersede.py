@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -257,7 +258,8 @@ def retire(repo: Path, old_gate: Path) -> list[str]:
     """Quarantine the superseded gate and unwire it from settings.json. Reversible."""
     log = []
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    quarantine = Path.home() / ".agentkit" / "quarantine" / repo.resolve().name / stamp
+    state = Path(os.environ.get("AGENTKIT_STATE_DIR") or (Path.home() / ".agentkit"))
+    quarantine = state / "quarantine" / repo.resolve().name / stamp
     quarantine.mkdir(parents=True, exist_ok=True)
 
     rel = old_gate.relative_to(repo)

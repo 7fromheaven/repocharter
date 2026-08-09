@@ -43,6 +43,18 @@
 set -euo pipefail
 
 PAYLOAD=$(cat)
+AGENTKIT_HARNESS="${AGENTKIT_HARNESS:-claude-code}"
+case "$AGENTKIT_HARNESS" in
+  claude-code|codex) ;;
+  *)
+    printf '%s\n' "agentkit safety gate: unknown AGENTKIT_HARNESS '$AGENTKIT_HARNESS'; refusing." >&2
+    exit 2 ;;
+esac
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-${CODEX_PROJECT_DIR:-}}"
+if [ -z "$PROJECT_DIR" ]; then
+  PROJECT_DIR=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+fi
 
 die_closed() {
   printf '%s\n' "agentkit safety gate: $1 The gate cannot evaluate this command, so it is refused rather than silently allowed. Install jq or python3, or remove the PreToolUse Bash hook deliberately." >&2
@@ -75,8 +87,17 @@ else
   die_closed "neither jq nor python3 is available."
 fi
 
-ask()   { decide ask   "$1"; exit 0; }
 block() { decide deny  "$1"; exit 0; }
+ask() {
+  if [ "$AGENTKIT_HARNESS" = "codex" ]; then
+    # Codex 0.147 parses a PreToolUse `ask` decision but does not implement it: the
+    # hook is marked failed and the command CONTINUES. A hard denial is the only
+    # honest fail-closed translation until hook-initiated approvals are supported.
+    block "$1 Codex cannot request approval from PreToolUse, so this is blocked; the operator may run it directly after review."
+  fi
+  decide ask "$1"
+  exit 0
+}
 
 # Command-position anchor (+ optional inline env-var assignments). POSIX-portable.
 CSEP='(^[[:space:]]*|[;&|][[:space:]]*|\$\([[:space:]]*)([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+ +)*'
@@ -100,7 +121,7 @@ SAFE_PATHS_EXTRA="${SAFE_PATHS_EXTRA:-}"
 # Fails closed: a compatibility.json that exists but cannot be parsed refuses the command.
 # A repo that declared its fences and then corrupted the file is exactly the case where
 # waving the call through is wrong.
-COMPAT="${CLAUDE_PROJECT_DIR:-.}/.agents/compatibility.json"
+COMPAT="${PROJECT_DIR}/.agents/compatibility.json"
 if [ -f "$COMPAT" ]; then
   # Emitted as: verb <TAB> reason <TAB> pattern [<TAB> pattern ...]
   # A rule may carry `pattern` (one) or `allOf` (several, ALL of which must match). The
@@ -282,9 +303,9 @@ if echo "$CMD" | grep -qE "${CSEP}(${MUTATIVE_PATTERN})"; then
   set +e
   PWD_NOW=$(pwd 2>/dev/null || echo "<pwd-failed>")
   CWD_PREFIX="cwd"
-  if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  if [ -n "${PROJECT_DIR:-}" ]; then
     case "$PWD_NOW/" in
-      "${CLAUDE_PROJECT_DIR%/}/"*) ;;
+      "${PROJECT_DIR%/}/"*) ;;
       *) CWD_PREFIX="cwd (unverified)" ;;
     esac
   fi

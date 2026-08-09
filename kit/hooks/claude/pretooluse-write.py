@@ -32,8 +32,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _policy import (  # noqa: E402
-    ALLOW, add_context, deny, fail_closed, load_policy, path_matches,
-    read_payload, script_lengths,
+    ALLOW, add_context, deny, fail_closed, harness, load_policy, path_matches,
+    read_payload, script_lengths, write_paths,
 )
 
 STASH = Path(tempfile.gettempdir()) / "agentkit-measure"
@@ -65,37 +65,46 @@ def measure(path: Path, spec: dict) -> dict:
 
 def main() -> None:
     payload = read_payload()
-    tool_input = payload.get("tool_input") or {}
-    file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
-
-    if not file_path:
-        # Nothing to gate on. An Edit/Write without a path is not a shape we know how to
-        # judge, and inventing a verdict for it would be worse than allowing it: the
-        # denial layer in permissions.deny still applies independently.
-        sys.exit(ALLOW)
-
+    paths = write_paths(payload)
     policy = load_policy()
 
-    for rule in policy.get("denyWritePaths") or []:
-        if path_matches(file_path, rule["glob"]):
+    for file_path in paths:
+        # Codex has no ConfigChange event. Protect the repo-local files that activate its
+        # own hooks at the write-tool boundary; legitimate regeneration goes through
+        # `agentkit apply`, whose Bash invocation is separately gated and reviewable.
+        if harness() == "codex" and any(
+            path_matches(file_path, protected)
+            for protected in (".codex/hooks.json", ".codex/config.toml")
+        ):
             deny(
-                f"agentkit policy: writing {file_path} is forbidden. {rule['reason']} "
-                f"(rule: denyWritePaths {rule['glob']} in .agents/compatibility.json)"
+                f"agentkit policy: Codex may not edit its own enforcement file {file_path} "
+                "through apply_patch. Change the source kit and run `agentkit apply`."
             )
+
+        for rule in policy.get("denyWritePaths") or []:
+            if path_matches(file_path, rule["glob"]):
+                deny(
+                    f"agentkit policy: writing {file_path} is forbidden. {rule['reason']} "
+                    f"(rule: denyWritePaths {rule['glob']} in .agents/compatibility.json)"
+                )
 
     notes = []
     STASH.mkdir(parents=True, exist_ok=True)
-    for spec in policy.get("measureOnWrite") or []:
-        if not path_matches(file_path, spec["glob"]):
-            continue
-        before = measure(Path(file_path), spec)
-        try:
-            stash_path(file_path).write_text(json.dumps(before), encoding="utf-8")
-        except OSError:
-            # A missing stash only costs the delta line in PostToolUse; it is not a
-            # reason to refuse an otherwise-permitted edit.
-            pass
-        notes.append(f"{spec['glob']} -> {json.dumps(before.get('scripts', before))} ({spec['reason']})")
+    for file_path in paths:
+        for spec in policy.get("measureOnWrite") or []:
+            if not path_matches(file_path, spec["glob"]):
+                continue
+            before = measure(Path(file_path), spec)
+            try:
+                stash_path(file_path).write_text(json.dumps(before), encoding="utf-8")
+            except OSError:
+                # A missing stash only costs the delta line in PostToolUse; it is not a
+                # reason to refuse an otherwise-permitted edit.
+                pass
+            notes.append(
+                f"{file_path}: {spec['glob']} -> "
+                f"{json.dumps(before.get('scripts', before))} ({spec['reason']})"
+            )
 
     if notes:
         add_context(

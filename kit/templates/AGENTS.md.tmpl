@@ -50,7 +50,9 @@ convention rather than protection:
 
 - everything in this file that is not listed above.
 
-Run `agentkit verify --self-test` to confirm the enforced list is true rather than declared.
+Run `agentkit self-test --repo .` to confirm the installed gates fire. Under Codex, restart,
+review and trust `/hooks`, then run `agentkit self-test --repo . --promote-codex`; only that
+provider-backed path may promote Codex to blocking.
 
 ## Where things are
 

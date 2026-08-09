@@ -20,6 +20,7 @@ is one nobody will run on the tenth repository.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -74,7 +75,8 @@ def quarantine_root(repo: Path, stamp: str) -> Path:
     the retirement still shows up in git as a plain deletion — with the originals recoverable
     from history regardless.
     """
-    return Path.home() / ".agentkit" / "quarantine" / repo.resolve().name / stamp
+    state = Path(os.environ.get("AGENTKIT_STATE_DIR") or (Path.home() / ".agentkit"))
+    return state / "quarantine" / repo.resolve().name / stamp
 
 
 

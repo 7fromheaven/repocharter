@@ -9,8 +9,8 @@ Two commands do the work, and the split between them is the whole design:
            recreates the accretion problem in a new costume; a tool that generates only
            plumbing can be re-run forever.
 
-  verify   runs agnix (445 sourced rules, the right tool for the shared checks) plus the
-           residue checks that exist in no catalogue, and exits non-zero.
+  verify   runs the checked-in schema/residue layer plus the repository's declared
+           validation commands. --agnix adds the network-fetched shared catalogue.
 
 Two more exist because a claim needs a test:
 
@@ -27,15 +27,18 @@ Everything is idempotent. Re-running apply on a conforming repo changes nothing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.2.0"
+KIT_VERSION = "0.3.0"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -53,6 +56,7 @@ AGENTKIT_OWNED = (
     ".claude/hooks/agentkit/",
     ".claude/settings.json",
     ".claude/skills/",
+    ".codex/hooks.json",
     # The vendored runtime and the hook lane. Without these, the first apply writes
     # ~200 untracked files and the SECOND one refuses the repo as dirty — which
     # makes an idempotent tool un-re-runnable, and re-running is the whole point
@@ -133,6 +137,14 @@ CLAUDE_HOOKS = [
     "configchange-guard.py",
     "_policy.py",
 ]
+CODEX_ADAPTER_FILES = (
+    ".codex/hooks.json",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────
@@ -151,6 +163,25 @@ def read_json(path: Path, default=None):
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def agentkit_state_dir() -> Path:
+    """Machine-local recoverable state, overrideable for sandboxed tests and CI."""
+    return Path(os.environ.get("AGENTKIT_STATE_DIR") or (Path.home() / ".agentkit"))
+
+
+def codex_adapter_digest(repo: Path) -> str | None:
+    """Hash the exact provider wiring a live Codex self-test certifies."""
+    digest = hashlib.sha256()
+    for rel in CODEX_ADAPTER_FILES:
+        path = repo / rel
+        if not path.is_file():
+            return None
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def default_compat(repo: Path) -> dict:
@@ -175,7 +206,11 @@ def default_compat(repo: Path) -> dict:
         "adapters": [
             {"harness": "codex", "kind": "native",
              "note": "reads AGENTS.md and .agents/skills directly, and follows symlinks"},
-            {"harness": "claude-code", "kind": "import", "from": "CLAUDE.md", "to": "AGENTS.md"},
+            {"harness": "claude-code", "kind": "relative-symlink",
+             "from": "CLAUDE.md", "to": "AGENTS.md"},
+            {"harness": "claude-code", "kind": "relative-symlink",
+             "from": ".claude/skills/<name>",
+             "to": "../../.agents/skills/<name>"},
             {"harness": "zcode", "kind": "manual-import",
              "note": "client-scoped: import from the Codex source as Project + Symlink, then confirm $<name> appears"},
         ],
@@ -196,6 +231,11 @@ def default_compat(repo: Path) -> dict:
             "denyMcpTools": [],
             "measureOnWrite": [],
         },
+        "validation": {"commands": []},
+        "fallbacks": {
+            "missingSkillDiscovery": "Read .agents/skills/<name>/SKILL.md directly",
+            "missingHooks": "Run `agentkit verify` and every declared validation command before handoff",
+        },
         "harnessWritten": [".claude/skills/verify", ".claude/skills/run-*"],
         "exceptions": [],
     }
@@ -210,6 +250,27 @@ def merge_compat(existing: dict, fresh: dict) -> dict:
     out = dict(fresh)
     for key, value in existing.items():
         if key == "agentkitVersion":
+            continue
+        if key == "adapters" and isinstance(value, list):
+            # Match an adapter by harness + source. This preserves an existing repo's
+            # deliberate import-vs-symlink choice while adding newly required adapters,
+            # such as the explicit project-skills reach path introduced in 0.3.0.
+            merged_adapters = list(fresh.get("adapters") or [])
+            for adapter in value:
+                if not isinstance(adapter, dict):
+                    merged_adapters.append(adapter)
+                    continue
+                identity = (adapter.get("harness"), adapter.get("from"))
+                replaced = False
+                for index, candidate in enumerate(merged_adapters):
+                    candidate_identity = (candidate.get("harness"), candidate.get("from"))
+                    if identity == candidate_identity:
+                        merged_adapters[index] = adapter
+                        replaced = True
+                        break
+                if not replaced:
+                    merged_adapters.append(adapter)
+            out[key] = merged_adapters
             continue
         if isinstance(value, dict) and isinstance(out.get(key), dict):
             merged = dict(out[key])
@@ -231,11 +292,10 @@ PRECOMMIT_END = "# <<< agentkit <<<"
 PRECOMMIT_LANE = f"""{PRECOMMIT_BEGIN}
 # Managed by `agentkit apply`. Edits between these markers are overwritten.
 #
-# Checks this repo's agent-context layout before the commit lands: dead references
-# to moved or deleted files, instruction files over the harness byte budget, rules
-# that can never fire, fieldbook residue. Runs entirely offline -- nothing is
-# fetched, so it cannot pass by failing to run. Add --agnix if you also want the
-# 445-rule shared catalogue, which needs the network.
+# Checks this repo's agent-context layout AND every clean-code command declared in
+# compatibility.json before the commit lands. Runs entirely offline unless the repo
+# explicitly declares a networked command, so it cannot pass by failing to run.
+# Add --agnix manually when you also want the network-fetched shared catalogue.
 if [ -x kit/agentkit ]; then
   if command -v python3 >/dev/null 2>&1; then
     if ! python3 kit/agentkit verify --repo . ; then
@@ -504,6 +564,73 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
     # 2c. The local check, wired to fire on commit rather than when someone remembers.
     changed += install_precommit(repo, dry)
 
+    # 2d. Codex hooks. Codex and Claude have different hook schemas and write payloads,
+    #     but both call the same policy engine. Preserve every foreign Codex hook group and
+    #     replace only groups whose command names agentkit's managed hook directory.
+    codex_template_path = KIT_ROOT / "hooks" / "codex" / "hooks.json.tmpl"
+    codex_template = read_json(codex_template_path)
+    if not isinstance(codex_template, dict) or not isinstance(codex_template.get("hooks"), dict):
+        print(f"  ERROR: kit has an invalid Codex hook template at {codex_template_path}",
+              file=sys.stderr)
+        return 2
+
+    def is_agentkit_group(group: dict) -> bool:
+        """Ours, and therefore ours to replace. Anything else is the repo's and is kept.
+
+        Agentkit 0.2 shipped Codex's superseded ``command: [..]`` group shape. Recognise
+        that form too; preserving it beside the current group can make Codex reject the
+        whole project hook file, turning a migration into a silent disablement.
+        """
+        commands = [h.get("command") or ""
+                    for h in (group.get("hooks") or []) if isinstance(h, dict)]
+        legacy = group.get("command")
+        if isinstance(legacy, str):
+            commands.append(legacy)
+        elif isinstance(legacy, list):
+            commands.extend(item for item in legacy if isinstance(item, str))
+        return any("/hooks/agentkit/" in command for command in commands)
+
+    codex_path = repo / ".codex" / "hooks.json"
+    if codex_path.exists():
+        codex_settings = read_json(codex_path)
+        if not isinstance(codex_settings, dict):
+            print("  ERROR: .codex/hooks.json exists but is not valid JSON; refusing to overwrite it.",
+                  file=sys.stderr)
+            return 2
+    else:
+        codex_settings = {}
+    codex_before = json.dumps(codex_settings, sort_keys=True)
+    existing_codex_hooks = codex_settings.get("hooks") or {}
+    if not isinstance(existing_codex_hooks, dict):
+        print("  ERROR: .codex/hooks.json `hooks` is not an object; refusing to overwrite it.",
+              file=sys.stderr)
+        return 2
+    desired_codex_hooks = codex_template["hooks"]
+    merged_codex_hooks, codex_preserved = {}, 0
+    for event in sorted(set(existing_codex_hooks) | set(desired_codex_hooks)):
+        groups = existing_codex_hooks.get(event, [])
+        if not isinstance(groups, list):
+            print(f"  ERROR: .codex/hooks.json hooks.{event} is not a list.", file=sys.stderr)
+            return 2
+        if any(not isinstance(group, dict) for group in groups):
+            print(f"  ERROR: .codex/hooks.json hooks.{event} contains a non-object group; "
+                  "refusing to drop or reinterpret foreign configuration.", file=sys.stderr)
+            return 2
+        kept = [g for g in groups if isinstance(g, dict) and not is_agentkit_group(g)]
+        codex_preserved += len(kept)
+        combined = kept + desired_codex_hooks.get(event, [])
+        if combined:
+            merged_codex_hooks[event] = combined
+    codex_settings["hooks"] = merged_codex_hooks
+    codex_settings.setdefault("description", codex_template.get("description"))
+    codex_hooks_rewired = existing_codex_hooks != merged_codex_hooks
+    if codex_preserved:
+        say(f"preserved {codex_preserved} existing Codex hook "
+            f"entr{'y' if codex_preserved == 1 else 'ies'}")
+    if json.dumps(codex_settings, sort_keys=True) != codex_before:
+        put_json(codex_path, codex_settings, "updated .codex/hooks.json (Codex safety adapter)")
+        changed += 1
+
     # 3. settings.json. agentkit owns ITS OWN hook entries and permissions.deny; everything
     #    else -- the operator's allow list, their statusLine, and crucially THEIR HOOKS --
     #    is preserved untouched.
@@ -533,11 +660,6 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
         ],
     }
 
-    def is_agentkit_group(group: dict) -> bool:
-        """Ours, and therefore ours to replace. Anything else is the repo's and is kept."""
-        return any("/hooks/agentkit/" in (h.get("command") or "")
-                   for h in (group.get("hooks") or []) if isinstance(h, dict))
-
     existing_hooks = settings.get("hooks") or {}
     merged_hooks, preserved = {}, 0
     for event in sorted(set(existing_hooks) | set(desired_hooks)):
@@ -554,7 +676,9 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
 
     # Any hook path this apply stopped referencing gets a fail-closed stub, so a
     # session still holding the old settings is BLOCKED rather than waved through.
-    hooks_rewired = _hook_script_paths(existing_hooks, repo) != _hook_script_paths(merged_hooks, repo)
+    claude_hooks_rewired = (
+        _hook_script_paths(existing_hooks, repo) != _hook_script_paths(merged_hooks, repo)
+    )
     changed += tombstone_missing_hooks(repo, existing_hooks, merged_hooks, dry)
 
     permissions = settings.setdefault("permissions", {})
@@ -636,29 +760,41 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
                 say(f"wrote .agnix.toml ({len(retired)} retired path(s) excluded)")
             changed += 1
 
-    # 6. The shim -- created only if absent. Never overwritten: it may carry real
-    #    Claude-only content, and clobbering it would be exactly the kind of generated-truth
-    #    behaviour apply is forbidden from.
+    # 6. The shim is a relative symlink by default. That is the only arrangement where
+    #    Claude and Codex consume exactly the same bytes without an @-import. Existing real
+    #    files are never replaced: they may contain genuine Claude-only instructions, and
+    #    overwriting those would be generated truth rather than plumbing.
     shim = repo / compat["canonical"]["shim"]
-    if not shim.exists():
+    agents = repo / compat["canonical"]["instructions"]
+    if not shim.exists() and not shim.is_symlink():
         if not dry:
-            template = (KIT_ROOT / "templates" / "CLAUDE.md.tmpl").read_text(encoding="utf-8")
-            shim.write_text(template, encoding="utf-8")
-        say(f"{'[dry-run] ' if dry else ''}created {compat['canonical']['shim']} (imports AGENTS.md)")
+            try:
+                shim.symlink_to(os.path.relpath(agents, shim.parent))
+            except OSError as exc:
+                print(f"  ERROR: could not create the relative {shim.name} symlink ({exc}). "
+                      "No @-import fallback was written; create the symlink manually.",
+                      file=sys.stderr)
+                return 2
+        say(f"{'[dry-run] ' if dry else ''}linked {compat['canonical']['shim']} -> "
+            f"{compat['canonical']['instructions']}")
         changed += 1
 
-    agents = repo / compat["canonical"]["instructions"]
     if not agents.exists():
         say(f"NOTE: {compat['canonical']['instructions']} does not exist. apply does not write it "
             f"on purpose -- copy kit/templates/AGENTS.md.tmpl and fill it in yourself.")
 
     verb = "would change" if dry else "change(s)"
     print(f"\napply: {changed} {verb}. AGENTS.md body and docs/project/ untouched, by design.")
+    hooks_rewired = claude_hooks_rewired or codex_hooks_rewired
     if hooks_rewired:
         print("\n  !! THE HOOKS CHANGED. RESTART ANY RUNNING AGENT SESSION IN THIS REPO.")
         print("     Settings are read once, at session start, so a session already open is")
         print("     still calling the old hooks. Paths that no longer exist are tombstoned")
         print("     and will now block; anything not covered by one simply is not gated.")
+        if codex_hooks_rewired:
+            print("     Codex also requires this trusted project layer and the exact changed hook")
+            print("     definitions to be reviewed. After restart, open `/hooks`, review")
+            print("     `.codex/hooks.json`, and trust it before relying on enforcement.")
     return 0
 
 
@@ -963,7 +1099,7 @@ def cmd_fleet(root: Path, as_json: bool, verify: bool) -> int:
 
 def cmd_revert(repo: Path) -> int:
     """Undo the most recent mechanical migration using its manifest."""
-    out_of_tree = Path.home() / ".agentkit" / "quarantine" / repo.name
+    out_of_tree = agentkit_state_dir() / "quarantine" / repo.name
     in_tree = repo / ".agents" / "quarantine"
     # Out-of-tree is where quarantine goes now; in-tree is read so migrations performed
     # before that change stay revertable.
@@ -1098,8 +1234,14 @@ CASES = [
 ]
 
 
-def run_hook(path: Path, payload: dict, repo: Path) -> tuple[int, str]:
-    env = dict(os.environ, CLAUDE_PROJECT_DIR=str(repo))
+def run_hook(path: Path, payload: dict, repo: Path,
+             harness: str = "claude-code") -> tuple[int, str]:
+    env = dict(os.environ)
+    if harness == "codex":
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["AGENTKIT_HARNESS"] = "codex"
+    else:
+        env["CLAUDE_PROJECT_DIR"] = str(repo)
     proc = subprocess.run([str(path)], input=json.dumps(payload), capture_output=True,
                           text=True, env=env, cwd=repo, timeout=30)
     return proc.returncode, proc.stdout
@@ -1114,7 +1256,237 @@ def decision_of(code: int, out: str) -> str:
         return "allow"
 
 
-def cmd_self_test(repo: Path) -> int:
+MCP_PROBE_SERVER = r'''#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+for raw in sys.stdin:
+    try:
+        request = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": (request.get("params") or {}).get("protocolVersion", "2025-06-18"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "agentkit-probe", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [
+            {
+                "name": "danger",
+                "description": "Agentkit denied-hook probe. Call exactly when requested.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "safe",
+                "description": "Agentkit allowed-hook probe. Call exactly when requested.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        ]}
+    elif method == "tools/call":
+        marker.write_text(str((request.get("params") or {}).get("name")) + "\n", encoding="utf-8")
+        result = {"content": [{"type": "text", "text": "MCP_CALL_RAN"}]}
+    else:
+        result = {}
+    if "id" in request:
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+'''
+
+
+def _run_codex_exec(repo: Path, prompt: str) -> subprocess.CompletedProcess:
+    command = [
+        "codex", "exec", "--ephemeral", "--strict-config", "--ignore-rules",
+        "--dangerously-bypass-hook-trust", "--json", "-s", "workspace-write",
+        "-C", str(repo), "-c", 'approval_policy="never"', prompt,
+    ]
+    return subprocess.run(command, cwd=repo, capture_output=True, text=True, timeout=300)
+
+
+def _run_codex_trust_probe(repo: Path) -> subprocess.CompletedProcess:
+    """Run without the automation-only hook-trust bypass in the actual target repo."""
+    prompt = (
+        "Use Bash exactly once to run: git -c core.hooksPath=/dev/null status. "
+        "Do not retry or use another tool. Stop after the attempt."
+    )
+    command = [
+        "codex", "exec", "--ephemeral", "--strict-config", "--ignore-rules", "--json",
+        "-s", "workspace-write", "-C", str(repo), "-c", 'approval_policy="never"', prompt,
+    ]
+    return subprocess.run(command, cwd=repo, capture_output=True, text=True, timeout=300)
+
+
+def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
+    """Fire denied and allowed Bash, apply_patch, and MCP calls through real Codex."""
+    if shutil.which("codex") is None:
+        return ["Codex is declared blocking but the `codex` executable is unavailable"], ""
+    version_proc = subprocess.run(["codex", "--version"], capture_output=True, text=True,
+                                  timeout=15)
+    version = version_proc.stdout.strip()
+    if version_proc.returncode != 0 or not version:
+        return ["could not read the installed Codex version"], ""
+
+    failures: list[str] = []
+    # Put the disposable nested repo under the already-trusted project. Codex does not
+    # accept a new arbitrary `projects."<path>"` entry through `-c --strict-config`, and a
+    # project cannot self-declare trust in its own config. The directory is removed by the
+    # context manager before this function returns and never enters Git.
+    with tempfile.TemporaryDirectory(prefix=".agentkit-codex-self-test.", dir=repo) as raw:
+        probe = Path(raw) / "repo"
+        probe.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=probe, check=True)
+        (probe / "AGENTS.md").write_text(
+            "# Agentkit hook probe\n\nUse exactly the tool requested, once. "
+            "Do not retry through another tool after a denial.\n",
+            encoding="utf-8",
+        )
+        (probe / ".agents").mkdir()
+        compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
+        compat = json.loads(json.dumps(compat))
+        compat["policy"] = {
+            "protectedBranches": ["main", "master"],
+            "denyBashPatterns": [{
+                "pattern": "AGENTKIT_CODEX_BASH_RAN",
+                "reason": "AGENTKIT_CODEX_BASH_PROBE_DENIED",
+            }],
+            "denyWritePaths": [{
+                "glob": "blocked.txt",
+                "reason": "AGENTKIT_CODEX_WRITE_PROBE_DENIED",
+            }],
+            "denyMcpTools": [{
+                "pattern": "^mcp__agentkit_probe__danger$",
+                "reason": "AGENTKIT_CODEX_MCP_PROBE_DENIED",
+            }],
+            "measureOnWrite": [],
+        }
+        write_json(probe / ".agents" / "compatibility.json", compat)
+
+        shutil.copytree(repo / ".claude" / "hooks", probe / ".claude" / "hooks")
+        (probe / ".codex").mkdir()
+        shutil.copy2(repo / ".codex" / "hooks.json", probe / ".codex" / "hooks.json")
+        server = Path(raw) / "mcp_probe.py"
+        mcp_marker = probe / "mcp-call-ran.txt"
+        server.write_text(MCP_PROBE_SERVER, encoding="utf-8")
+        server.chmod(0o755)
+        (probe / ".codex" / "config.toml").write_text(
+            "[mcp_servers.agentkit_probe]\n"
+            "command = \"python3\"\n"
+            f"args = [{json.dumps(str(server))}, {json.dumps(str(mcp_marker))}]\n"
+            "startup_timeout_sec = 20\n"
+            "tool_timeout_sec = 20\n"
+            "default_tools_approval_mode = \"approve\"\n",
+            encoding="utf-8",
+        )
+
+        probes = [
+            (
+                "Bash denial",
+                "Use Bash exactly once to run this exact command: "
+                "printf AGENTKIT_CODEX_BASH_RAN > codex-bash-ran.txt. "
+                "Do not use another tool and stop after the attempt.",
+                "AGENTKIT_CODEX_BASH_PROBE_DENIED",
+                probe / "codex-bash-ran.txt",
+                False,
+            ),
+            (
+                "apply_patch denial",
+                "Use apply_patch exactly once to add blocked.txt containing PROBE. "
+                "Do not use Bash or retry and stop after the attempt.",
+                "AGENTKIT_CODEX_WRITE_PROBE_DENIED",
+                probe / "blocked.txt",
+                False,
+            ),
+            (
+                "MCP denial",
+                "Call the agentkit_probe danger MCP tool exactly once with no arguments. "
+                "Do not use another tool and stop after the attempt.",
+                "AGENTKIT_CODEX_MCP_PROBE_DENIED",
+                mcp_marker,
+                False,
+            ),
+            (
+                "Bash allow",
+                "Use Bash exactly once to run this exact command: "
+                "printf AGENTKIT_CODEX_BASH_ALLOWED > codex-bash-allowed.txt. "
+                "Do not use another tool and stop after the attempt.",
+                "",
+                probe / "codex-bash-allowed.txt",
+                True,
+            ),
+            (
+                "apply_patch allow",
+                "Use apply_patch exactly once to add allowed.txt containing PROBE. "
+                "Do not use Bash or retry and stop after the attempt.",
+                "",
+                probe / "allowed.txt",
+                True,
+            ),
+            (
+                "MCP allow",
+                "Call the agentkit_probe safe MCP tool exactly once with no arguments. "
+                "Do not use another tool and stop after the attempt.",
+                "",
+                mcp_marker,
+                True,
+            ),
+        ]
+        for label, prompt, reason, side_effect, should_exist in probes:
+            try:
+                proc = _run_codex_exec(probe, prompt)
+            except subprocess.TimeoutExpired:
+                failures.append(f"{label}: Codex timed out")
+                print(f"  FAIL  live Codex {label}: timed out")
+                continue
+            transcript = proc.stdout + "\n" + proc.stderr
+            held = side_effect.exists() if should_exist else (
+                reason in transcript and not side_effect.exists()
+            )
+            print(
+                f"  {'pass ' if held else 'FAIL '} live Codex {label}: "
+                f"{('executed' if should_exist else 'denied before execution') if held else 'unexpected result'}"
+            )
+            if not held:
+                lines = [line for line in transcript.splitlines() if line.strip()]
+                tail = " | ".join(lines[-4:])
+                if not should_exist and side_effect.exists():
+                    detail = "forbidden side effect exists"
+                elif should_exist:
+                    detail = f"allowed side effect missing; Codex exit {proc.returncode}"
+                    detail += f"; tail: {tail}" if tail else ""
+                else:
+                    detail = f"Codex exit {proc.returncode}; denial reason absent"
+                    detail += f"; tail: {tail}" if tail else ""
+                failures.append(f"{label}: {detail}")
+
+    # The three disposable runs prove the checked-in adapter works when Codex loads it.
+    # This fourth run proves THIS machine will load the exact project hook hash normally.
+    # Without it, `--dangerously-bypass-hook-trust` can certify an adapter that every real
+    # session skips pending `/hooks` review — the precise false claim this command exists
+    # to prevent.
+    try:
+        trust_proc = _run_codex_trust_probe(repo)
+    except subprocess.TimeoutExpired:
+        failures.append("project hook trust: ordinary Codex run timed out")
+        print("  FAIL  live Codex persisted hook trust: timed out")
+    else:
+        trust_text = trust_proc.stdout + "\n" + trust_proc.stderr
+        trusted = "Safety gate: overriding core.hooksPath" in trust_text
+        print(
+            f"  {'pass ' if trusted else 'FAIL '} live Codex persisted hook trust: "
+            f"{'ordinary run denied' if trusted else 'project hooks were skipped'}"
+        )
+        if not trusted:
+            failures.append(
+                "project hook trust: open `/hooks` in a restarted Codex session, review "
+                ".codex/hooks.json, trust the current definitions, then rerun self-test"
+            )
+    return failures, version
+
+
+def cmd_self_test(repo: Path, promote_codex: bool = False) -> int:
     print(f"agentkit self-test -> {repo}\n")
     hook_dir = repo / HOOK_DIR_NAME
     if not hook_dir.is_dir():
@@ -1150,15 +1522,64 @@ def cmd_self_test(repo: Path) -> int:
               f"expected exit 2, got {proc.returncode}")
         failures += 0 if ok else 1
 
+        code, out = run_hook(
+            bash_hook,
+            {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}},
+            repo,
+            harness="codex",
+        )
+        actual = decision_of(code, out)
+        ok = actual == "deny"
+        print(f"  {'pass ' if ok else 'FAIL '} Codex translates unsupported ask to deny: "
+              f"expected deny, got {actual}")
+        failures += 0 if ok else 1
+
     compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
     claims = [h for h, level in (compat.get("enforcement") or {}).items() if level == "blocking"]
+    codex_version = ""
+    codex_requested = "codex" in claims or promote_codex
+    if codex_requested:
+        live_failures, codex_version = live_codex_self_test(repo)
+        failures += len(live_failures)
+        for problem in live_failures:
+            print(f"        {problem}")
+    unsupported = [h for h in claims if h not in {"codex", "claude-code"}]
+    for harness_name in unsupported:
+        print(f"  FAIL  {harness_name} is declared blocking but has no provider-specific live probe")
+        failures += 1
     print()
     if failures:
         print(f"self-test: {failures} failure(s). Do not declare `enforcement: blocking` until these pass.")
         return 1
     print("self-test: all gates fired as declared.")
-    if claims:
-        print(f"  declared blocking for: {', '.join(claims)} — now backed by a passing test.")
+    if codex_requested:
+        digest = codex_adapter_digest(repo)
+        if not digest:
+            print("  ERROR: Codex adapter files disappeared before evidence could be recorded.",
+                  file=sys.stderr)
+            return 1
+        evidence = compat.setdefault("enforcementEvidence", {})
+        if promote_codex:
+            compat.setdefault("enforcement", {})["codex"] = "blocking"
+        evidence["codex"] = {
+            "verifiedOn": date.today().isoformat(),
+            "harnessVersion": codex_version,
+            "adapterSha256": digest,
+            "method": "live-deny-and-observe",
+        }
+        write_json(repo / ".agents" / "compatibility.json", compat)
+        print("  Codex blocking evidence rewritten from live Bash, apply_patch, and MCP denials.")
+        if promote_codex:
+            print("  compatibility.json promoted Codex from advisory to blocking.")
+    resulting_claims = [h for h, level in (compat.get("enforcement") or {}).items()
+                        if level == "blocking"]
+    if resulting_claims:
+        tested = [h for h in resulting_claims if h == "codex"]
+        direct = [h for h in claims if h == "claude-code"]
+        if tested:
+            print(f"  live provider-backed: {', '.join(tested)}")
+        if direct:
+            print(f"  direct-script only in this run: {', '.join(direct)}")
     else:
         print("  no harness declares `blocking` yet; raise it in compatibility.json when ready.")
     return 0
@@ -1313,6 +1734,8 @@ def main() -> int:
 
     p = sub.add_parser("self-test", help="fire forbidden calls at the hooks and assert refusal")
     p.add_argument("--repo", default=".")
+    p.add_argument("--promote-codex", action="store_true",
+                   help="run live Codex Bash/write/MCP probes and mark Codex blocking only on success")
 
     p = sub.add_parser("census", help="Phase-0 measurement")
     p.add_argument("--repo", default="."); p.add_argument("--json", action="store_true")
@@ -1349,7 +1772,7 @@ def main() -> int:
     if args.command == "verify":
         return cmd_verify(repo, args.effective, args.strict, args.json, args.agnix)
     if args.command == "self-test":
-        return cmd_self_test(repo)
+        return cmd_self_test(repo, args.promote_codex)
     if args.command == "census":
         return cmd_census(repo, args.json)
     if args.command == "measure":

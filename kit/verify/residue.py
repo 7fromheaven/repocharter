@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """agentkit conformance checks — the part no shipped linter covers.
 
-agnix carries 445 sourced rules and already implements the byte-chain check, the
-override-file check, the nested-AGENTS.md check, import validity, and the rules-frontmatter
-checks. It is the right tool and this file does not re-implement it.
+agnix carries a broad sourced catalogue and remains available through `verify --agnix`.
+The default commit path cannot fetch dependencies, so this checked-in module owns the
+load-bearing offline checks directly.
 
 What lives here is the residue: the checks that exist in no rule catalogue, plus the ones
 that must read `.agents/compatibility.json` to know what this repo declared. Every check
@@ -28,6 +28,7 @@ Exit codes: 0 clean or warnings only, 1 errors found, 2 the checker could not ru
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -68,6 +69,15 @@ RETIRED_FIELDBOOK_SKILLS = {
 # set; it cannot shrink it.
 DEFAULT_HARNESS_WRITTEN = (".claude/skills/verify", ".claude/skills/run-*")
 
+CODEX_ADAPTER_FILES = (
+    ".codex/hooks.json",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+)
+
 
 @dataclass
 class Report:
@@ -105,6 +115,150 @@ def read_json(path: Path) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _schema_type_ok(value, expected: str) -> bool:
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    return True
+
+
+def _resolve_schema_ref(schema_root: dict, ref: str) -> dict | None:
+    if not ref.startswith("#/"):
+        return None
+    node = schema_root
+    for raw in ref[2:].split("/"):
+        key = raw.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node if isinstance(node, dict) else None
+
+
+def _schema_errors(value, schema: dict, schema_root: dict, path: str = "$", depth: int = 0) -> list[str]:
+    """Validate the dependency-free subset used by compatibility.schema.json.
+
+    Pulling a JSON Schema package into a tool that must run on a fresh clone would break the
+    zero-dependency contract. This deliberately implements only the checked-in schema's
+    vocabulary; an unsupported keyword remains documentation rather than being guessed at.
+    """
+    if depth > 40:
+        return [f"{path}: schema nesting exceeds 40 levels"]
+    if "$ref" in schema:
+        target = _resolve_schema_ref(schema_root, schema["$ref"])
+        if target is None:
+            return [f"{path}: unresolved schema reference {schema['$ref']!r}"]
+        return _schema_errors(value, target, schema_root, path, depth + 1)
+
+    errors: list[str] = []
+    expected = schema.get("type")
+    if expected and not _schema_type_ok(value, expected):
+        return [f"{path}: expected {expected}, got {type(value).__name__}"]
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append(f"{path}: {value!r} is not one of {schema['enum']!r}")
+
+    if isinstance(value, dict):
+        for key in schema.get("required") or []:
+            if key not in value:
+                errors.append(f"{path}: missing required key {key!r}")
+        properties = schema.get("properties") or {}
+        additional = schema.get("additionalProperties", True)
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key in properties:
+                errors.extend(_schema_errors(child, properties[key], schema_root,
+                                             child_path, depth + 1))
+            elif additional is False:
+                errors.append(f"{child_path}: unknown key")
+            elif isinstance(additional, dict):
+                errors.extend(_schema_errors(child, additional, schema_root,
+                                             child_path, depth + 1))
+    elif isinstance(value, list):
+        minimum = schema.get("minItems")
+        if isinstance(minimum, int) and len(value) < minimum:
+            errors.append(f"{path}: needs at least {minimum} item(s)")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                errors.extend(_schema_errors(item, item_schema, schema_root,
+                                             f"{path}[{index}]", depth + 1))
+    elif isinstance(value, str):
+        minimum = schema.get("minLength")
+        if isinstance(minimum, int) and len(value) < minimum:
+            errors.append(f"{path}: must be at least {minimum} character(s)")
+        pattern = schema.get("pattern")
+        if pattern and not re.search(pattern, value):
+            errors.append(f"{path}: {value!r} does not match {pattern!r}")
+        if schema.get("format") == "date" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            errors.append(f"{path}: {value!r} is not an ISO date")
+    elif isinstance(value, int) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            errors.append(f"{path}: {value} is below {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            errors.append(f"{path}: {value} is above {schema['maximum']}")
+
+    if "not" in schema and not _schema_errors(value, schema["not"], schema_root,
+                                                path, depth + 1):
+        errors.append(f"{path}: matches a forbidden schema shape")
+    if "oneOf" in schema:
+        matches = sum(not _schema_errors(value, branch, schema_root, path, depth + 1)
+                      for branch in schema["oneOf"])
+        if matches != 1:
+            errors.append(f"{path}: must match exactly one of {len(schema['oneOf'])} shapes")
+    return errors
+
+
+def check_schema(root: Path, compat: dict, rep: Report) -> None:
+    """Validate the declaration against the checked-in schema, offline."""
+    bundled = Path(__file__).resolve().parent.parent / "schema" / "compatibility.schema.json"
+    declared = compat.get("$schema")
+    schema_path = bundled
+    if isinstance(declared, str) and "://" not in declared:
+        candidate = (root / ".agents" / declared).resolve()
+        try:
+            candidate.relative_to(root.resolve())
+        except ValueError:
+            rep.error(f"compatibility.json $schema resolves outside the repo: {declared}")
+            return
+        if not candidate.exists():
+            rep.error(f"compatibility.json $schema does not exist: {declared}")
+            return
+        schema_path = candidate
+    schema = read_json(schema_path)
+    if not isinstance(schema, dict):
+        rep.error(f"compatibility schema is unreadable or invalid JSON: {schema_path}")
+        return
+    for problem in _schema_errors(compat, schema, schema)[:40]:
+        rep.error(f"compatibility schema: {problem}")
+
+
+def _version_at_least(compat: dict, wanted: tuple[int, int, int]) -> bool:
+    try:
+        actual = tuple(int(part) for part in compat.get("agentkitVersion", "0.0.0").split("."))
+    except (AttributeError, ValueError):
+        return False
+    return actual >= wanted
+
+
+def codex_adapter_digest(root: Path) -> str | None:
+    digest = hashlib.sha256()
+    for rel in CODEX_ADAPTER_FILES:
+        path = root / rel
+        if not path.is_file():
+            return None
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def frontmatter(text: str) -> dict | None:
@@ -269,15 +423,226 @@ def check_declaration(root: Path, compat: dict, rep: Report) -> None:
             "repo-authored budget. Intended, but it should not be a surprise."
         )
 
-    for adapter in compat.get("adapters") or []:
-        if adapter.get("kind") != "relative-symlink":
+    adapters = compat.get("adapters") or []
+    declared_reach: set[tuple[str, str | None]] = set()
+    for adapter in adapters if isinstance(adapters, list) else []:
+        if not isinstance(adapter, dict):
+            continue  # the schema check reports the shape
+        harness_name = adapter.get("harness")
+        kind = adapter.get("kind")
+        source = adapter.get("from")
+        target = adapter.get("to")
+        declared_reach.add((str(harness_name), source if isinstance(source, str) else None))
+
+        if kind == "native":
+            if harness_name == "codex":
+                canonical = compat.get("canonical") or {}
+                if canonical.get("instructions") != "AGENTS.md":
+                    rep.error("Codex native adapter requires canonical.instructions = AGENTS.md")
+                if canonical.get("skills") != ".agents/skills":
+                    rep.error("Codex native adapter requires canonical.skills = .agents/skills")
             continue
-        src = root / (adapter.get("from") or "")
-        if not src.exists() and not src.is_symlink():
-            rep.error(f"declared adapter {adapter.get('from')} does not exist")
+
+        if kind == "manual-import":
+            rep.note(
+                f"{harness_name} adapter is manual and cannot be verified from this checkout: "
+                f"{adapter.get('note') or 'no verification note declared'}"
+            )
+            continue
+
+        if not isinstance(source, str) or not isinstance(target, str):
+            rep.error(f"declared {kind} adapter for {harness_name} needs string `from` and `to`")
+            continue
+
+        if "<name>" in source or "<name>" in target:
+            # check_skills resolves every concrete project skill and its Claude symlink.
+            if kind != "relative-symlink":
+                rep.error(f"placeholder adapter {source} must be a relative-symlink")
+            continue
+
+        src = root / source
+        expected = (src.parent / target).resolve()
+        if kind == "relative-symlink":
+            if not src.is_symlink():
+                rep.error(f"declared adapter {source} is not a symlink")
+                continue
+            actual_target = os.readlink(src)
+            if os.path.isabs(actual_target):
+                rep.error(f"declared adapter {source} is an absolute symlink ({actual_target})")
+                continue
+            actual = (src.parent / actual_target).resolve()
+            if actual != expected:
+                rep.error(
+                    f"declared adapter {source} resolves to {actual}, not declared target {expected}"
+                )
+            if not actual.exists():
+                rep.error(f"declared adapter {source} is broken (target {actual} does not exist)")
+            continue
+
+        if kind == "import":
+            if not src.is_file() or src.is_symlink():
+                rep.error(f"declared import adapter {source} is missing or is not a real file")
+                continue
+            directive = "@" + target
+            lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+            if directive not in (line.strip() for line in lines):
+                rep.error(
+                    f"declared import adapter {source} does not contain the exact line {directive!r}"
+                )
+            if not expected.exists():
+                rep.error(f"declared import adapter {source} targets missing path {target}")
+
+    # 0.3.0 makes the reach paths an asserted contract rather than an optional comment.
+    if _version_at_least(compat, (0, 3, 0)):
+        if ("codex", None) not in declared_reach:
+            rep.error("compatibility.json lacks the Codex native adapter declaration")
+        shim = (compat.get("canonical") or {}).get("shim", "CLAUDE.md")
+        if ("claude-code", shim) not in declared_reach:
+            rep.error(f"compatibility.json lacks a Claude adapter for {shim}")
+        if ("claude-code", ".claude/skills/<name>") not in declared_reach:
+            rep.error("compatibility.json lacks the Claude project-skills symlink adapter")
 
     for exc in compat.get("exceptions") or []:
         rep.note(f"declared exception: {exc.get('rule')} — {exc.get('reason')} (approved {exc.get('approvedBy')}, {exc.get('date')})")
+
+
+def check_codex_hooks(root: Path, compat: dict, rep: Report) -> None:
+    """Assert the generated Codex adapter's current schema and provider semantics."""
+    path = root / ".codex" / "hooks.json"
+    enforcement = (compat.get("enforcement") or {}).get("codex", "none")
+    native_declared = any(
+        isinstance(a, dict) and a.get("harness") == "codex" and a.get("kind") == "native"
+        for a in (compat.get("adapters") or [])
+    )
+    required = _version_at_least(compat, (0, 3, 0)) and (native_declared or enforcement != "none")
+    if not path.exists():
+        if required:
+            rep.error(".codex/hooks.json is missing; run `agentkit apply` to install the Codex adapter")
+        return
+
+    config = read_json(path)
+    if not isinstance(config, dict):
+        rep.error(".codex/hooks.json is not valid JSON")
+        return
+    hooks = config.get("hooks")
+    if not isinstance(hooks, dict):
+        rep.error(".codex/hooks.json has no object-valued `hooks` block")
+        return
+
+    expected = (
+        ("PreToolUse", "^Bash$", "pretooluse-bash.sh"),
+        ("PreToolUse", "^apply_patch$", "pretooluse-write.py"),
+        ("PreToolUse", "^mcp__.*$", "pretooluse-mcp.py"),
+        ("PostToolUse", "^apply_patch$", "posttooluse-write.py"),
+    )
+    for event, matcher, script in expected:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            rep.error(f".codex/hooks.json lacks hooks.{event}")
+            continue
+        matching = [g for g in groups
+                    if isinstance(g, dict) and g.get("matcher") == matcher]
+        handlers = [h for group in matching for h in (group.get("hooks") or [])
+                    if isinstance(h, dict)]
+        commands = [h.get("command") for h in handlers
+                    if h.get("type") == "command" and isinstance(h.get("command"), str)]
+        command = next((cmd for cmd in commands if script in cmd), None)
+        if command is None:
+            rep.error(
+                f".codex/hooks.json {event} matcher {matcher!r} does not invoke {script}"
+            )
+            continue
+        if "AGENTKIT_HARNESS=codex" not in command:
+            rep.error(
+                f".codex/hooks.json command for {script} lacks AGENTKIT_HARNESS=codex; "
+                "the shared gate would emit Claude-only approval decisions"
+            )
+        if "git rev-parse --show-toplevel" not in command:
+            rep.error(
+                f".codex/hooks.json command for {script} is not rooted through the git top level"
+            )
+        installed = root / ".claude" / "hooks" / "agentkit" / script
+        if not installed.is_file():
+            rep.error(f".codex/hooks.json references missing installed hook {installed.relative_to(root)}")
+        elif not os.access(installed, os.X_OK):
+            rep.error(f"Codex hook {installed.relative_to(root)} is not executable")
+
+    config_toml = root / ".codex" / "config.toml"
+    if config_toml.exists():
+        text = config_toml.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"^\s*(?:codex_)?hooks\s*=\s*false\b", text, re.M | re.I):
+            rep.error(".codex/config.toml disables hooks, so the installed adapter cannot run")
+        if re.search(r"^\s*allow_managed_hooks_only\s*=\s*true\b", text, re.M | re.I):
+            rep.error(
+                ".codex/config.toml allows managed hooks only, which skips this project adapter"
+            )
+
+    if enforcement == "blocking":
+        evidence = (compat.get("enforcementEvidence") or {}).get("codex")
+        if not isinstance(evidence, dict):
+            rep.error(
+                "Codex is declared blocking but has no live enforcementEvidence. "
+                "Run `agentkit self-test --repo .` with Codex installed."
+            )
+        else:
+            actual_digest = codex_adapter_digest(root)
+            if actual_digest is None or evidence.get("adapterSha256") != actual_digest:
+                rep.error(
+                    "Codex blocking evidence is stale: installed hook/config bytes changed. "
+                    "Re-run `agentkit self-test --repo .`."
+                )
+            try:
+                proc = subprocess.run(["codex", "--version"], capture_output=True, text=True,
+                                      timeout=10)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                rep.note("Codex binary unavailable here; recorded live evidence could not be version-checked")
+            else:
+                version = proc.stdout.strip()
+                if proc.returncode == 0 and version and version != evidence.get("harnessVersion"):
+                    rep.error(
+                        f"Codex blocking evidence was measured on {evidence.get('harnessVersion')!r}, "
+                        f"but this machine runs {version!r}. Re-run the live self-test."
+                    )
+        rep.note(
+            "Codex project hooks are blocking only after the workspace and current hook hash "
+            "are trusted on this machine; inspect or approve them with `/hooks`."
+        )
+
+
+def check_validation(root: Path, compat: dict, rep: Report) -> None:
+    """Run the repo-declared clean-code commands without a shell."""
+    validation = compat.get("validation") or {}
+    commands = validation.get("commands") if isinstance(validation, dict) else None
+    if not commands:
+        return
+    if not isinstance(commands, list):
+        return  # schema check reports it
+    for spec in commands:
+        if not isinstance(spec, dict):
+            continue
+        name, argv = spec.get("name"), spec.get("argv")
+        if not isinstance(name, str) or not isinstance(argv, list) or not argv:
+            continue
+        if not all(isinstance(arg, str) and arg for arg in argv):
+            continue
+        timeout = spec.get("timeoutSeconds", 300)
+        try:
+            proc = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError:
+            rep.error(f"validation {name!r} could not run: executable {argv[0]!r} was not found")
+            continue
+        except subprocess.TimeoutExpired:
+            rep.error(f"validation {name!r} timed out after {timeout} seconds")
+            continue
+        if proc.returncode != 0:
+            lines = [line for line in (proc.stdout + "\n" + proc.stderr).splitlines() if line.strip()]
+            tail = " | ".join(lines[-4:])
+            rep.error(
+                f"validation {name!r} failed with exit {proc.returncode}"
+                + (f": {tail}" if tail else "")
+            )
+        else:
+            rep.note(f"validation passed: {name}")
 
 
 # ── check 3: dead references in settings.json ─────────────────────────────────────────
@@ -598,6 +963,8 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
         rep.error(".agents/compatibility.json is missing. Run `agentkit apply` first.")
         return rep
 
+    check_schema(root, compat, rep)
+
     # An inert deny rule reads exactly like a working one from the outside, so this is an
     # error rather than a warning: a pattern that silently matches nothing occupies the slot
     # where a real fence would go.
@@ -631,11 +998,13 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
     check_declaration(root, compat, rep)
     check_skills(root, compat, rep)
     check_dead_references(root, rep)
+    check_codex_hooks(root, compat, rep)
     check_codex_config(root, rep)
     check_claude_md_excludes(root, rep)
     check_override_and_nesting(root, rep)
     check_rules(root, rep)
     check_budgets(root, compat, rep)
+    check_validation(root, compat, rep)
     if effective:
         check_effective(root, rep)
 

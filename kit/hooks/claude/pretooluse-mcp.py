@@ -19,7 +19,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _policy import ALLOW, compile_pattern, deny, load_policy, read_payload  # noqa: E402
+from _policy import (  # noqa: E402
+    ALLOW, compile_pattern, deny, fail_closed, load_policy, read_payload,
+)
 
 
 def arg_matches(tool_input: dict, conditions: dict) -> bool:
@@ -44,7 +46,9 @@ def main() -> None:
     tool_input = payload.get("tool_input") or {}
 
     if not tool_name:
-        sys.exit(ALLOW)
+        fail_closed("the MCP hook payload has no tool_name, so the gate cannot identify the call.")
+    if not isinstance(tool_input, dict):
+        fail_closed("the MCP hook payload has no object-valued tool_input.")
 
     for rule in load_policy().get("denyMcpTools") or []:
         if not compile_pattern(rule["pattern"], "denyMcpTools.pattern").search(tool_name):

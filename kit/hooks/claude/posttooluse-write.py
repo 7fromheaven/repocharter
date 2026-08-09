@@ -24,7 +24,9 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _policy import ALLOW, load_policy, path_matches, read_payload, script_lengths  # noqa: E402
+from _policy import (  # noqa: E402
+    ALLOW, load_policy, path_matches, read_payload, script_lengths, write_paths,
+)
 
 STASH = Path(tempfile.gettempdir()) / "agentkit-measure"
 
@@ -71,26 +73,23 @@ def describe_delta(before: dict, after: dict) -> str:
 
 def main() -> None:
     payload = read_payload()
-    tool_input = payload.get("tool_input") or {}
-    file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
-    if not file_path:
-        sys.exit(ALLOW)
-
+    paths = write_paths(payload)
     policy = load_policy()
     lines = []
-    for spec in policy.get("measureOnWrite") or []:
-        if not path_matches(file_path, spec["glob"]):
-            continue
-        after = measure(Path(file_path), spec)
-        before = {}
-        stash = stash_path(file_path)
-        try:
-            if stash.exists():
-                before = json.loads(stash.read_text(encoding="utf-8"))
-                stash.unlink()
-        except (OSError, json.JSONDecodeError):
+    for file_path in paths:
+        for spec in policy.get("measureOnWrite") or []:
+            if not path_matches(file_path, spec["glob"]):
+                continue
+            after = measure(Path(file_path), spec)
             before = {}
-        lines.append(f"{Path(file_path).name}: {describe_delta(before, after)}")
+            stash = stash_path(file_path)
+            try:
+                if stash.exists():
+                    before = json.loads(stash.read_text(encoding="utf-8"))
+                    stash.unlink()
+            except (OSError, json.JSONDecodeError):
+                before = {}
+            lines.append(f"{Path(file_path).name}: {describe_delta(before, after)}")
 
     if lines:
         print(json.dumps({

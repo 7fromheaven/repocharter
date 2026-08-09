@@ -3,7 +3,7 @@
 The mechanical layer of the portable agent-context system. One vendored copy per
 repository, one version stamp, one command to install and one to check.
 
-**Status: in production across a fleet of repositories.** 176 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 204 tests, no dependencies:
 `python3 kit/tests/run_tests.py`. Every rule below was found by a real migration, and the
 commentary cites the failure that produced it.
 
@@ -20,9 +20,10 @@ conforming repo reports `0 change(s)`.
 - `.claude/hooks/agentkit/*` — the gate scripts, vendored not symlinked
 - `.claude/settings.json` — **only** the `hooks` key and `permissions.deny`; every other
   key, including your allow-list, is preserved untouched
+- `.codex/hooks.json` — current project-hook schema, merged with foreign hook groups and keys
 - `.claude/skills/<name>` — relative symlinks into `.agents/skills/`
 - `.agnix.toml` — linter config with severities raised on the six rules that matter
-- `CLAUDE.md` — the `@AGENTS.md` shim, **only if absent**
+- `CLAUDE.md` — a relative symlink to `AGENTS.md`, **only if absent**
 
 **Never writes:** `AGENTS.md`'s body, anything under `docs/project/`. A tool that generates
 truth recreates the accretion problem in a new costume. Copy
@@ -39,8 +40,8 @@ truth recreates the accretion problem in a new costume. Copy
 | `policy promote` | moves the reviewed draft into the live policy | 0 / 1 |
 | `supersede` | proves the kit's gate is never weaker, then retires the legacy one | 0 / 1 |
 | `migrate` | mechanical migration + a written plan for the judgment calls | 0 / 2 |
-| `verify` | agnix (445 shared rules) + the residue checks, stage-aware | 0 / 1 |
-| `self-test` | fires forbidden calls at the installed hooks and asserts refusal | 0 / 1 |
+| `verify` | checked-in schema/residue checks + declared validation commands; `--agnix` is optional | 0 / 1 |
+| `self-test` | fires forbidden calls at installed hooks; `--promote-codex` requires live persisted-trust proof | 0 / 1 |
 | `revert` | undoes the last mechanical migration from its manifest | 0 / 1 |
 
 ### The order for one repository
@@ -54,6 +55,8 @@ kit/agentkit policy scaffold --repo ~/dev/foo     # harvest its real rules
 kit/agentkit policy promote  --repo ~/dev/foo
 kit/agentkit apply   --repo ~/dev/foo             # recompile permissions.deny
 kit/agentkit self-test --repo ~/dev/foo           # prove the gates fire
+# Under Codex: restart, review/trust /hooks, then:
+kit/agentkit self-test --repo ~/dev/foo --promote-codex
 kit/agentkit supersede --repo ~/dev/foo           # can the old gate be retired?
 kit/agentkit supersede --repo ~/dev/foo --retire  # only if the check says yes
 kit/agentkit migrate --repo ~/dev/foo             # plan; --apply does the mechanical half
@@ -144,18 +147,23 @@ check is the CI gate; `--effective` is the developer-machine check. They are not
 interchangeable.
 
 `self-test` is what entitles a repo to declare `enforcement: blocking` in
-`compatibility.json`. Every control below Tier 0 fails open, so an untested gate is a
-guess, not a fence.
+`compatibility.json`. For Codex, promotion records the exact adapter hash and installed CLI
+version only after Bash, `apply_patch`, and MCP are denied through the real CLI and an ordinary
+no-bypass run proves that project trust persists. Open `/hooks` after installation or any adapter
+change; a temporary trust override proves code paths, not operational enforcement.
 
 ## The gates
 
-| Matcher | Hook | Enforces |
-|---|---|---|
-| `Bash` | `pretooluse-bash.sh` | force-push, checks-bypass, `core.hooksPath` override, destructive git, recursive rm, cwd-safety context |
-| `Edit\|Write\|NotebookEdit` | `pretooluse-write.py` | `denyWritePaths`, and takes the before-measurement |
-| `mcp__.*` | `pretooluse-mcp.py` | `denyMcpTools`, narrowable by argument |
-| `Edit\|Write` (Post) | `posttooluse-write.py` | takes the after-measurement and reports the delta |
-| `ConfigChange` | `configchange-guard.py` | refuses `disableAllHooks`, emptying `permissions.deny`, dropping a hook event |
+| Policy surface | Claude Code | Codex | Enforces |
+|---|---|---|---|
+| Shell | `Bash` | `Bash` | force-push, checks-bypass, `core.hooksPath` override, destructive git, recursive rm, repo policy |
+| Writes | `Edit\|Write\|NotebookEdit` | `apply_patch` | `denyWritePaths`; Codex parses every path in a multi-file patch |
+| MCP | `mcp__.*` | `mcp__.*` | `denyMcpTools`, narrowable by argument |
+| Post-write | `Edit\|Write` | `apply_patch` | takes the after-measurement and reports the delta |
+| Config | `ConfigChange` | write guard on `.codex/hooks.json` and `.codex/config.toml` | refuses local hook disablement |
+
+Codex does not support an interactive `ask` decision in `PreToolUse`; the shared engine converts
+that verdict to deny so confirmation rules cannot fail open.
 
 **Everything fails closed.** A gate that cannot parse its input, read its policy, or
 compile a pattern exits 2. Claude Code treats exit 1 as non-blocking and proceeds; only
@@ -210,7 +218,7 @@ agent's own reasoning.
 python3 kit/tests/run_tests.py
 ```
 
-176 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+204 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI
@@ -223,11 +231,10 @@ so the workflow's job is to be loud after the fact, not to be a fence.
 
 - **No distribution/generation layer.** `ruler` and `rulesync` fan one source out into 30+
   agents' native formats. That is right for a design that duplicates instructions per
-  harness and wrong for this one, which has two adapters because `AGENTS.md` is read
-  natively by two of three harnesses and the third takes a two-line shim.
-- **No re-implementation of agnix.** 445 sourced rules with `verified_on` dates is a higher
-  evidentiary standard than anything written here. `verify` calls it and adds only what no
-  catalogue covers.
+  harness and wrong for this one, which keeps `AGENTS.md` canonical and uses only declared,
+  verifier-checked adapters: a root Claude symlink and a manual ZCode skill import.
+- **No re-implementation of agnix.** The shared catalogue remains opt-in through
+  `verify --agnix`; default verification is checked in, dependency-free, and offline.
 - **No submodule.** Vendored copy with a version stamp, because submodules break on fresh
   clone in exactly the automated contexts this serves. A weaker consistency guarantee,
   traded knowingly.

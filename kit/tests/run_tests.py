@@ -54,8 +54,14 @@ def check(label: str, condition: bool, detail: str = "") -> None:
         print(f"  FAIL  {label}{(' — ' + detail) if detail else ''}")
 
 
-def run_hook(name: str, payload, repo: Path) -> tuple[int, str, str]:
-    env = dict(os.environ, CLAUDE_PROJECT_DIR=str(repo))
+def run_hook(name: str, payload, repo: Path,
+             harness: str = "claude-code") -> tuple[int, str, str]:
+    env = dict(os.environ)
+    if harness == "codex":
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["AGENTKIT_HARNESS"] = "codex"
+    else:
+        env["CLAUDE_PROJECT_DIR"] = str(repo)
     body = payload if isinstance(payload, str) else json.dumps(payload)
     proc = subprocess.run([str(HOOKS / name)], input=body, capture_output=True,
                           text=True, env=env, cwd=repo, timeout=30)
@@ -159,6 +165,16 @@ def test_bash_gate(tmp: Path) -> None:
         got = decision(code, out)
         check(f"{label} -> {expected}", got == expected, f"got {got}")
 
+    section("Bash gate — Codex never emits its unsupported ask decision")
+    code, out, _ = run_hook(
+        "pretooluse-bash.sh",
+        {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}},
+        repo,
+        harness="codex",
+    )
+    check("Codex translates ask to a hard deny", decision(code, out) == "deny", out[:200])
+    check("the denial explains the operator escape path", "operator may run it" in out, out[:200])
+
     section("Bash gate — what it must NOT refuse")
     for label, command in [
         ("plain ls",                 "ls -la"),
@@ -242,6 +258,58 @@ def test_write_gate(tmp: Path) -> None:
     code, out, _ = run_hook("pretooluse-write.py", {"tool_name": "Write", "tool_input": {"file_path": allowed}}, repo)
     check("unrelated path allowed", decision(code, out) == "allow", out[:160])
 
+    section("apply_patch gate — Codex checks every path in a multi-file patch")
+    patch = """*** Begin Patch
+*** Update File: src/app.ts
+@@
+-old
++new
+*** Add File: lib/content/live/new.json
++{}
+*** End Patch"""
+    code, out, _ = run_hook(
+        "pretooluse-write.py",
+        {"tool_name": "apply_patch", "tool_input": {"command": patch}},
+        repo,
+        harness="codex",
+    )
+    check("a forbidden second path denies the whole patch", decision(code, out) == "deny", out[:200])
+    check("the Codex denial names the forbidden path", "new.json" in out, out[:200])
+
+    safe_patch = """*** Begin Patch
+*** Add File: src/new.ts
++export {};
+*** End Patch"""
+    code, out, _ = run_hook(
+        "pretooluse-write.py",
+        {"tool_name": "apply_patch", "tool_input": {"command": safe_patch}},
+        repo,
+        harness="codex",
+    )
+    check("an unrelated Codex patch is allowed", decision(code, out) == "allow", out[:160])
+
+    config_patch = """*** Begin Patch
+*** Update File: .codex/hooks.json
+@@
+-{}
++{"hooks": {}}
+*** End Patch"""
+    code, out, _ = run_hook(
+        "pretooluse-write.py",
+        {"tool_name": "apply_patch", "tool_input": {"command": config_patch}},
+        repo,
+        harness="codex",
+    )
+    check("Codex cannot apply_patch its own hook config", decision(code, out) == "deny", out[:200])
+
+    code, _, err = run_hook(
+        "pretooluse-write.py",
+        {"tool_name": "apply_patch", "tool_input": {"command": "not a patch"}},
+        repo,
+        harness="codex",
+    )
+    check("an unrecognised Codex patch shape fails closed", code == 2, f"exit {code}: {err[:120]}")
+
     section("Edit/Write gate — the measurement that must never be deleted")
     target = repo / "lib" / "content" / "loc.json"
     target.write_text(json.dumps({"title": "Привет мир"}, ensure_ascii=False), encoding="utf-8")
@@ -298,6 +366,9 @@ def test_mcp_gate(tmp: Path) -> None:
     code, _, err = run_hook("pretooluse-mcp.py", {"tool_name": "mcp__a__b", "tool_input": {}}, bad)
     check("bad regex exits 2", code == 2, f"exit {code}")
     check("and names the pattern", "invalid regex" in err, err[:120])
+
+    code, _, err = run_hook("pretooluse-mcp.py", {"tool_input": {}}, repo, harness="codex")
+    check("an MCP payload without a tool name fails closed", code == 2, f"exit {code}")
 
 
 # ── the ConfigChange guard ────────────────────────────────────────────────────────────
@@ -446,6 +517,66 @@ def test_residue(tmp: Path) -> None:
     check("it names the floor that IS active",
           has(rep, "notes", "universal floor is active"), str(rep.get("notes"))[:200])
 
+    section("Residue verifier — declaration schema and adapter reach are real checks")
+    repo = make_repo(tmp / "schema-unknown")
+    compat_path = repo / ".agents" / "compatibility.json"
+    compat = json.loads(compat_path.read_text(encoding="utf-8"))
+    compat["inventedCompatibilityClaim"] = True
+    compat_path.write_text(json.dumps(compat), encoding="utf-8")
+    rep = residue(repo)
+    check("an unknown declaration key is rejected by the checked-in schema",
+          has(rep, "errors", "inventedCompatibilityClaim"), str(rep["errors"])[:240])
+
+    repo = make_repo(tmp / "future-provider", compat_extra={
+        "adapters": [{
+            "harness": "future-agent",
+            "kind": "manual-import",
+            "note": "Read the canonical files directly until native discovery exists",
+        }],
+        "enforcement": {"claude-code": "advisory", "future-agent": "advisory"},
+    })
+    rep = residue(repo)
+    check("a future provider can be declared without changing agentkit's schema",
+          not has(rep, "errors", "future-agent"), str(rep["errors"])[:240])
+
+    repo = make_repo(tmp / "broken-import", compat_extra={
+        "agentkitVersion": "0.3.0",
+        "adapters": [
+            {"harness": "codex", "kind": "native"},
+            {"harness": "claude-code", "kind": "import",
+             "from": "CLAUDE.md", "to": "AGENTS.md"},
+            {"harness": "claude-code", "kind": "relative-symlink",
+             "from": ".claude/skills/<name>", "to": "../../.agents/skills/<name>"},
+        ],
+        "enforcement": {"claude-code": "advisory", "codex": "advisory"},
+    })
+    (repo / "CLAUDE.md").write_text("# does not reach AGENTS\n", encoding="utf-8")
+    rep = residue(repo)
+    check("a declared Claude import without @AGENTS.md is rejected",
+          has(rep, "errors", "exact line '@AGENTS.md'"), str(rep["errors"])[:260])
+
+    section("Residue verifier — provider-neutral validation commands")
+    repo = make_repo(tmp / "validation-pass", compat_extra={
+        "validation": {"commands": [{
+            "name": "portable pass",
+            "argv": [sys.executable, "-c", "raise SystemExit(0)"],
+        }]},
+    })
+    rep = residue(repo)
+    check("a passing declared validation is recorded",
+          has(rep, "notes", "validation passed: portable pass"), str(rep["notes"])[:220])
+
+    repo = make_repo(tmp / "validation-fail", compat_extra={
+        "validation": {"commands": [{
+            "name": "portable fail",
+            "argv": [sys.executable, "-c", "raise SystemExit(7)"],
+        }]},
+    })
+    rep = residue(repo)
+    check("a failing declared validation blocks verification",
+          has(rep, "errors", "portable fail") and has(rep, "errors", "exit 7"),
+          str(rep["errors"])[:240])
+
     # Same defect, but the repo now claims to be finished: it becomes an error.
     repo = make_repo(tmp / "r14")
     rules = repo / ".claude" / "rules"
@@ -539,6 +670,11 @@ def test_apply(tmp: Path) -> None:
     check("compatibility.json created", (repo / ".agents" / "compatibility.json").exists())
     check("settings.json created", (repo / ".claude" / "settings.json").exists())
     check("hooks installed", (repo / ".claude" / "hooks" / "agentkit" / "pretooluse-bash.sh").exists())
+    check("Codex hooks.json installed", (repo / ".codex" / "hooks.json").exists())
+    check("CLAUDE.md is a relative symlink, not an @-import",
+          (repo / "CLAUDE.md").is_symlink()
+          and not os.path.isabs(os.readlink(repo / "CLAUDE.md")),
+          os.readlink(repo / "CLAUDE.md") if (repo / "CLAUDE.md").is_symlink() else "not a symlink")
     check("AGENTS.md untouched by apply", (repo / "AGENTS.md").read_bytes() == original)
 
     settings = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
@@ -547,6 +683,20 @@ def test_apply(tmp: Path) -> None:
     check("Edit|Write matcher present", any("Edit" in (m or "") for m in matchers), str(matchers))
     check("mcp matcher present", any("mcp" in (m or "") for m in matchers), str(matchers))
     check("ConfigChange hook present", "ConfigChange" in settings["hooks"])
+
+    codex_hooks = json.loads((repo / ".codex" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
+    codex_pre = codex_hooks["PreToolUse"]
+    codex_matchers = [group.get("matcher") for group in codex_pre]
+    check("Codex has Bash, apply_patch, and MCP matchers",
+          codex_matchers == ["^Bash$", "^apply_patch$", "^mcp__.*$"], str(codex_matchers))
+    codex_commands = [handler["command"] for groups in codex_hooks.values()
+                      for group in groups for handler in group.get("hooks", [])]
+    check("every Codex command selects Codex wire semantics",
+          all("AGENTKIT_HARNESS=codex" in command for command in codex_commands),
+          str(codex_commands))
+    check("Codex post-write measurement is installed",
+          any("posttooluse-write.py" in command for command in codex_commands),
+          str(codex_commands))
 
     second = subprocess.run([sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
                             capture_output=True, text=True, timeout=120)
@@ -589,6 +739,45 @@ def test_apply(tmp: Path) -> None:
                            capture_output=True, text=True, timeout=120)
     check("re-apply over foreign hooks is still idempotent", "0 change(s)" in again.stdout, again.stdout[-200:])
 
+    section("apply — must preserve foreign Codex hooks too")
+    codex_config_path = repo / ".codex" / "hooks.json"
+    codex_config = json.loads(codex_config_path.read_text(encoding="utf-8"))
+    codex_config["hooks"].setdefault("SessionStart", []).append({
+        "matcher": "startup",
+        "hooks": [{"type": "command", "command": "python3 tools/their-codex-start.py"}],
+    })
+    codex_config["customUserKey"] = "kept"
+    codex_config_path.write_text(json.dumps(codex_config, indent=2) + "\n", encoding="utf-8")
+    codex_apply = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    after_codex = json.loads(codex_config_path.read_text(encoding="utf-8"))
+    check("foreign Codex SessionStart hook survives",
+          "SessionStart" in after_codex["hooks"], str(after_codex["hooks"]))
+    check("foreign Codex top-level key survives", after_codex.get("customUserKey") == "kept")
+    check("apply reports preserved Codex wiring", "preserved 1 existing Codex hook entry" in codex_apply.stdout,
+          codex_apply.stdout[:400])
+
+    legacy_codex = after_codex
+    legacy_codex["hooks"]["PreToolUse"].append({
+        "matcher": "Bash",
+        "command": ["${CODEX_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-bash.sh"],
+    })
+    codex_config_path.write_text(json.dumps(legacy_codex, indent=2) + "\n", encoding="utf-8")
+    legacy_upgrade = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    upgraded_codex = json.loads(codex_config_path.read_text(encoding="utf-8"))
+    pre_groups = upgraded_codex["hooks"]["PreToolUse"]
+    check("apply removes agentkit's obsolete Codex command-array shape",
+          not any("command" in group for group in pre_groups), str(pre_groups))
+    check("legacy Codex migration leaves exactly one current Bash group",
+          legacy_upgrade.returncode == 0
+          and len([group for group in pre_groups if group.get("matcher") == "^Bash$"]) == 1,
+          legacy_upgrade.stderr + str(pre_groups))
+
     # A user key must survive re-apply: apply owns hooks and permissions.deny, nothing else.
     settings["permissions"]["allow"].append("Bash(pnpm build:*)")
     settings["customUserKey"] = "kept"
@@ -606,7 +795,7 @@ def test_apply(tmp: Path) -> None:
     stale.mkdir(parents=True, exist_ok=True)
     git_init(stale)
     (stale / "AGENTS.md").write_text("# t\n", encoding="utf-8")
-    qdir = Path.home() / ".agentkit" / "quarantine" / stale.name / "20200101T000000Z"
+    qdir = Path(os.environ["AGENTKIT_STATE_DIR"]) / "quarantine" / stale.name / "20200101T000000Z"
     qdir.mkdir(parents=True, exist_ok=True)
     (qdir / "manifest.json").write_text(json.dumps({"stamp": "x", "actions": [
         {"op": "rename", "from": "nowhere/absent.sh", "to": ".claude/hooks/absent.sh"}]}), encoding="utf-8")
@@ -616,7 +805,8 @@ def test_apply(tmp: Path) -> None:
     check("revert exits non-zero when it restored nothing", r.returncode == 1, f"exit {r.returncode}")
     check("and the quarantine SURVIVES", (qdir / "precious.txt").exists())
     check("and it says where the content is", str(qdir) in r.stderr, r.stderr[:200])
-    shutil.rmtree(Path.home() / ".agentkit" / "quarantine" / stale.name, ignore_errors=True)
+    shutil.rmtree(Path(os.environ["AGENTKIT_STATE_DIR"]) / "quarantine" / stale.name,
+                  ignore_errors=True)
 
     section("self-test — the thing that entitles a `blocking` claim")
     st = subprocess.run([sys.executable, str(KIT / "agentkit"), "self-test", "--repo", str(repo)],
@@ -795,6 +985,7 @@ def test_vendor_and_precommit(tmp: Path) -> None:
     run("git", "config", "user.email", "t@t")
     run("git", "config", "user.name", "t")
     (repo / "README.md").write_text("# t\n", encoding="utf-8")
+    (repo / "AGENTS.md").write_text("# rules\n", encoding="utf-8")
     run("git", "add", "-A")
     run("git", "commit", "-qm", "init")
 
@@ -819,6 +1010,28 @@ def test_vendor_and_precommit(tmp: Path) -> None:
     again = subprocess.run([sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
                            capture_output=True, text=True)
     check("second apply reports 0 changes", "0 change(s)" in again.stdout, again.stdout[-200:])
+
+    section("pre-commit — runs provider-neutral declared validation")
+    compat_path = repo / ".agents" / "compatibility.json"
+    compat = json.loads(compat_path.read_text(encoding="utf-8"))
+    compat["validation"] = {"commands": [{
+        "name": "fixture clean-code failure",
+        "argv": [sys.executable, "-c", "raise SystemExit(9)"],
+    }]}
+    compat_path.write_text(json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+    run("git", "add", ".agents/compatibility.json")
+    rejected = run("git", "commit", "-m", "must not land")
+    check("a failed declared validation blocks the commit", rejected.returncode != 0,
+          rejected.stdout[-240:] + rejected.stderr[-240:])
+    check("the validation failure is named", "fixture clean-code failure" in
+          (rejected.stdout + rejected.stderr), (rejected.stdout + rejected.stderr)[-300:])
+
+    compat["validation"] = {"commands": []}
+    compat_path.write_text(json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+    run("git", "add", ".agents/compatibility.json")
+    restored = run("git", "commit", "-m", "restore passing validation")
+    check("the same gate permits a passing declared validation", restored.returncode == 0,
+          restored.stdout[-240:] + restored.stderr[-240:])
 
     section("pre-commit — blocks a real error, and cannot pass by not running")
     text = hook.read_text(encoding="utf-8")
@@ -894,6 +1107,11 @@ def test_stale_session_tombstone(tmp: Path) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
+        # Keep quarantine/revert tests inside the disposable tree. This makes the same
+        # dependency-free suite runnable from Codex's workspace sandbox and from CI,
+        # instead of requiring write access to the operator's home directory.
+        previous_state = os.environ.get("AGENTKIT_STATE_DIR")
+        os.environ["AGENTKIT_STATE_DIR"] = str(tmp / "agentkit-state")
         test_bash_gate(tmp / "bash")
         test_write_gate(tmp / "write")
         test_mcp_gate(tmp)
@@ -904,6 +1122,10 @@ def main() -> int:
         test_measure(tmp / "measure")
         test_vendor_and_precommit(tmp / "vendor")
         test_stale_session_tombstone(tmp / "stale")
+        if previous_state is None:
+            os.environ.pop("AGENTKIT_STATE_DIR", None)
+        else:
+            os.environ["AGENTKIT_STATE_DIR"] = previous_state
 
     print(f"\n{'=' * 60}")
     print(f"agentkit tests: {PASSED} passed, {FAILED} failed")
