@@ -1,315 +1,296 @@
-# agent-context
+# agentkit
 
-**A portable context system for coding agents, and a mechanical layer that enforces it.**
+**Give every coding agent the same context—and make your important rules more than suggestions.**
 
-Every coding agent reads a set of instruction files before it does anything. Left alone, that set
-grows until you are paying for a novel at the start of every session, and the safety rules inside it
-are polite requests the agent honours maybe a third of the time.
+Agentkit is a dependency-free toolkit for repositories used with Claude Code, Codex, ZCode, and
+other coding-agent harnesses. It keeps project guidance in one place, loads detailed context only
+when it is needed, and wires one safety policy into the native controls each harness actually
+supports.
 
-This is two things that address that:
+With agentkit, you get:
 
-1. **A discipline** — exactly two files load at startup, everything else is fetched on demand, and
-   the always-loaded set has a hard ceiling that a linter enforces.
-2. **`agentkit`** — a dependency-free Python CLI that installs the mechanical parts, compiles your
-   safety rules into real interceptors, and refuses to let a repo claim enforcement it has not
-   tested.
+- **One source of truth** instead of separate instruction sets for every agent.
+- **Lean startup context** so more of the prompt is available for the work itself.
+- **Provider-native guardrails** for shell commands, file writes, MCP tools, and configuration.
+- **Proof that the guardrails run** before a repository is allowed to call them blocking.
+- **A safe migration path** that preserves existing hooks, settings, and project knowledge.
+- **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-Works with Claude Code, Codex, and ZCode for context. Claude Code and Codex have native safety
-adapters; ZCode remains advisory. Codex deliberately requires a human to review and trust each
-project hook configuration, so the declaration stays advisory until a live no-bypass self-test has
-observed that exact trusted adapter deny real calls.
+> Current release: **agentkit 0.3.0** · **204 tests** · **zero runtime dependencies**
 
 ---
 
-## Why
+## Built for everyday agent work
 
-The predecessor system worked and cost roughly **50,000 tokens per session before any work began**,
-with 38% of its commits being bookkeeping about the documentation itself. Docs about docs.
+**Switch agents without rewriting the repository.** Claude Code, Codex, and other harnesses can
+reach the same instructions, skills, project state, and decisions through small, explicit adapters.
 
-Investigating why produced three findings, two of which contradicted the obvious diagnosis:
+**Keep the prompt focused.** Working rules stay in one compact startup document. Specifications,
+plans, decisions, research, and procedures are named by path and loaded on demand.
 
-- **Skills were innocent.** All three harnesses lazy-load them. Twelve skills carrying ~48 KB of
-  bodies grew the startup prompt by 4,272 characters and contributed **zero** body bytes. Deleting
-  them to save cost would have removed the one component already working correctly.
-- **The cost was the predecessor's `CLAUDE.md` and its `@`-imports.** Anthropic is explicit that imports load at
-  launch, recursive to four hops. A 70-file system wired through imports is an always-loaded system
-  wearing a lazy-loading costume. `.claude/rules/*.md` without `paths:` frontmatter loads at launch
-  too — that surface alone is **74% of the remaining cost across our fleet.**
-- **It is a cost argument, not a quality argument, and we say so.** No vendor has published an
-  experiment showing heavy context files degrade agent output. `arXiv:2602.11988` measured that
-  context files "do not generally improve task success rates, while increasing inference cost by
-  over 20% on average." The honest case for this migration is spend and latency, with adherence
-  roughly neutral.
+**Turn critical boundaries into mechanisms.** Rules such as “do not edit generated files,” “do not
+deploy production through MCP,” or “ask before discarding work” can be expressed once and enforced
+through the harness surfaces that support them.
 
-## The shape
+**Know what is actually active.** Agentkit checks the installed configuration, fires real probes at
+declared policies, and records provider-backed evidence. An installed hook is not treated as a
+working hook merely because the file exists.
 
+**Adopt it without surrendering your repo.** Agentkit writes plumbing, not project truth. It never
+generates the body of `AGENTS.md` and never rewrites anything under `docs/project/`.
+
+---
+
+## One source of truth
+
+```text
+AGENTS.md                    authored working rules; the canonical startup document
+CLAUDE.md -> AGENTS.md       relative compatibility symlink when no shim already exists
+
+docs/project/
+  SPEC.md                    stable product truth and locked constraints
+  PLAN.md                    active work and validation gates
+  STATUS.md                  current verified state and next action
+  decisions/                 one durable decision per file
+  pitfalls.md                capped, verified negative results
+
+.agents/skills/<name>/       canonical on-demand procedures
+.claude/skills/<name>        relative symlinks to the canonical skills
+.agents/compatibility.json   provider adapters, budgets, policy, and evidence
+.codex/hooks.json            Codex project-hook adapter
 ```
-AGENTS.md                    always-loaded. Rules, not knowledge. Safety first.
-CLAUDE.md                    always-loaded. A relative symlink to `AGENTS.md`.
-                             ── those two, and no third, ever ──
-docs/project/*               named by path in AGENTS.md's routing block. Never imported.
-  SPEC.md PLAN.md STATUS.md  Zero startup cost. Read on demand.
-  decisions/ pitfalls.md
-.agents/skills/<name>/       one procedure each. ~90-100 tokens standing, body on trigger.
-.claude/rules/*.md           path-scoped only. Loads when a matching file is read.
-.agents/compatibility.json   machine-readable declaration + policy. Never loaded.
-```
 
-Four rules hold it together, and each is a **refusal** rather than a feature:
+The result is deliberately simple: one authored instruction file, one policy, and one durable
+project-memory layout. Provider-specific files are adapters, not competing sources of truth.
 
-1. **The always-loaded set is fixed at two files.** Growth pressure resolves as deletion or as a
-   move to on-demand — never as a third root file. This is the load-bearing one: the old system did
-   not fail because any single file was bad, it failed because the set had no ceiling.
-2. **Path reference, never `@`-import.** Measured on a real repo: the on-demand corpus was 77,971
-   bytes (~20,500 tokens if imported) against **~600 bytes of routing lines**. Same knowledge, 3% of
-   the price.
-3. **One flat root `AGENTS.md`, never nested.** This is also what makes the byte gate exact.
-4. **Nothing append-only.** No journals, no lessons ledgers, no handoff files, no checkpoint
-   directories. `STATUS.md` is rewritten as a snapshot; finished plans are deleted, not archived.
-   This is what kills the 38%-of-commits problem at its root.
+## Provider support
 
-## The budget is real, and it comes from the source
-
-| Gate | Threshold | Kind | Where it comes from |
+| Harness | Shared context | Safety integration | Declaration |
 |---|---|---|---|
-| Codex-visible chain | 32,768 bytes | **hard fail** | `DEFAULT_PROJECT_DOC_MAX_BYTES` in Codex's own source |
-| Claude-visible repo set | 200 lines | warn | Anthropic's published guidance |
+| **Codex** | Native `AGENTS.md` and `.agents/skills/` discovery | Project hooks for Bash, `apply_patch`, MCP, and post-write measurement | Can become **blocking** after exact-hook trust and a live proof |
+| **Claude Code** | `CLAUDE.md` and skill symlinks reach the same canonical files | Hooks for Bash, writes, MCP, config changes, and post-write measurement | **Advisory** until provider-backed proof is recorded |
+| **ZCode** | Native `AGENTS.md`; project skill imported as a symlink | No live-tested safety adapter yet | **Advisory** |
+| **Other harnesses** | Read `AGENTS.md` and canonical skill paths directly | Explicit fallback until an adapter exists | **Advisory** |
 
-The hard fail sits at the **real shipped default**, not a fraction of it — a gate at an invented
-boundary costs you deletions from a safety file to satisfy a fiction. Anthropic publishes no byte
-cap, so a qualitative target earns a warning, not a build failure.
-
-Exceed the Codex budget and your safety file is **silently truncated** — content cut mid-file, head
-kept, tail dropped, and every later file skipped whole. `agentkit` also checks four separate ways a
-repo's own safety file can vanish entirely, including an override filename that replaces it and a
-committed config line that shrinks the budget to nothing.
+Agentkit does not pretend every provider exposes the same control surface. Context portability and
+safety enforcement are reported separately.
 
 ---
 
 ## Quick start
 
-Requires Python 3 and nothing else. No install step — the kit is vendored as a directory.
+Agentkit requires Python 3 and nothing else. Clone this repository, then run the CLI directly from
+the checkout.
 
-**Look before you touch:**
-
-```sh
-kit/agentkit census --repo ~/dev/your-repo    # read-only measurement
-kit/agentkit fleet  --root ~/dev              # every repo under a root, one table
-python3 kit/tests/run_tests.py                # 204 tests, no dependencies
-```
-
-**A fresh repo:**
+### 1. Measure before changing anything
 
 ```sh
-kit/agentkit census   --repo .          # measure before anything changes
-kit/agentkit apply    --repo . --dry-run
-kit/agentkit apply    --repo .          # installs the plumbing; refuses a dirty tree
-#   ... author AGENTS.md from kit/templates/AGENTS.md.tmpl yourself ...
-#   ... author `policy` in .agents/compatibility.json ...
-kit/agentkit apply    --repo .          # recompile permissions from the policy
-kit/agentkit self-test --repo .         # fire forbidden calls, assert refusal
-kit/agentkit verify   --repo .          # lint; exits non-zero on error
+kit/agentkit census --repo ~/dev/your-repo
 ```
 
-For Codex, restart after `apply`, open `/hooks`, review and trust `.codex/hooks.json`, then run:
+This captures the existing startup context and migration state so you can review the change against
+a real baseline.
+
+### 2. Preview and apply the mechanical layer
+
+```sh
+kit/agentkit apply --repo ~/dev/your-repo --dry-run
+kit/agentkit apply --repo ~/dev/your-repo
+```
+
+`apply` refuses a dirty worktree by default, preserves unrelated Claude and Codex configuration,
+and reports every file it changes.
+
+Once applied, agentkit is vendored into the target repository:
+
+```sh
+cd ~/dev/your-repo
+kit/agentkit verify --repo .
+```
+
+### 3. Add your project context and policy
+
+Use `kit/templates/AGENTS.md.tmpl` as a starting point when the repository does not already have
+an `AGENTS.md`. Write the project-specific rules yourself; agentkit will not invent them.
+
+Then review `.agents/compatibility.json` and add only boundaries that matter to this repository.
+The `policy` portion might look like this:
+
+```json
+{
+  "policy": {
+    "protectedBranches": ["main"],
+    "denyWritePaths": [
+      {
+        "glob": "generated/**",
+        "reason": "Generated output must be changed through its source."
+      }
+    ],
+    "denyMcpTools": [
+      {
+        "pattern": "^mcp__.*__deploy_to_production$",
+        "reason": "Production deployment is an operator-run action."
+      }
+    ],
+    "measureOnWrite": []
+  }
+}
+```
+
+Re-run `apply` after changing policy so provider-native permissions are recompiled:
+
+```sh
+kit/agentkit apply --repo .
+```
+
+### 4. Prove the installation
+
+```sh
+kit/agentkit self-test --repo .
+kit/agentkit measure --repo .
+kit/agentkit verify --repo .
+```
+
+- `self-test` checks the universal safety floor with both forbidden and benign calls.
+- `measure` fires every repository-declared rule and reports enforced, broken, or unmeasured.
+- `verify` checks schema, adapters, context budgets, residue, and declared validation commands.
+
+### 5. Activate Codex project hooks
+
+Codex requires a one-time review whenever project-hook definitions change:
+
+1. Restart Codex in the target repository.
+2. Open `/hooks`.
+3. Review and trust the exact definitions from `.codex/hooks.json`.
+4. Run the live promotion:
 
 ```sh
 kit/agentkit self-test --repo . --promote-codex
+kit/agentkit verify --repo . --effective
 ```
 
-Promotion requires both disposable live-denial probes and an ordinary no-bypass run in the target
-repository. A temporary CLI trust override is deliberately insufficient evidence.
+Promotion succeeds only after disposable deny/allow probes and an ordinary run confirm that
+persisted project-hook trust is active. See the
+[official Codex hook documentation](https://learn.chatgpt.com/docs/hooks) for the trust model.
 
-**A repo that already has a hand-rolled gate script** adds two steps — harvest its existing rules
-into portable policy, then retire the old script only once the new one is proven no weaker:
+---
+
+## What agentkit enforces
+
+The universal policy provides a conservative floor. Repository policy adds the boundaries no
+generic tool can infer, such as production deploys, credential surfaces, generated files, and
+live-data operations.
+
+| Surface | Claude Code | Codex | Examples |
+|---|---|---|---|
+| Shell | `Bash` hook | `Bash` project hook | force-push, checks bypass, destructive Git and database commands |
+| File writes | Edit/Write hooks and permissions | `apply_patch` project hook | protected paths and agent configuration |
+| MCP | `mcp__.*` hook | `mcp__.*` project hook | production deploys or argument-scoped tool denials |
+| Post-write | Edit/Write hook | `apply_patch` project hook | measurements the operator needs after a change |
+| Configuration | `ConfigChange` guard | write guard | disabling or replacing the installed safety layer |
+
+Gate scripts fail closed when they cannot parse input, read policy, or compile a pattern. Claude can
+pause for an interactive `ask`; Codex currently translates the same decision to a denial because
+its `PreToolUse` hook cannot initiate approval safely.
+
+Hooks are guardrails, not an operating-system security boundary. Credentials and production
+capabilities should still use the narrowest permissions their providers offer.
+
+---
+
+## Bringing an existing repository across
+
+Agentkit is designed to migrate a real repository without flattening the controls it already has.
 
 ```sh
-kit/agentkit policy scaffold --repo .   # harvest from the repo's own gate
-#   ... review policyDraft, then ...
-kit/agentkit policy promote  --repo .
-kit/agentkit supersede --repo .         # can the old gate be retired safely?
+kit/agentkit census --repo ~/dev/your-repo
+kit/agentkit apply --repo ~/dev/your-repo --dry-run
+kit/agentkit apply --repo ~/dev/your-repo
+```
+
+If the repository has a hand-written shell gate, agentkit can harvest a reviewable policy draft and
+compare the old and new gates before retiring anything:
+
+```sh
+cd ~/dev/your-repo
+kit/agentkit policy scaffold --repo .
+# Review policyDraft in .agents/compatibility.json.
+kit/agentkit policy promote --repo .
+kit/agentkit apply --repo .
+kit/agentkit supersede --repo .
 kit/agentkit supersede --repo . --retire
 ```
 
-**Restart your agent session after `apply`.** Settings are read once at session start, so a session
-running from before the install keeps calling the old hooks — and a missing hook script fails
-*open*, not closed. This bit us; see [Where we are](#where-we-are).
+`supersede` retires the legacy shell gate only when the replacement is no weaker on its probe
+corpus, does not block benign commands, and has no unresolved harvested rules. Retirement is
+quarantined and reversible.
 
-### What `apply` writes, and what it refuses to write
+For broader legacy layouts, `migrate` performs the mechanical half and writes out the judgment
+calls instead of guessing:
 
-**Writes** — all mechanical, all regenerable: the declaration file, the vendored gate scripts, the
-Claude `hooks` and `permissions.deny` keys in settings (every other key preserved, including your
-allow-list), merged Codex project hooks, skill symlinks, linter config, and a relative
-`CLAUDE.md -> AGENTS.md` symlink if absent.
+```sh
+kit/agentkit migrate --repo .
+kit/agentkit migrate --repo . --apply
+```
 
-**Never writes:** `AGENTS.md`'s body, or anything under `docs/project/`.
+---
 
-That refusal is deliberate and it is the centre of the design. *A tool that generates truth
-recreates the accretion problem in a new costume.* Plumbing can be regenerated forever; the actual
-rules have to be written by a person. Copy the template and fill it in.
+## CLI reference
 
-Everything is idempotent — re-running `apply` on a conforming repo reports `0 change(s)`.
-
-### The commands
-
-| Command | Does |
+| Command | Purpose |
 |---|---|
-| `census` | The before-measurement. Without it there is no way to tell if any of this helped. |
-| `fleet` | `census` for every repo under a root, one table. |
-| `apply` | Install the mechanical layer, idempotently. |
-| `policy scaffold` / `promote` | Harvest a draft policy from the repo's own existing rules. |
-| `supersede` | Prove the new gate is never weaker, then retire the legacy one. |
-| `self-test` | Fire forbidden and benign calls at installed hooks; `--promote-codex` uses the real CLI and persisted-trust proof. |
-| `measure` | Fire every rule the repo *itself* declares at its gate and report which held. |
-| `verify` | Dependency-free schema/residue checks plus every validation command declared by the repo; `--agnix` adds the network-fetched catalogue. |
-| `migrate` | Mechanical migration plus a written plan for the judgment calls. |
-| `revert` | Undo the last mechanical migration from its manifest. |
+| `census` | Measure context and migration state before touching the repository |
+| `fleet` | Run the census across repositories under one root |
+| `apply` | Install or update the mechanical layer idempotently |
+| `policy scaffold` | Harvest a reviewable draft from an existing repository gate |
+| `policy promote` | Move reviewed draft rules into live policy |
+| `supersede` | Compare and safely retire a legacy shell gate |
+| `self-test` | Exercise universal allow/deny behavior; optionally prove live Codex hooks |
+| `measure` | Fire every declared repository rule and report real coverage |
+| `verify` | Validate schema, adapters, budgets, residue, and repository checks |
+| `migrate` | Apply safe mechanical migration and surface judgment calls |
+| `revert` | Restore the last quarantined mechanical migration |
+
+All default verification is offline and dependency-free. `verify --agnix` optionally adds the
+network-fetched shared rule catalogue.
 
 ---
 
-## Enforcement, ranked by whether failure is loud
+## Safe by default
 
-Most systems lie about this. Controls are ranked by **whether their failure is noticeable**, not by
-how much they appear to block.
+- **Dirty worktrees are refused** unless you explicitly pass `--allow-dirty`.
+- **Existing hooks and unrelated settings are preserved**, including user allow-lists.
+- **`AGENTS.md` and `docs/project/` remain human-owned.**
+- **Every install is idempotent**; a conforming repository reports zero changes.
+- **Pre-commit verification fails closed** if Python, agentkit, or a declared validation command is
+  missing.
+- **Provider claims remain explicit**: context support does not masquerade as safety enforcement.
 
-- **Tier 0 — the capability does not exist in the agent's process.** The only tier with no failure
-  mode. A genuinely read-only credential qualifies. Note that some vendors *cannot* be made to
-  qualify: if a provider's token API accepts no permission field at any price, and a
-  full-privilege token sits in a file owned by the same uid the agent runs as, then "that deploy
-  command is blocked" is a regex that does not survive a direct API call.
-- **Tier 1 — hooks.** Reachable, but not silently. Claude installs five interceptors; Codex maps
-  the same shell, write, MCP, and post-write policy surfaces to its native project hooks. Each
-  adapter guards its own local configuration from its write-tool surface.
-- **Tier 2 — CI detection.** Renamed from "blocking," because on a private repo without a paid plan
-  branch protection returns 403. CI is a detector that runs *after* the push it wanted to stop.
-- **Tier 3 — the agent enforcing a rule on itself.** The floor, and `AGENTS.md` is required to say
-  so. Independent measurement puts best-configuration strict compliance with standing instructions
-  at **36.2%**, most frontier models below 25%.
+## Current status
 
-**Everything below Tier 0 fails open.** That is why `self-test` exists: no repo may declare
-`enforcement: blocking` until it has fired a forbidden call at its own hooks and watched the
-refusal. An untested gate is a guess.
+Agentkit 0.3.0 is used in production repositories today. Its 204-test suite is intentionally heavy
+on negative cases: dangerous calls must be refused, malformed inputs must fail closed, foreign
+configuration must survive, and a gate that never ran must not report success.
 
-`self-test` covers the universal rules. **`measure` covers the rules a repo writes for
-itself** — which is where every inert-fence defect has lived. It builds a probe that provably
-matches each rule's own pattern, fires it at the installed gate, and compares the verdict to
-the verb declared. Three things keep it from becoming the next detector that cried wolf: a
-rule whose conditions cannot hold together is **INERT** (demonstrated, not suspected); a rule
-it cannot build a probe for is **UNMEASURED and never reported as passing**; and an
-independent corpus grouped by danger catches a pattern that is live but simply *wrong*, which
-pattern-derived probes match by construction and can never detect.
-
-Current fleet reading: **121 of 127 declared fences fire as declared, 0 broken, 0 over-broad**,
-6 unmeasured and reported as such.
-
-Gate scripts **fail closed** — a gate that cannot parse its input, read its policy, or compile a
-pattern exits 2. This is not pedantry: Claude Code treats exit 1 as *non-blocking and proceeds*. An
-ancestor of our shell gate exited **0** when `jq` was missing, which was a silent allow of every
-command on the machine, and nothing noticed for months. There is a regression test for exactly that.
-
-### The idea worth stealing: measure, don't ask
-
-Some rules exist because a human **cannot check the output themselves** — "report string lengths in
-a script the operator does not read, before and after any change near it."
-
-As prose, that instruction runs at roughly the 36% compliance figure above. It happens one time in
-three and nobody finds out which times. So the kit does not ask the agent to take the measurement.
-**The hook takes it, before and after, and reports the delta.** Every time, mechanically.
-
-That is also the principled line for what to keep when told to delete verification scaffolding:
-rules that check *the world* stay; rules that are rituals about the agent's own reasoning go.
-
----
-
-## Where we are
-
-**Working and used daily.** `agentkit 0.3.0`, 204 tests, zero dependencies. Six repositories are
-migrated, and the source repository now dogfoods both provider adapters. The Codex adapter has been
-live-tested to deny forbidden and permit benign Bash, `apply_patch`, and MCP calls; this checkout
-remains honestly advisory until its exact project hook hash is trusted through `/hooks` and the
-ordinary live probe passes.
-
-The original fleet measurements remain:
-
-| repo | always-loaded before | after |
-|---|---:|---:|
-| A | 103,354 | 6,045 |
-| B | 38,390 | 7,165 |
-| C | 33,595 | 7,878 |
-| D | 22,602 | 7,346 |
-| E | 7,777 | 7,777 — had converged independently |
-| F | 11,470 | 11,787 — layout was already right; **enforcement** was missing |
-
-Five landed between 6,045 and 7,878 bytes, and two of those had arrived there independently before
-this work. That consistency is the design's shape asserting itself rather than arithmetic.
-
-Thirteen repos remain, 354,597 bytes, three-quarters of it unscoped rules files.
-
-### What is not working, stated plainly
-
-Codex project hooks are installed but not yet persistently trusted on this machine. A live run with
-the adapter loaded denied forbidden and permitted benign Bash, `apply_patch`, and MCP probes. An
-ordinary run without an automation trust override then allowed the forbidden Bash probe, proving
-that repository trust — not adapter logic — is the remaining activation boundary. The manifest
-therefore says `advisory`; it will say `blocking` only after `/hooks` approval and a repeated
-ordinary live denial.
-
-The earlier inert-fence failures remain the reason for this standard. Fifty-three harvested fences
-could never fire, a detector then mislabeled nine working fences, and a generated Claude deny rule
-was unsupported. Those classes now have negative tests, schema checks, live deny-and-observe tests,
-and provider-neutral pre-commit validation. A hook rewire still requires a session restart because
-both harnesses load project settings at session start.
-
----
-
-## What's planned
-
-**Now — activate and certify the Codex adapter.**
-Review the project hooks through `/hooks`, then run `self-test --promote-codex`. Roll the same
-adapter and trust ceremony through each migrated repository; never copy a `blocking` declaration.
-
-**Next — make repos 7-19 cheap.**
-Six mechanical steps are still done by hand on every migration. Six worked examples now exist, which
-is enough to fold them into `migrate --apply`. This is the highest-value remaining work.
-
-**Then — the fresh-repo story.**
-`apply` already does the complete mechanical job on a clean repo; every remaining manual step is
-migration-specific. The gap is policy: `policy scaffold` is a *harvester*, so a fresh repo with no
-existing gate harvests nothing and lands in an empty-policy state. The universal floor is active,
-but there is no repository-specific deploy, credential, or live-data fence because no tool can
-infer those boundaries safely. A future starter policy library by stack may narrow that gap; it
-must not turn guesses into automatic production policy.
-
-**Open, not blocking:** ZCode has no live-tested safety adapter. Its context path remains portable
-through a declared manual skill import, but its production boundaries are instructions only.
-
----
+The Codex adapter has provider-backed Bash, `apply_patch`, MCP, allow-path, and persisted-trust
+evidence. Each checkout still has to review and prove its own exact hook hash. Claude Code uses the
+same policy engine but remains advisory until equivalent provider-backed evidence is recorded.
+ZCode currently provides portable context only.
 
 ## Honest limits
 
-- **Context is portable; enforcement is per harness and per checkout.** Codex and ZCode read
-  `AGENTS.md` natively; Claude reads the same bytes through a relative symlink. Claude and Codex
-  have adapters over one policy engine. Codex has provider-backed live promotion; this source
-  repository keeps Claude advisory until an equivalent provider-backed claim exists. ZCode has no
-  safety adapter yet.
-- **`supersede` handles shell gates only.** Retiring other validator types deserves the same replay
-  proof and does not have it yet.
-- **No distribution or generation layer.** Tools that fan one source out into 30+ agents' native
-  formats are right for a design that duplicates per harness and wrong for this one, which converges
-  on a single file with one shim.
-- **No re-implementation of `agnix`.** The network-fetched catalogue remains available through
-  `verify --agnix`; the default commit path is dependency-free and runs the checked-in schema,
-  residue checks, and repository-declared validation commands.
-- **Vendored, not packaged.** A copy per repo with a version stamp. Submodules break on fresh clone
-  in exactly the automated contexts this serves; that is a weaker consistency guarantee, traded
-  knowingly.
-- **The residue checks came out at ~400 lines against a ~150-line estimate.** The reuse ratio the
-  estimate defended still holds — 445 shared rules against ~400 lines written — but the number was
-  optimistic and is corrected here rather than quietly.
+- Context is portable; enforcement is always provider- and checkout-specific.
+- Agentkit cannot make a broadly privileged credential read-only. Use provider-side least privilege.
+- ZCode and generic harnesses remain advisory until live-tested safety adapters exist.
+- `supersede` compares shell gates; other legacy validator types require manual review.
+- The toolkit is vendored into each repository rather than installed globally or delivered as a
+  service.
+- Agentkit does not synchronize credentials, connector authorization, environment files, or
+  customer data.
 
 ---
 
-## Layout
+## Repository layout
 
 ```
 README.md          this file — the design, the commands, and the honest limits
@@ -322,11 +303,5 @@ kit/templates/     AGENTS.md skeleton, linter config, CI workflow
 kit/tests/         204 tests, no dependencies, mostly negative
 ```
 
-**Evidence standard.** Every measurement quoted here was taken rather than cited: byte budgets read
-from the harness's own source, gate behaviour recorded by firing commands at the installed hook,
-adherence figures taken from published experiments with the reasoning stated. Where a number is
-inferred it says so. Several vendor documentation claims were refuted by reading the shipped source.
-
-**Provenance.** This was extracted from a private repository where it runs across a fleet of
-production projects. The migration history, per-repository measurements and open decisions stay
-there; what ships here is the tool and the reasoning behind it.
+**Ready to try it?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is read-only, takes
+seconds, and gives you a concrete baseline before agentkit changes a file.
