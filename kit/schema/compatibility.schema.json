@@ -28,10 +28,10 @@
       "additionalProperties": false,
       "properties": {
         "instructions": { "type": "string", "default": "AGENTS.md" },
-        "shim":         { "type": "string", "default": "CLAUDE.md" },
-        "project":      { "type": "string", "default": "docs/project" },
-        "skills":       { "type": "string", "default": ".agents/skills" },
-        "research":     { "type": "string", "default": "docs/research" }
+        "shim": { "type": "string", "default": "CLAUDE.md" },
+        "project": { "type": "string", "default": "docs/project" },
+        "skills": { "type": "string", "default": ".agents/skills" },
+        "research": { "type": "string", "default": "docs/research" }
       }
     },
 
@@ -51,10 +51,10 @@
         "additionalProperties": false,
         "properties": {
           "harness": { "type": "string", "minLength": 1 },
-          "kind":    { "enum": ["relative-symlink", "import", "manual-import", "native"] },
-          "from":    { "type": "string" },
-          "to":      { "type": "string" },
-          "note":    { "type": "string" }
+          "kind": { "enum": ["relative-symlink", "import", "manual-import", "native"] },
+          "from": { "type": "string" },
+          "to": { "type": "string" },
+          "note": { "type": "string" }
         }
       }
     },
@@ -65,8 +65,8 @@
       "additionalProperties": { "$ref": "#/$defs/enforcementLevel" },
       "properties": {
         "claude-code": { "$ref": "#/$defs/enforcementLevel" },
-        "codex":       { "$ref": "#/$defs/enforcementLevel" },
-        "zcode":       { "$ref": "#/$defs/enforcementLevel" }
+        "codex": { "$ref": "#/$defs/enforcementLevel" },
+        "zcode": { "$ref": "#/$defs/enforcementLevel" }
       }
     },
 
@@ -112,10 +112,10 @@
           "default": 200,
           "description": "WARN threshold on the Claude-visible repo-controlled set. Anthropic publishes no byte cap, only an adherence target, and a qualitative target earns a warning rather than a build failure."
         },
-        "skillWarnCount":     { "type": "integer", "default": 20 },
+        "skillWarnCount": { "type": "integer", "default": 20 },
         "skillBodyMaxTokens": { "type": "integer", "default": 5000 },
-        "pitfallsMaxLines":   { "type": "integer", "default": 100 },
-        "pitfallsMaxBytes":   { "type": "integer", "default": 8192 }
+        "pitfallsMaxLines": { "type": "integer", "default": 100 },
+        "pitfallsMaxBytes": { "type": "integer", "default": 8192 }
       }
     },
 
@@ -149,7 +149,7 @@
             "required": ["glob", "reason"],
             "additionalProperties": false,
             "properties": {
-              "glob":   { "type": "string" },
+              "glob": { "type": "string" },
               "reason": { "type": "string", "description": "Shown to the agent on denial. A gate that explains itself is one people fix rather than route around." }
             }
           },
@@ -164,7 +164,7 @@
             "additionalProperties": false,
             "properties": {
               "pattern": { "type": "string", "description": "Python regex matched against the full tool name, e.g. ^mcp__.*__deploy_to_vercel$" },
-              "reason":  { "type": "string" },
+              "reason": { "type": "string" },
               "whenArgMatches": {
                 "type": "object",
                 "description": "Optional narrowing: deny only when a named argument matches a regex. Lets `deploy(target=preview)` through while denying `deploy(target=production)`.",
@@ -182,14 +182,14 @@
             "required": ["glob", "measure", "reason"],
             "additionalProperties": false,
             "properties": {
-              "glob":    { "type": "string" },
+              "glob": { "type": "string" },
               "measure": { "enum": ["script-lengths", "byte-size", "line-count"] },
               "scripts": {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Unicode script names for `script-lengths`, for example [\"Cyrillic\"]. Counts are reported separately for each configured script."
               },
-              "reason":  { "type": "string" }
+              "reason": { "type": "string" }
             }
           },
           "default": []
@@ -259,10 +259,10 @@
         "required": ["rule", "reason", "approvedBy", "date"],
         "additionalProperties": false,
         "properties": {
-          "rule":       { "type": "string", "description": "Which design rule is being departed from." },
-          "reason":     { "type": "string" },
+          "rule": { "type": "string", "description": "Which design rule is being departed from." },
+          "reason": { "type": "string" },
           "approvedBy": { "type": "string" },
-          "date":       { "type": "string", "format": "date" }
+          "date": { "type": "string", "format": "date" }
         }
       },
       "default": []

@@ -225,6 +225,18 @@ def test_bash_gate(tmp: Path) -> None:
         got = decision(code, out)
         check(f"{label} -> {expected}", got == expected, f"got {got}")
 
+    # Regression: before 0.3.1, a repo ask overlapping a universal ask made ask() return
+    # 1 on the second match. `set -e` then exited before emitting either decision.
+    overlap = make_repo(tmp / "overlap", policy={"askBashPatterns": [
+        {"pattern": "git +reset +--hard", "reason": "repo also protects hard reset"}]})
+    code, out, _ = run_hook(
+        "pretooluse-bash.sh",
+        {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}},
+        overlap,
+    )
+    check("overlapping repo + universal asks still emit an ask",
+          decision(code, out) == "ask", f"got {decision(code, out)}")
+
     section("Bash gate — fails CLOSED (the bug this kit exists to fix)")
     code, _, err = run_hook("pretooluse-bash.sh", "this is not json", repo)
     check("malformed payload exits 2", code == 2, f"exit {code}")
@@ -837,6 +849,14 @@ def test_policy_and_supersede(tmp: Path) -> None:
           sc.over_broad(["(^|[[:space:]])git +push", branch_only]) == [],
           str(sc.over_broad(["(^|[[:space:]])git +push", branch_only])))
 
+    real_install = [
+        r"(^[[:space:]]*|[;&|][[:space:]]*)(npm|pnpm|yarn|bun)([^[:alnum:]_]|$)",
+        r"(^|[[:space:]])(install|i|add)([[:space:]]|$)",
+        r"(^|[[:space:]])(-g|--global)([[:space:]]|=|$)",
+    ]
+    check("the verifier accepts a satisfiable multi-token conjunction",
+          not sc.unsatisfiable(real_install))
+
     section("the gate honours allOf — a conjunction needs BOTH halves")
     repo = make_repo(tmp / "conj", {
         "denyBashPatterns": [
@@ -940,6 +960,20 @@ def test_measure(tmp: Path) -> None:
           me.UNPROBEABLE not in me.BROKEN)
     check("but NARROW is", me.NARROW in me.BROKEN)
 
+    section("measure — MCP regex alternatives are exercised, not left unmeasured")
+    mcp_rule = {
+        "pattern": r"^mcp__.*__(promote|update_project_deployment_protection)$",
+        "reason": "both production mutation tools are denied",
+    }
+    repo = make_repo(tmp / "mcp-alternation", {"denyMcpTools": [mcp_rule]})
+    measured = me.measure_mcp_rule(
+        repo=repo,
+        gate=KIT / "hooks" / "claude" / "pretooluse-mcp.py",
+        rule=mcp_rule,
+    )
+    check("an alternation-based MCP rule is measured", measured["verdict"] == me.ENFORCED,
+          str(measured))
+
     section("measure — probes never come from the must-always-work corpus")
     # A probe drawn from the benign set would assert a rule fires on a command the
     # same run asserts must always pass.
@@ -1025,6 +1059,97 @@ def test_vendor_and_precommit(tmp: Path) -> None:
     check("an over-budget AGENTS.md is refused", committed.returncode != 0)
     check("and the commit did NOT land",
           "oversized" not in run("git", "log", "--oneline").stdout)
+
+    section("pre-commit — repairs an existing hook whose terminal exit hid the gate")
+    legacy = tmp / "legacy-hook"
+    legacy.mkdir(parents=True, exist_ok=True)
+    legacy_run = lambda *a: subprocess.run(list(a), cwd=legacy, capture_output=True, text=True)
+    legacy_run("git", "init", "-q", ".")
+    legacy_run("git", "config", "user.email", "t@t")
+    legacy_run("git", "config", "user.name", "t")
+    (legacy / "README.md").write_text("# legacy hook fixture\n", encoding="utf-8")
+    (legacy / "AGENTS.md").write_text("# rules\n", encoding="utf-8")
+    legacy_run("git", "add", "-A")
+    legacy_run("git", "commit", "-qm", "init")
+    hooks = legacy / ".githooks"
+    hooks.mkdir()
+    legacy_hook = hooks / "pre-commit"
+    legacy_hook.write_text(
+        "#!/usr/bin/env bash\n"
+        "# Existing repository gate.\n"
+        "set -u\n\n"
+        "printf 'legacy-ran\\n' >> .legacy-hook-ran\n"
+        "rc=0\n"
+        "exit \"$rc\"\n",
+        encoding="utf-8",
+    )
+    legacy_hook.chmod(0o755)
+    legacy_run("git", "config", "core.hooksPath", ".githooks")
+
+    installed = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(legacy)],
+        capture_output=True, text=True,
+    )
+    installed_text = legacy_hook.read_text(encoding="utf-8")
+    check("apply succeeds for an existing terminal-exit hook", installed.returncode == 0,
+          installed.stdout[-300:] + installed.stderr[-300:])
+    check("the managed block is moved before the legacy hook can exit",
+          installed_text.index("# >>> agentkit >>>") < installed_text.index('exit "$rc"'))
+
+    legacy_compat = legacy / ".agents" / "compatibility.json"
+    declared = json.loads(legacy_compat.read_text(encoding="utf-8"))
+    declared["validation"] = {"commands": [{
+        "name": "terminal-exit fixture failure",
+        "argv": [sys.executable, "-c", "raise SystemExit(9)"],
+    }]}
+    legacy_compat.write_text(json.dumps(declared, indent=2) + "\n", encoding="utf-8")
+    legacy_run("git", "add", ".agents/compatibility.json")
+    blocked = legacy_run("git", "commit", "-m", "must not pass terminal exit")
+    check("a real commit reaches the managed validation before the terminal exit",
+          blocked.returncode != 0, blocked.stdout[-300:] + blocked.stderr[-300:])
+    check("the reached failure names the declared validation",
+          "terminal-exit fixture failure" in blocked.stdout + blocked.stderr)
+    check("the legacy hook body does not run after RepoCharter blocks",
+          not (legacy / ".legacy-hook-ran").exists())
+
+    declared["validation"] = {"commands": []}
+    legacy_compat.write_text(json.dumps(declared, indent=2) + "\n", encoding="utf-8")
+    legacy_run("git", "add", ".agents/compatibility.json")
+    passed = legacy_run("git", "commit", "-m", "passing terminal-exit hook")
+    check("a passing managed gate falls through to the existing hook", passed.returncode == 0,
+          passed.stdout[-300:] + passed.stderr[-300:])
+    check("the preserved existing hook actually ran", (legacy / ".legacy-hook-ran").exists())
+
+    # Recreate the exact defect: a complete managed block is present, but a terminal
+    # exit appears first. Manual verification must reject that false installation.
+    current = legacy_hook.read_text(encoding="utf-8")
+    start = current.index("# >>> agentkit >>>")
+    finish = current.index("# <<< agentkit <<<") + len("# <<< agentkit <<<")
+    lane = current[start:finish]
+    broken = (current[:start] + current[finish:]).rstrip() + "\n\n" + lane + "\n"
+    legacy_hook.write_text(broken, encoding="utf-8")
+    rejected_wiring = legacy_run(sys.executable, "kit/agentkit", "verify", "--repo", ".")
+    check("manual verify rejects a present-but-unreachable pre-commit block",
+          rejected_wiring.returncode != 0,
+          rejected_wiring.stdout[-400:] + rejected_wiring.stderr[-400:])
+    check("the wiring error explains that an earlier exit hides the block",
+          "unreachable" in (rejected_wiring.stdout + rejected_wiring.stderr).lower())
+
+    repaired = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(legacy),
+         "--allow-dirty"], capture_output=True, text=True,
+    )
+    repaired_text = legacy_hook.read_text(encoding="utf-8")
+    check("re-apply repairs the unreachable managed block", repaired.returncode == 0 and
+          repaired_text.index("# >>> agentkit >>>") < repaired_text.index('exit "$rc"') and
+          repaired_text.endswith("\n") and not repaired_text.endswith("\n\n"),
+          repaired.stdout[-300:] + repaired.stderr[-300:])
+    again = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(legacy),
+         "--allow-dirty"], capture_output=True, text=True,
+    )
+    check("the repaired existing hook is idempotent", "0 change(s)" in again.stdout,
+          again.stdout[-300:])
 
 
 def test_stale_session_tombstone(tmp: Path) -> None:

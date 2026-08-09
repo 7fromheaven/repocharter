@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.3.0"
+KIT_VERSION = "0.3.1"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -307,6 +308,64 @@ fi
 PRECOMMIT_STANDALONE = "#!/usr/bin/env bash\nset -uo pipefail\n\n" + PRECOMMIT_LANE
 
 
+def _without_precommit_lane(text: str) -> str:
+    """Remove one complete managed lane without disturbing the surrounding hook.
+
+    ``apply`` used to refresh the lane wherever it already sat, including after a
+    terminal ``exit``.  Removing and reinserting it lets upgrades repair that
+    present-but-unreachable state instead of preserving it forever.
+    """
+    start = text.find(PRECOMMIT_BEGIN)
+    if start == -1:
+        return text
+    end = text.find(PRECOMMIT_END, start + len(PRECOMMIT_BEGIN))
+    if end == -1:
+        # A partial managed region has no safe ownership boundary. Leave it intact;
+        # verification reports the malformed block instead of deleting user text.
+        return text
+    end += len(PRECOMMIT_END)
+    if text[end:end + 2] == "\n\n":
+        end += 2
+    elif text[end:end + 1] == "\n":
+        end += 1
+    without = text[:start] + text[end:]
+    return without.rstrip("\n") + "\n" if without else ""
+
+
+def _place_precommit_lane(text: str) -> str:
+    """Place the managed lane before legacy hook control flow can terminate.
+
+    Keep a shell shebang and an initial ``set`` preamble first, then run RepoCharter
+    before variable assignments, bypass branches, helper calls, or terminal exits in
+    the existing hook. A passing lane falls through to the preserved hook body.
+    """
+    base = _without_precommit_lane(text)
+    # Do not duplicate a malformed region whose end marker is missing.
+    if PRECOMMIT_BEGIN in base:
+        return base
+
+    lines = base.splitlines(keepends=True)
+    insert_at = 1 if lines and lines[0].startswith("#!") else 0
+    last_set = None
+    for index in range(insert_at, len(lines)):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if re.match(r"^set(?:\s|$)", stripped):
+            last_set = index + 1
+            continue
+        break
+    if last_set is not None:
+        insert_at = last_set
+
+    before = "".join(lines[:insert_at])
+    after = "".join(lines[insert_at:])
+    if before:
+        before = before.rstrip("\n") + "\n\n"
+    separator = "" if not after or after.startswith("\n") else "\n"
+    return before + PRECOMMIT_LANE + separator + after
+
+
 TOMBSTONE = """#!/usr/bin/env bash
 # agentkit tombstone. This hook was replaced; the file that lived here is gone.
 #
@@ -428,14 +487,10 @@ def install_precommit(repo: Path, dry: bool) -> int:
     if existing is None:
         new = PRECOMMIT_STANDALONE
         label = f"wrote {hook.relative_to(repo)} (agentkit verify on commit)"
-    elif PRECOMMIT_BEGIN in existing:
-        head, _, rest = existing.partition(PRECOMMIT_BEGIN)
-        _, _, tail = rest.partition(PRECOMMIT_END)
-        new = head + PRECOMMIT_LANE.rstrip("\n") + tail
-        label = f"refreshed the agentkit block in {hook.relative_to(repo)}"
     else:
-        new = existing.rstrip("\n") + "\n\n" + PRECOMMIT_LANE
-        label = f"added an agentkit block to {hook.relative_to(repo)}"
+        new = _place_precommit_lane(existing)
+        action = "refreshed and repositioned" if PRECOMMIT_BEGIN in existing else "added"
+        label = f"{action} the agentkit block in {hook.relative_to(repo)}"
 
     if existing != new:
         if dry:

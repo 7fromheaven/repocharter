@@ -152,21 +152,19 @@ def unsatisfiable(patterns: list[str]) -> bool:
     alternatives, is never. The rule then sits in the policy looking exactly like a working
     fence.
 
-    Detection is empirical rather than analytical: mine probes from each pattern, and if no
-    probe drawn from any of them satisfies every pattern, treat the conjunction as
-    unsatisfiable. It can miss an exotic case, but it catches the shape that actually occurs.
+    Detection is empirical rather than analytical. Use the same bounded ERE expander and
+    composite-probe builder as ``agentkit measure``; the older one-pattern-at-a-time miner
+    falsely rejected valid rules such as ``npm install -g`` because no individual fragment
+    contained the entire command.
     """
     if len(patterns) < 2:
         return False
-    candidates: list[str] = []
-    for p in patterns:
-        candidates.extend(_probe_strings(p))
-    if not candidates:
-        return False
-    for cand in candidates:
-        if all(_matches(p, cand) for p in patterns):
-            return False
-    return True
+    # Local import avoids loading the heavier measurement machinery during ordinary policy
+    # harvesting. measure imports supersede, but neither module imports scaffold.
+    from measure import INERT, compose_probes
+
+    _, note = compose_probes(patterns)
+    return note == INERT
 
 
 def _matches(pattern: str, text: str) -> bool:

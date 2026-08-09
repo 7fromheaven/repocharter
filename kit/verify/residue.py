@@ -63,6 +63,9 @@ CODEX_ADAPTER_FILES = (
     ".claude/hooks/agentkit/pretooluse-mcp.py",
 )
 
+PRECOMMIT_BEGIN = "# >>> agentkit >>>"
+PRECOMMIT_END = "# <<< agentkit <<<"
+
 
 @dataclass
 class Report:
@@ -591,6 +594,70 @@ def check_codex_hooks(root: Path, compat: dict, rep: Report) -> None:
         )
 
 
+def check_precommit(root: Path, rep: Report) -> None:
+    """Assert that Git invokes a complete, reachable RepoCharter commit gate."""
+    try:
+        in_git = subprocess.run(
+            ["git", "rev-parse", "--git-dir"], cwd=root,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        rep.error("could not inspect Git pre-commit wiring")
+        return
+    if in_git.returncode != 0:
+        rep.note("not a Git checkout; pre-commit wiring cannot be verified")
+        return
+
+    configured = subprocess.run(
+        ["git", "config", "--get", "core.hooksPath"], cwd=root,
+        capture_output=True, text=True, timeout=15,
+    ).stdout.strip()
+    if not configured:
+        rep.error(
+            "git core.hooksPath is unset, so the checked-in RepoCharter pre-commit gate "
+            "does not run. Run `agentkit apply`."
+        )
+        return
+
+    hooks_dir = Path(configured).expanduser()
+    if not hooks_dir.is_absolute():
+        hooks_dir = root / hooks_dir
+    hook = hooks_dir / "pre-commit"
+    try:
+        display = hook.resolve().relative_to(root.resolve())
+    except ValueError:
+        display = hook
+    if not hook.is_file():
+        rep.error(f"active pre-commit hook is missing at {display}")
+        return
+    if not os.access(hook, os.X_OK):
+        rep.error(f"active pre-commit hook is not executable: {display}")
+
+    text = hook.read_text(encoding="utf-8", errors="replace")
+    starts, ends = text.count(PRECOMMIT_BEGIN), text.count(PRECOMMIT_END)
+    if starts != 1 or ends != 1:
+        rep.error(
+            f"active pre-commit hook has {starts} RepoCharter start marker(s) and "
+            f"{ends} end marker(s); run `agentkit apply` to install one complete block"
+        )
+        return
+    begin, end = text.index(PRECOMMIT_BEGIN), text.index(PRECOMMIT_END)
+    if end < begin:
+        rep.error("active pre-commit hook's RepoCharter markers are reversed")
+        return
+    managed = text[begin:end]
+    if "python3 kit/agentkit verify --repo ." not in managed:
+        rep.error("active pre-commit RepoCharter block does not invoke `agentkit verify`")
+
+    for number, line in enumerate(text[:begin].splitlines(), 1):
+        if re.match(r"^[ \t]*exit(?:[ \t]|$)", line):
+            rep.error(
+                f"active pre-commit RepoCharter block is unreachable: line {number} exits "
+                "before the managed block. Run `agentkit apply` to reposition it."
+            )
+            break
+
+
 def check_validation(root: Path, compat: dict, rep: Report) -> None:
     """Run the repo-declared clean-code commands without a shell."""
     validation = compat.get("validation") or {}
@@ -964,6 +1031,7 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
     check_skills(root, compat, rep)
     check_dead_references(root, rep)
     check_codex_hooks(root, compat, rep)
+    check_precommit(root, rep)
     check_codex_config(root, rep)
     check_claude_md_excludes(root, rep)
     check_override_and_nesting(root, rep)

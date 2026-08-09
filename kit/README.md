@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
 `agentkit` name so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 209 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 223 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -216,7 +216,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-209 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+223 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI

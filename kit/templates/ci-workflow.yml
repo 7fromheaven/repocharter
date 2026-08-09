@@ -12,7 +12,7 @@ name: agentkit
 
 on:
   push:
-    branches: ["**"]
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 
@@ -24,11 +24,11 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
       - name: agentkit verify
         # --strict promotes warnings to errors. It can be omitted temporarily during a

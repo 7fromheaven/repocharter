@@ -89,7 +89,14 @@ fi
 
 block() { decide deny  "$1"; exit 0; }
 ask() {
-  [ -z "${PENDING_ASK:-}" ] && PENDING_ASK="$1"
+  # A repo rule and the universal floor may both ask about the same command. Returning
+  # the failed status of `[ -z ... ]` on the second match trips `set -e` and exits before
+  # `emit_pending_ask`, silently turning two prompts into an allow. Keep the first reason,
+  # but always return success so the decision is emitted.
+  if [ -z "${PENDING_ASK:-}" ]; then
+    PENDING_ASK="$1"
+  fi
+  return 0
 }
 emit_pending_ask() {
   [ -z "${PENDING_ASK:-}" ] && return

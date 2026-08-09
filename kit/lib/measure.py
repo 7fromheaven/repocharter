@@ -446,33 +446,58 @@ def measure_mcp_rule(rule: dict, gate: Path, repo: Path) -> dict:
     pattern = rule.get("pattern") or ""
     result = {"kind": "mcp", "declared": "deny", "pattern": pattern,
               "reason": (rule.get("reason") or "").strip(), "probe": None, "observed": None}
-    # An anchored literal is the common shape; strip anchors and verify the
-    # result still matches the pattern it came from.
+    # An anchored literal is the common shape. If stripping regex furniture does not
+    # produce a witness, use the same bounded ERE expander as Bash measurement. MCP rules
+    # commonly group tool suffixes as ``(promote|update_protection)``; treating those as
+    # unprobeable leaves a real production boundary unmeasured.
     literal = pattern.strip("^$").replace(".*", "x")
-    if not literal or not _matches_all(literal, [pattern]):
+    try:
+        compiled = re.compile(pattern)
+    except re.error:
+        result["verdict"] = UNPROBEABLE
+        return result
+    candidates = [literal] if literal and compiled.search(literal) else []
+    if not candidates:
+        candidates = [candidate for candidate in expand_ere(pattern)
+                      if compiled.search(candidate)][:12]
+    if not candidates:
         result["verdict"] = UNPROBEABLE
         return result
 
     tool_input: dict = {}
     for arg, arg_pat in (rule.get("whenArgMatches") or {}).items():
         value = str(arg_pat).strip("^$").replace(".*", "x")
-        if not _matches_all(value, [str(arg_pat)]):
+        try:
+            arg_compiled = re.compile(str(arg_pat))
+        except re.error:
             result["verdict"] = UNPROBEABLE
             return result
+        if not arg_compiled.search(value):
+            values = [candidate for candidate in expand_ere(str(arg_pat))
+                      if arg_compiled.search(candidate)]
+            if not values:
+                result["verdict"] = UNPROBEABLE
+                return result
+            value = values[0]
         tool_input[arg] = value
 
-    payload = json.dumps({"tool_name": literal, "tool_input": tool_input})
-    try:
-        proc = subprocess.run([str(gate)], input=payload, text=True, capture_output=True,
-                              cwd=repo, timeout=30,
-                              env={**_env(), "CLAUDE_PROJECT_DIR": str(repo)})
-    except (OSError, subprocess.TimeoutExpired):
-        result["verdict"] = UNPROBEABLE
-        return result
-    observed = decision_of(proc)
-    result["probe"] = literal + (f" {tool_input}" if tool_input else "")
-    result["observed"] = observed
-    result["verdict"] = ENFORCED if STRENGTH.get(observed, 0) >= 2 else UNENFORCED
+    worst, worst_probe = None, None
+    for candidate in candidates:
+        payload = json.dumps({"tool_name": candidate, "tool_input": tool_input})
+        try:
+            proc = subprocess.run([str(gate)], input=payload, text=True, capture_output=True,
+                                  cwd=repo, timeout=30,
+                                  env={**_env(), "CLAUDE_PROJECT_DIR": str(repo)})
+        except (OSError, subprocess.TimeoutExpired):
+            result["verdict"] = UNPROBEABLE
+            return result
+        observed = decision_of(proc)
+        if worst is None or STRENGTH.get(observed, 0) < STRENGTH.get(worst, 0):
+            worst, worst_probe = observed, candidate
+
+    result["probe"] = worst_probe + (f" {tool_input}" if tool_input else "")
+    result["observed"] = worst
+    result["verdict"] = ENFORCED if STRENGTH.get(worst, 0) >= 2 else UNENFORCED
     return result
 
 

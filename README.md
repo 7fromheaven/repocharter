@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.3.0** · CLI: `kit/agentkit`
+> Current version: **RepoCharter 0.3.1** · CLI: `kit/agentkit`
 >
-> **209 tests** · **zero runtime dependencies**
+> **223 tests** · **zero runtime dependencies**
 
 RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
 repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
@@ -266,11 +266,13 @@ optionally adds the network-fetched shared rule catalogue.
 - **Every install is idempotent**; a conforming repository reports zero changes.
 - **Pre-commit verification fails closed** if Python, the vendored CLI, or a declared validation
   command is missing.
+- **Existing pre-commit hooks stay reachable**: the managed verifier runs before legacy hook
+  control flow, and `verify` rejects a block hidden behind an earlier `exit`.
 - **Provider claims remain explicit**: context support does not masquerade as safety enforcement.
 
 ## Current status
 
-RepoCharter 0.3.0 is used in production repositories today. Its 209-test suite is intentionally
+RepoCharter 0.3.1 is used in production repositories today. Its 223-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -308,7 +310,7 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         209 tests, no dependencies, mostly negative
+kit/tests/         223 tests, no dependencies, mostly negative
 ```
 
 **Ready to try RepoCharter?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is
