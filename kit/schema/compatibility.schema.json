@@ -138,7 +138,7 @@
         },
         "askBashPatterns": {
           "type": "array",
-          "description": "Same shape as denyBashPatterns. Claude prompts; Codex hard-denies because PreToolUse cannot currently initiate an approval without failing open.",
+          "description": "Same shape as denyBashPatterns. Claude prompts directly. In approval-capable Codex turns, the adapter hands confirmation to Codex's native permission flow; with approvals disabled, it denies. PreToolUse cannot itself force a Codex prompt, so the agent must submit the call for native approval.",
           "items": { "$ref": "#/$defs/bashRule" },
           "default": []
         },

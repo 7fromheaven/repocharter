@@ -53,6 +53,8 @@ def run_hook(name: str, payload, repo: Path,
     if harness == "codex":
         env.pop("CLAUDE_PROJECT_DIR", None)
         env["AGENTKIT_HARNESS"] = "codex"
+        if isinstance(payload, dict) and "permission_mode" not in payload:
+            payload = {**payload, "permission_mode": "default"}
     else:
         env["CLAUDE_PROJECT_DIR"] = str(repo)
     body = payload if isinstance(payload, str) else json.dumps(payload)
@@ -119,9 +121,11 @@ def test_bash_gate(tmp: Path) -> None:
     cases = [
         ("force-push to main",          "git push --force origin main",              "deny"),
         ("force-push short flag",       "git push -f origin main",                   "deny"),
+        ("force-push after git -C",     "git -C /tmp/repo push --force origin main", "deny"),
         ("--no-verify commit",          "git commit --no-verify -m 'x'",             "deny"),
         ("core.hooksPath bypass",       "git -c core.hooksPath=/dev/null push",      "deny"),
         ("plain push to main",          "git push origin main",                      "ask"),
+        ("plain push after git -C",     "git -C /tmp/repo push origin main",         "ask"),
         ("reset --hard",                "git reset --hard HEAD~1",                   "ask"),
         ("git clean -fd",               "git clean -fd",                             "ask"),
         ("git clean -d -f separated",   "git clean -d -f",                           "ask"),
@@ -129,6 +133,7 @@ def test_bash_gate(tmp: Path) -> None:
         ("git stash drop",              "git stash drop",                            "ask"),
         ("checkout a file",             "git checkout -- src/app.ts",                "ask"),
         ("recursive rm outside safe",   "rm -rf /Users/someone/important",           "ask"),
+        ("ask cannot hide later deny",  "rm -rf /Users/someone/important; wp db drop", "deny"),
 
         # Database wipes are denied; reset operations request confirmation because they can
         # be valid in local development.
@@ -156,15 +161,26 @@ def test_bash_gate(tmp: Path) -> None:
         got = decision(code, out)
         check(f"{label} -> {expected}", got == expected, f"got {got}")
 
-    section("Bash gate — Codex never emits its unsupported ask decision")
+    section("Bash gate — Codex hands confirmation to its native approval path")
     code, out, _ = run_hook(
         "pretooluse-bash.sh",
         {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}},
         repo,
         harness="codex",
     )
-    check("Codex translates ask to a hard deny", decision(code, out) == "deny", out[:200])
-    check("the denial explains the operator escape path", "operator may run it" in out, out[:200])
+    check("approval-capable Codex does not hard-deny an ask", decision(code, out) == "allow", out[:240])
+    check("the handoff requires native approval",
+          "native permission request" in context_of(out), out[:240])
+
+    code, out, _ = run_hook(
+        "pretooluse-bash.sh",
+        {"permission_mode": "bypassPermissions", "tool_name": "Bash",
+         "tool_input": {"command": "git reset --hard HEAD~1"}},
+        repo,
+        harness="codex",
+    )
+    check("Codex without an approval path still denies an ask", decision(code, out) == "deny", out[:240])
+    check("the denial names the unavailable approval path", "no active approval path" in out, out[:240])
 
     section("Bash gate — what it must NOT refuse")
     for label, command in [

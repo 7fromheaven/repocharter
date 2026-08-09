@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
 `agentkit` name so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 204 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 209 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -168,8 +168,11 @@ or any adapter change; a temporary trust override proves code paths, not operati
 | Post-write | `Edit\|Write` | `apply_patch` | takes the after-measurement and reports the delta |
 | Config | `ConfigChange` | write guard on `.codex/hooks.json` and `.codex/config.toml` | refuses local hook disablement |
 
-Codex does not support an interactive `ask` decision in `PreToolUse`; the shared engine converts
-that verdict to deny so confirmation rules cannot fail open.
+Codex does not support an interactive `ask` decision in `PreToolUse`. In an approval-capable turn,
+the adapter labels the call as confirmation-required and hands it to Codex's native permission
+flow; with approvals disabled, it denies the call. Because `PreToolUse` cannot itself open the
+prompt, the agent must submit confirmation-class calls for native approval. Unconditional `deny`
+rules remain blocking in either mode.
 
 **Everything fails closed.** A gate that cannot parse its input, read its policy, or compile
 a pattern exits 2. Claude Code treats exit 1 as non-blocking and proceeds; exit 2 blocks.
@@ -213,7 +216,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-204 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+209 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI

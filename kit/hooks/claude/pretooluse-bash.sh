@@ -4,8 +4,8 @@
 #
 # Reads stdin JSON per the Claude Code hook spec:
 #   { "tool_name": "Bash", "tool_input": { "command": "..." } }
-# Emits a permissionDecision (ask|deny) on match, or a cwd-safety additionalContext on
-# mutative git/fs ops. No match -> allow (silent, no output).
+# Emits a permissionDecision (ask|deny) on Claude, a deny or native-approval handoff on
+# Codex, or cwd-safety additionalContext on mutative git/fs ops. No match -> allow.
 #
 #   `ask`  = reversible-but-consequential  (rm -r, git reset --hard, push to protected)
 #   `deny` = unambiguous foot-gun          (force-push to protected, checks-bypass flags)
@@ -60,6 +60,8 @@ die_closed() {
 if command -v jq >/dev/null 2>&1; then
   CMD=$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.command // ""' 2>/dev/null) ||
     die_closed "the hook payload could not be parsed as JSON."
+  PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | jq -r '.permission_mode // ""' 2>/dev/null) ||
+    die_closed "the hook permission mode could not be parsed as JSON."
   decide() {
     jq -nc --arg d "$1" --arg r "$2" \
       '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,permissionDecisionReason:$r}}'
@@ -72,6 +74,9 @@ elif command -v python3 >/dev/null 2>&1; then
   CMD=$(printf '%s' "$PAYLOAD" | python3 -c \
     'import json,sys;sys.stdout.write(str(json.load(sys.stdin).get("tool_input",{}).get("command","")))' 2>/dev/null) ||
     die_closed "the hook payload could not be parsed as JSON."
+  PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | python3 -c \
+    'import json,sys;sys.stdout.write(str(json.load(sys.stdin).get("permission_mode", "")))' 2>/dev/null) ||
+    die_closed "the hook permission mode could not be parsed as JSON."
   decide() {
     python3 -c 'import json,sys;print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":sys.argv[1],"permissionDecisionReason":sys.argv[2]}}))' "$1" "$2"
   }
@@ -84,18 +89,33 @@ fi
 
 block() { decide deny  "$1"; exit 0; }
 ask() {
+  [ -z "${PENDING_ASK:-}" ] && PENDING_ASK="$1"
+}
+emit_pending_ask() {
+  [ -z "${PENDING_ASK:-}" ] && return
   if [ "$AGENTKIT_HARNESS" = "codex" ]; then
-    # Codex 0.147 parses a PreToolUse `ask` decision but does not implement it: the
-    # hook is marked failed and the command CONTINUES. A hard denial is the only
-    # fail-closed translation until hook-initiated approvals are supported.
-    block "$1 Codex cannot request approval from PreToolUse, so this is blocked; the operator may run it directly after review."
+    # PreToolUse cannot create a Codex approval prompt. In an approval-capable turn,
+    # hand the decision back to Codex so a tool call submitted with native escalation
+    # can reach its normal PermissionRequest/user-review path. Under approval_policy=never
+    # Codex reports bypassPermissions; there is no confirmation path, so fail closed.
+    if [ "$PERMISSION_MODE" = "default" ]; then
+      context "[agentkit-confirmation-required] ${PENDING_ASK} Continue only through Codex's native permission request; if this invocation was not submitted for approval, stop and retry with approval."
+      exit 0
+    fi
+    block "${PENDING_ASK} Codex has no active approval path (permission_mode=${PERMISSION_MODE:-missing}), so this is blocked."
   fi
-  decide ask "$1"
+  decide ask "$PENDING_ASK"
   exit 0
 }
 
 # Command-position anchor (+ optional inline env-var assignments). POSIX-portable.
 CSEP='(^[[:space:]]*|[;&|][[:space:]]*|\$\([[:space:]]*)([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+ +)*'
+
+# Git permits global options between `git` and its subcommand. Keep command-position
+# anchoring while accepting the common value-taking and flag-only forms, including the
+# `git -C /path push` spelling used by tools that operate on another checkout.
+GIT_GLOBAL='(((-C|-c|--git-dir|--work-tree|--namespace|--config-env)[[:space:]]+[^;&|[:space:]]+|(-C)[^;&|[:space:]]+|(--git-dir|--work-tree|--namespace|--config-env)=[^;&|[:space:]]+|--(no-pager|paginate|literal-pathspecs|glob-pathspecs|noglob-pathspecs|icase-pathspecs|no-optional-locks|bare))[[:space:]]+)*'
+GIT="${CSEP}git[[:space:]]+${GIT_GLOBAL}"
 
 # Extra rm-safe paths a stack fragment may contribute (default: none).
 SAFE_PATHS_EXTRA="${SAFE_PATHS_EXTRA:-}"
@@ -165,7 +185,7 @@ PYEOF
         deny) block "Repo policy: ${RULE_WHY}" ;;
         # Hold `ask` decisions until the universal rules run so a repository prompt cannot
         # downgrade a universal denial. Repository `deny` decisions can fire immediately.
-        ask)  [ -z "${PENDING_ASK:-}" ] && PENDING_ASK="${RULE_WHY}" ;;
+        ask)  [ -z "${PENDING_REPO_ASK:-}" ] && PENDING_REPO_ASK="${RULE_WHY}" ;;
       esac
     fi
   done <<EOF
@@ -187,7 +207,7 @@ if [ -z "$PROTECTED" ] && [ -f "$COMPAT" ]; then
   fi
 fi
 PROTECTED="(${PROTECTED:-main|master})"
-PUSH_LINES=$(echo "$CMD" | grep -E "${CSEP}git +push([^[:alnum:]_]|$)" | grep -E "(^|[^[:alnum:]_])${PROTECTED}([^[:alnum:]_]|$)" || true)
+PUSH_LINES=$(echo "$CMD" | grep -E "${GIT}push([^[:alnum:]_]|$)" | grep -E "(^|[^[:alnum:]_])${PROTECTED}([^[:alnum:]_]|$)" || true)
 if [[ -n $PUSH_LINES ]]; then
   if echo "$PUSH_LINES" | grep -qE -- '--force([^[:alnum:]_]|$)|(^|[[:space:]])-f([^[:alnum:]_]|$)'; then
     block "Safety gate: git push --force to a protected branch ${PROTECTED} is BLOCKED — force-push overwrites shared history. Use a feature branch and a PR."
@@ -197,8 +217,8 @@ fi
 
 # 2. Checks-bypass attempts (block). The bypass flag must co-occur with a real git write
 #    verb on the SAME line, so a --no-verify quoted inside a commit-message body is exempt.
-if echo "$CMD" | grep -qE "${CSEP}git +(.*[^[:alnum:]_])?(commit|push|rebase|merge|cherry-pick|am|tag)(.*[[:space:]])(--no-verify|--no-gpg-sign)([^[:alnum:]_]|$)" ||
-  echo "$CMD" | grep -qE "${CSEP}git +.*commit\.gpgsign=false"; then
+if echo "$CMD" | grep -qE "${GIT}(.*[^[:alnum:]_])?(commit|push|rebase|merge|cherry-pick|am|tag)(.*[[:space:]])(--no-verify|--no-gpg-sign)([^[:alnum:]_]|$)" ||
+  echo "$CMD" | grep -qE "${GIT}.*commit\.gpgsign=false"; then
   block "Safety gate: checks-bypass (--no-verify / --no-gpg-sign / commit.gpgsign=false) is BLOCKED. Investigate the failing gate; do not route around it."
 fi
 
@@ -209,25 +229,25 @@ if echo "$CMD" | grep -qE "${CSEP}git +.*-c +core\.hooksPath="; then
 fi
 
 # 3. git reset --hard (ask) — destroys uncommitted working-tree changes.
-echo "$CMD" | grep -qE "${CSEP}git +reset +--hard([^[:alnum:]_]|$)" &&
+echo "$CMD" | grep -qE "${GIT}reset +--hard([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git reset --hard' destroys uncommitted changes. Confirm cwd and target with the operator."
 
 # 3b. Working-tree-revert cousins of reset --hard (ask). Each can discard uncommitted work.
 #     checkout is exempt only for -b/-B branch creation.
-if echo "$CMD" | grep -qE "${CSEP}git +checkout([^[:alnum:]_]|$)" &&
-  ! echo "$CMD" | grep -qE "${CSEP}git +checkout +-[bB]([^[:alnum:]_]|$)"; then
+if echo "$CMD" | grep -qE "${GIT}checkout([^[:alnum:]_]|$)" &&
+  ! echo "$CMD" | grep -qE "${GIT}checkout +-[bB]([^[:alnum:]_]|$)"; then
   ask "Safety gate: 'git checkout' (other than -b/-B) can irrecoverably revert uncommitted changes. Confirm the target — and to un-apply a change under review, reverse the edit in place; never discard the working tree."
 fi
-echo "$CMD" | grep -qE "${CSEP}git +restore([^[:alnum:]_]|$)" &&
+echo "$CMD" | grep -qE "${GIT}restore([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git restore' reverts uncommitted changes irrecoverably. Confirm the target with the operator."
 # Force may arrive as an adjacent cluster (-fd), a SEPARATED cluster (-d -f), or the long
 # form (--force), anywhere within the clean invocation — but never across a command
 # separator (;&|), so a force flag on a LATER command cannot false-fire. The dash must
 # follow whitespace (a real flag token), so a filename containing "-f" stays silent.
 # The f/F match is anywhere in the cluster so forms such as `git clean -fd` are covered.
-echo "$CMD" | grep -qE "${CSEP}git +clean( +[^;&|]*)? +(-[A-Za-z]*[fF][A-Za-z]*|--force)([^[:alnum:]_]|$)" &&
+echo "$CMD" | grep -qE "${GIT}clean( +[^;&|]*)? +(-[A-Za-z]*[fF][A-Za-z]*|--force)([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git clean' with a force flag (any position: -f/-fd/-d -f/--force) deletes untracked files irrecoverably. Confirm the target."
-echo "$CMD" | grep -qE "${CSEP}git +stash +(drop|clear)([^[:alnum:]_]|$)" &&
+echo "$CMD" | grep -qE "${GIT}stash +(drop|clear)([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git stash drop/clear' discards stashed work irrecoverably. Confirm with the operator."
 
 # 4. Recursive rm outside safe paths (ask). Matches any short-flag cluster containing r/R
@@ -271,15 +291,17 @@ fi
 echo "$CMD" | grep -qE "${CSEP}(dropdb|dropuser)([^[:alnum:]_]|$)" &&
   block "Safety gate: '${CMD%% *}' destroys a database or role outright. The operator runs this, not an agent."
 
-# Every universal BLOCK has now had its turn. A repo `ask` held above is safe to emit.
-[ -n "${PENDING_ASK:-}" ] && ask "Repo policy: ${PENDING_ASK}"
+# Every universal BLOCK has now had its turn. Queue a repository prompt only when no
+# universal confirmation already explains the command, then adapt it for the harness.
+[ -n "${PENDING_REPO_ASK:-}" ] && ask "Repo policy: ${PENDING_REPO_ASK}"
+emit_pending_ask
 
 # 6. CWD-awareness injection on mutative git / filesystem ops (context-inject, no block).
 #    The harness preserves cwd between Bash calls, so a prior `cd <subdir>` for a read-only
 #    op can silently set the wrong context for a later mutative op. Ask-gated commands
 #    above have already exited.
-MUTATIVE_PATTERN='git +(add|checkout|clean|commit|rm|mv|reset|merge|rebase|cherry-pick|stash|worktree|revert|restore|push)([^[:alnum:]_]|$)|rm +|mv +'
-if echo "$CMD" | grep -qE "${CSEP}(${MUTATIVE_PATTERN})"; then
+GIT_MUTATIVE='(add|checkout|clean|commit|rm|mv|reset|merge|rebase|cherry-pick|stash|worktree|revert|restore|push)([^[:alnum:]_]|$)'
+if echo "$CMD" | grep -qE "${GIT}${GIT_MUTATIVE}|${CSEP}(rm +|mv +)"; then
   set +e
   PWD_NOW=$(pwd 2>/dev/null || echo "<pwd-failed>")
   CWD_PREFIX="cwd"

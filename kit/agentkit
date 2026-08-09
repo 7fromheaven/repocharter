@@ -1190,6 +1190,8 @@ def run_hook(path: Path, payload: dict, repo: Path,
     if harness == "codex":
         env.pop("CLAUDE_PROJECT_DIR", None)
         env["AGENTKIT_HARNESS"] = "codex"
+        if "permission_mode" not in payload:
+            payload = {**payload, "permission_mode": "default"}
     else:
         env["CLAUDE_PROJECT_DIR"] = str(repo)
     proc = subprocess.run([str(path)], input=json.dumps(payload), capture_output=True,
@@ -1204,6 +1206,13 @@ def decision_of(code: int, out: str) -> str:
         return json.loads(out)["hookSpecificOutput"]["permissionDecision"]
     except Exception:
         return "allow"
+
+
+def context_of(out: str) -> str:
+    try:
+        return json.loads(out)["hookSpecificOutput"].get("additionalContext", "")
+    except Exception:
+        return ""
 
 
 MCP_PROBE_SERVER = r'''#!/usr/bin/env python3
@@ -1479,8 +1488,21 @@ def cmd_self_test(repo: Path, promote_codex: bool = False) -> int:
             harness="codex",
         )
         actual = decision_of(code, out)
+        ok = actual == "allow" and "native permission request" in context_of(out)
+        print(f"  {'pass ' if ok else 'FAIL '} Codex hands ask to native approval: "
+              f"expected approval handoff, got {actual}")
+        failures += 0 if ok else 1
+
+        code, out = run_hook(
+            bash_hook,
+            {"permission_mode": "bypassPermissions", "tool_name": "Bash",
+             "tool_input": {"command": "git reset --hard HEAD~1"}},
+            repo,
+            harness="codex",
+        )
+        actual = decision_of(code, out)
         ok = actual == "deny"
-        print(f"  {'pass ' if ok else 'FAIL '} Codex translates unsupported ask to deny: "
+        print(f"  {'pass ' if ok else 'FAIL '} Codex without approval path denies ask: "
               f"expected deny, got {actual}")
         failures += 0 if ok else 1
 

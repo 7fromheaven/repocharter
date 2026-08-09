@@ -61,7 +61,7 @@ export default function OpenGraphImage() {
           <div style={{ display: "flex", alignItems: "center", gap: 18, fontSize: 23, color: "#4de0b7" }}>
             repocharter.com
             <span style={{ width: 5, height: 5, borderRadius: 99, background: "#4d82ff" }} />
-            204 tests · zero CLI dependencies
+            209 tests · zero CLI dependencies
           </div>
         </div>
       </div>

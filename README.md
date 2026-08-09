@@ -21,7 +21,7 @@ With RepoCharter, you get:
 
 > Current version: **RepoCharter 0.3.0** · CLI: `kit/agentkit`
 >
-> **204 tests** · **zero runtime dependencies**
+> **209 tests** · **zero runtime dependencies**
 
 RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
 repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
@@ -207,8 +207,10 @@ live-data operations.
 | Configuration | `ConfigChange` guard | write guard | disabling or replacing the installed safety layer |
 
 Gate scripts fail closed when they cannot parse input, read policy, or compile a pattern. Claude can
-pause for an interactive `ask`; Codex currently translates the same decision to a denial because
-its `PreToolUse` hook cannot initiate approval safely.
+pause directly on an interactive `ask`. Codex's `PreToolUse` hook cannot create that prompt, so an
+approval-capable turn hands the call to Codex's native permission flow and a no-approval turn denies
+it. The agent must submit confirmation-class calls for native approval; unconditional `deny` rules
+remain blocking either way.
 
 Hooks are guardrails, not an operating-system security boundary. Credentials and production
 capabilities should still use the narrowest permissions their providers offer. Verified
@@ -268,7 +270,7 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter 0.3.0 is used in production repositories today. Its 204-test suite is intentionally
+RepoCharter 0.3.0 is used in production repositories today. Its 209-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -306,7 +308,7 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         204 tests, no dependencies, mostly negative
+kit/tests/         209 tests, no dependencies, mostly negative
 ```
 
 **Ready to try RepoCharter?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is
