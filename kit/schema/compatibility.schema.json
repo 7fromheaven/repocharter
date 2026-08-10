@@ -155,7 +155,7 @@
             }
           },
           "default": [],
-          "description": "Paths no agent may Edit or Write. Compiled into permissions.deny AND checked by the hook, deliberately twice: permissions.deny is the client-enforced layer, the hook is what still fires if a settings layer is missing."
+          "description": "Paths no agent may Edit or Write. Compiled into Claude's Edit permissions.deny matcher, which covers every file-editing tool, AND checked by the Edit/Write hook, deliberately twice: permissions.deny is the client-enforced layer, the hook is what still fires if a settings layer is missing."
         },
         "denyMcpTools": {
           "type": "array",
