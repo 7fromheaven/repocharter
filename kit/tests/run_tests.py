@@ -441,7 +441,7 @@ def _entry(script: str) -> dict:
 
 def _healthy_settings() -> dict:
     return {
-        "permissions": {"allow": [], "deny": ["Write(lib/content/live/**)"]},
+        "permissions": {"allow": [], "deny": ["Edit(lib/content/live/**)"]},
         "hooks": {
             "PreToolUse": [
                 {"matcher": "Bash", **_entry("pretooluse-bash.sh")},
@@ -1013,6 +1013,46 @@ def test_apply(tmp: Path) -> None:
     check("the migration is reported instead of happening silently",
           "disabled the legacy unreasoned auto-memory default" in upgraded.stdout,
           upgraded.stdout[-500:])
+
+    section("apply — compiles Claude path denials through its supported matcher")
+    permission_upgrade = tmp / "permission-upgrade"
+    permission_upgrade.mkdir(parents=True, exist_ok=True)
+    git_init(permission_upgrade)
+    (permission_upgrade / "AGENTS.md").write_text("# t\n", encoding="utf-8")
+    (permission_upgrade / ".agents").mkdir()
+    permission_compat = agentkit_mod.default_compat(permission_upgrade)
+    permission_compat["agentkitVersion"] = "0.3.6"
+    permission_compat["policy"]["denyWritePaths"] = [
+        {"glob": "locales/hy/**", "reason": "Only a language reviewer may change this."},
+        {"glob": "app/*/holding/**", "reason": "Holding pages require explicit review."},
+    ]
+    (permission_upgrade / ".agents" / "compatibility.json").write_text(
+        json.dumps(permission_compat, indent=2) + "\n", encoding="utf-8")
+    (permission_upgrade / ".claude").mkdir()
+    (permission_upgrade / ".claude" / "settings.json").write_text(json.dumps({
+        "permissions": {
+            "allow": [],
+            "deny": [
+                "Edit(app/*/holding/**)",
+                "Edit(locales/hy/**)",
+                "Write(app/*/holding/**)",
+                "Write(locales/hy/**)",
+            ],
+        },
+    }, indent=2) + "\n", encoding="utf-8")
+    git_commit_all(permission_upgrade)
+    permission_apply = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(permission_upgrade)],
+        capture_output=True, text=True, timeout=120,
+    )
+    permission_settings = json.loads(
+        (permission_upgrade / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    permission_denials = permission_settings["permissions"]["deny"]
+    check("0.3.7 removes invalid Write(...) rules and keeps both paths denied",
+          permission_apply.returncode == 0 and permission_denials == [
+              "Edit(app/*/holding/**)",
+              "Edit(locales/hy/**)",
+          ], permission_apply.stderr + str(permission_denials))
 
     section("apply — must preserve foreign Codex hooks too")
     codex_config_path = repo / ".codex" / "hooks.json"
@@ -1926,7 +1966,7 @@ def test_claude_enforcement_evidence(tmp: Path) -> None:
           any("git -c core.hooksPath=/dev/null status" in part for part in target_argv),
           " ".join(target_argv))
     probe_settings = agentkit_mod.claude_probe_settings(
-        {"permissions": {"deny": ["Write(blocked.txt)"], "allow": []}})
+        {"permissions": {"deny": ["Edit(blocked.txt)"], "allow": []}})
     check("the probe repo empties permissions.deny",
           probe_settings["permissions"]["deny"] == [])
 

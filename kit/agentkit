@@ -33,7 +33,7 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.3.6"
+KIT_VERSION = "0.3.7"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -1019,7 +1019,10 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
     policy = compat.get("policy") or {}
     deny = []
     for rule in policy.get("denyWritePaths") or []:
-        deny.extend([f"Edit({rule['glob']})", f"Write({rule['glob']})"])
+        # Claude's Edit matcher covers every file-editing tool. Write(...) is not a
+        # supported path-permission matcher and Claude warns before ignoring it.
+        # The RepoCharter hook still handles Edit, Write, and NotebookEdit explicitly.
+        deny.append(f"Edit({rule['glob']})")
     for rule in policy.get("denyMcpTools") or []:
         # permissions.deny matches tool names literally, so only anchored literal patterns
         # are translatable. Regex rules stay hook-only, and the hook is what enforces them.
@@ -2288,7 +2291,7 @@ def live_claude_self_test(repo: Path) -> tuple[list[str], str]:
 
 
 CONFIGCHANGE_FIXTURE_SETTINGS = {
-    "permissions": {"allow": [], "deny": ["Write(fixture/**)"]},
+    "permissions": {"allow": [], "deny": ["Edit(fixture/**)"]},
     "hooks": {
         "PreToolUse": [
             {"matcher": "Bash", "hooks": [{"type": "command", "command":
