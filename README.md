@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.3.2** · CLI: `kit/agentkit`
+> Current version: **RepoCharter 0.3.3** · CLI: `kit/agentkit`
 >
-> **237 tests** · **zero runtime dependencies**
+> **300 tests** · **zero runtime dependencies**
 
 RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
 repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
@@ -77,7 +77,7 @@ project-memory layout. Provider-specific files are adapters, not competing sourc
 | Harness | Shared context | Safety integration | Enforcement status |
 |---|---|---|---|
 | **Codex** | Native `AGENTS.md` and `.agents/skills/` discovery | Project hooks for Bash, `apply_patch`, MCP, and post-write measurement | Eligible for **verified enforcement** after exact-hook trust and live deny/allow proof |
-| **Claude Code** | `CLAUDE.md` and skill symlinks reach the same canonical files | Hooks for Bash, writes, MCP, config changes, and post-write measurement | **Advisory** until provider-backed proof is recorded |
+| **Claude Code** | `CLAUDE.md` and skill symlinks reach the same canonical files | Hooks for Bash, writes, MCP, config changes, and post-write measurement | Eligible for **verified enforcement** after live deny/allow proof in the checkout |
 | **OpenCode** | Native `AGENTS.md` and `.agents/skills/` discovery | No RepoCharter tool-call adapter yet; pre-commit verification still applies | **Advisory** |
 | **Hermes Agent** | Native `AGENTS.md`; canonical skills require an external-directory setting | No RepoCharter tool-call adapter yet; pre-commit verification still applies | **Advisory** |
 | **ZCode** | Native `AGENTS.md`; project skill imported as a symlink | No live-tested safety adapter yet | **Advisory** |
@@ -86,7 +86,9 @@ project-memory layout. Provider-specific files are adapters, not competing sourc
 **Verified enforcement** means live probes showed the harness stopping tested prohibited calls
 before execution while allowing benign calls. The compatibility manifest serializes this state as
 `enforcement: "blocking"`; that internal value does not mean RepoCharter or the repository is
-blocked. Evidence is scoped to the exact checkout, adapter hash, harness version, and probe matrix.
+blocked. The portable manifest record is paired with a private attestation under this worktree's
+absolute Git directory, so a clone or sibling worktree cannot inherit the checkout claim. Evidence
+is scoped to the exact checkout, adapter hash, harness version, and probe matrix.
 
 RepoCharter does not pretend every provider exposes the same control surface. Context portability
 and safety enforcement are reported separately. OpenCode and Hermes Agent can use local or
@@ -190,6 +192,31 @@ Promotion succeeds only after disposable deny/allow probes and an ordinary run c
 persisted project-hook trust is active. See the
 [official Codex hook documentation](https://learn.chatgpt.com/docs/hooks) for the trust model.
 
+### 6. Earn the same claim under Claude Code
+
+Claude Code reads hooks once, at session start, so restart it after `apply`. Start `claude`
+interactively in the checkout once, review the project, and accept its trust prompt (a trusted
+parent workspace also covers descendants). Then:
+
+```sh
+kit/agentkit self-test --repo . --promote-claude
+```
+
+This drives the real `claude` executable in a disposable repository and requires both directions on
+Bash, Write, and MCP. The intended tool call and matching hook response must appear in structured
+event output; each denial must carry RepoCharter's own reason and leave its marker uncreated, while
+each benign call must actually run. A second call uses this checkout's effective user, project, and
+local settings. Promotion separately checks persisted workspace trust and writes a private
+checkout attestation. Every probe tool is pre-allowed and the probe repository's
+`permissions.deny` is emptied, so a native permission refusal cannot be mistaken for a hook denial.
+
+The ConfigChange guard is verified in a disposable fixture rather than scored as a live provider
+event. Ordinary mode can refuse writes before the hook, but bypass-authorized writes are possible;
+the decisive measurement is that headless `claude -p` sessions emitted no ConfigChange event for
+authorized Write, Bash, or external settings mutations. The fixture checks the provider-shaped
+payload and the exact five installed handler mappings. `verify` independently refuses
+`disableAllHooks`.
+
 ---
 
 ## What RepoCharter enforces
@@ -272,15 +299,18 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter is used in production repositories today. Its 237-test suite is intentionally
+RepoCharter is used in production repositories today. Its 300-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
 The Codex adapter has provider-backed Bash, `apply_patch`, MCP, allow-path, and persisted-trust
-evidence. Each checkout still has to review and prove its own exact hook hash. Claude Code uses the
-same policy engine but remains advisory until equivalent provider-backed evidence is recorded.
-OpenCode, Hermes Agent, and ZCode currently provide portable context without RepoCharter tool-call
-enforcement.
+evidence. Each checkout still has to review and prove its own exact hook hash. The Claude Code
+adapter has provider-backed Bash, Write, and MCP deny-and-allow evidence, structured hook-event
+proof, an observed post-write measurement, persisted covering trust, and a target effective-settings
+probe. Both providers pair the tracked digest/version record with a checkout-private Git
+attestation. ConfigChange's handler logic and exact wiring are fixture-verified because the
+headless promotion harness emits no watcher event for settings mutations. OpenCode, Hermes Agent,
+and ZCode currently provide portable context without RepoCharter tool-call enforcement.
 
 ## Honest limits
 
@@ -310,7 +340,7 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         237 tests, no dependencies, mostly negative
+kit/tests/         300 tests, no dependencies, mostly negative
 ```
 
 **Ready to try RepoCharter?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is

@@ -33,7 +33,7 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.3.2"
+KIT_VERSION = "0.3.3"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -136,6 +136,18 @@ CODEX_ADAPTER_FILES = (
     ".claude/hooks/agentkit/posttooluse-write.py",
     ".claude/hooks/agentkit/pretooluse-mcp.py",
 )
+# The Claude wire path is settings.json plus every script it names. configchange-guard.py
+# belongs here because settings.json invokes it; leaving it out would let the one gate that
+# protects the settings file change without invalidating the evidence.
+CLAUDE_ADAPTER_FILES = (
+    ".claude/settings.json",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+    ".claude/hooks/agentkit/configchange-guard.py",
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────
@@ -161,10 +173,14 @@ def agentkit_state_dir() -> Path:
     return Path(os.environ.get("AGENTKIT_STATE_DIR") or (Path.home() / ".agentkit"))
 
 
-def codex_adapter_digest(repo: Path) -> str | None:
-    """Hash the exact provider wiring a live Codex self-test certifies."""
+def adapter_digest(repo: Path, files: tuple[str, ...]) -> str | None:
+    """Hash the exact provider wiring a live self-test certifies.
+
+    A missing file returns None rather than a digest over what remains, so a half-installed
+    adapter can never match a recorded hash.
+    """
     digest = hashlib.sha256()
-    for rel in CODEX_ADAPTER_FILES:
+    for rel in files:
         path = repo / rel
         if not path.is_file():
             return None
@@ -173,6 +189,144 @@ def codex_adapter_digest(repo: Path) -> str | None:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def codex_adapter_digest(repo: Path) -> str | None:
+    return adapter_digest(repo, CODEX_ADAPTER_FILES)
+
+
+def claude_adapter_digest(repo: Path) -> str | None:
+    return adapter_digest(repo, CLAUDE_ADAPTER_FILES)
+
+
+CHECKOUT_EVIDENCE_VERSION = 1
+
+
+def checkout_git_dir(repo: Path) -> Path | None:
+    """Return this worktree's private Git directory, never the shared common dir."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=repo,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    path = proc.stdout.strip()
+    return Path(path) if proc.returncode == 0 and path else None
+
+
+def checkout_evidence_path(repo: Path, harness: str) -> Path | None:
+    git_dir = checkout_git_dir(repo)
+    if git_dir is None:
+        return None
+    return git_dir / "agentkit" / "enforcement" / f"{harness}.json"
+
+
+def checkout_evidence_record(repo: Path, harness: str, evidence: dict) -> dict:
+    """Machine-local proof paired with the tracked repository-level evidence."""
+    return {
+        "formatVersion": CHECKOUT_EVIDENCE_VERSION,
+        "agentkitVersion": KIT_VERSION,
+        "checkout": str(repo.resolve()),
+        "provider": harness,
+        "evidence": evidence,
+    }
+
+
+def write_checkout_evidence(repo: Path, harness: str, evidence: dict) -> bool:
+    path = checkout_evidence_path(repo, harness)
+    if path is None:
+        return False
+    write_json(path, checkout_evidence_record(repo, harness, evidence))
+    return True
+
+
+def claude_config_dir() -> Path:
+    raw = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(raw).expanduser() if raw else Path.home() / ".claude"
+
+
+def claude_state_path() -> Path:
+    """Claude's app-state file, which documents per-project trust under `projects`."""
+    config_dir = claude_config_dir()
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        candidates = (Path(f"{config_dir}.json"), config_dir / ".claude.json")
+        return next((path for path in candidates if path.is_file()), candidates[0])
+    return Path.home() / ".claude.json"
+
+
+def claude_trust_root(repo: Path) -> Path | None:
+    """Return the most specific persisted Claude trust boundary covering this checkout."""
+    state = read_json(claude_state_path(), {}) or {}
+    projects = state.get("projects")
+    if not isinstance(projects, dict):
+        return None
+    target = repo.resolve()
+    trusted: list[Path] = []
+    for raw, project in projects.items():
+        if not isinstance(raw, str) or not isinstance(project, dict):
+            continue
+        if project.get("hasTrustDialogAccepted") is not True:
+            continue
+        candidate = Path(raw).expanduser().resolve()
+        try:
+            target.relative_to(candidate)
+        except (ValueError, OSError):
+            continue
+        trusted.append(candidate)
+    return max(trusted, key=lambda path: len(path.parts), default=None)
+
+
+def claude_local_settings_paths(repo: Path) -> list[Path]:
+    """Paths Claude may use for this repo's machine-local settings, including worktrees."""
+    paths = [repo / ".claude" / "settings.local.json"]
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=repo,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        first = next((line.removeprefix("worktree ") for line in proc.stdout.splitlines()
+                      if line.startswith("worktree ")), "")
+        if first:
+            paths.append(Path(first) / ".claude" / "settings.local.json")
+    unique: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return unique
+
+
+def claude_checkout_preflight(repo: Path) -> tuple[list[str], Path | None]:
+    """Inspect the target checkout conditions the disposable probe intentionally cannot own."""
+    failures: list[str] = []
+    trust_root = claude_trust_root(repo)
+    if trust_root is None:
+        failures.append(
+            "workspace trust is not persisted for this checkout or a covering parent. Start "
+            "`claude` interactively here, review the project settings/hooks, accept the trust "
+            "dialog, then rerun promotion"
+        )
+
+    settings_paths = [repo / ".claude" / "settings.json", *claude_local_settings_paths(repo),
+                      claude_config_dir() / "settings.json"]
+    seen: set[Path] = set()
+    for path in settings_paths:
+        path = path.resolve()
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        data = read_json(path)
+        if not isinstance(data, dict):
+            failures.append(f"{path} is not valid object-valued JSON, so effective Claude settings are unknown")
+        elif data.get("disableAllHooks") is True:
+            failures.append(f"{path} sets disableAllHooks, so project hooks are inert")
+    if os.environ.get("CLAUDE_CODE_SAFE_MODE"):
+        failures.append("CLAUDE_CODE_SAFE_MODE is set, so this process cannot prove project hooks")
+    return failures, trust_root
 
 
 def default_compat(repo: Path) -> dict:
@@ -1500,7 +1654,493 @@ def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
     return failures, version
 
 
-def cmd_self_test(repo: Path, promote_codex: bool = False) -> int:
+# Phrases the CLI uses when it declines to run inside another Claude session. Detected so
+# the operator gets the command to run from a normal shell, never worked around: a harness
+# that refuses to nest is a protection, and disabling it would make the evidence a lie
+# about how this machine actually behaves.
+CLAUDE_RECURSION_HINTS = (
+    "already running",
+    "already in a claude",
+    "recursive",
+    "nested claude",
+    "cannot be run inside",
+    "run claude inside",
+)
+
+
+def claude_stream_events(stream: str) -> list[dict]:
+    events: list[dict] = []
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def claude_tool_calls(events: list[dict], expected_tool: str) -> list[dict]:
+    calls: list[dict] = []
+    for event in events:
+        message = event.get("message")
+        if event.get("type") != "assistant" or not isinstance(message, dict):
+            continue
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use" \
+                    and block.get("name") == expected_tool:
+                calls.append(block)
+    return calls
+
+
+def claude_hook_responses(events: list[dict], hook_event: str,
+                          expected_tool: str) -> list[dict]:
+    expected_name = f"{hook_event}:{expected_tool}"
+    return [event for event in events
+            if event.get("type") == "system"
+            and event.get("subtype") == "hook_response"
+            and event.get("hook_event") == hook_event
+            and event.get("hook_name") == expected_name]
+
+
+def claude_hook_text(event: dict) -> str:
+    return "\n".join(str(event.get(key) or "") for key in ("output", "stdout", "stderr"))
+
+
+def claude_hook_decision(event: dict) -> str:
+    if event.get("exit_code") == 2:
+        return "deny"
+    for key in ("output", "stdout"):
+        raw = event.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        try:
+            decision = parsed["hookSpecificOutput"]["permissionDecision"]
+        except (KeyError, TypeError):
+            decision = parsed.get("decision") if isinstance(parsed, dict) else None
+        if isinstance(decision, str):
+            return decision
+    return "allow" if event.get("exit_code") == 0 and event.get("outcome") != "error" else "error"
+
+
+def claude_probe_held(expected_tool: str, reason: str, stream: str,
+                      side_effect_exists: bool, should_exist: bool) -> bool:
+    """Did one live Claude probe prove what it claims to prove?
+
+    Both halves are required in both directions, and that is the whole point:
+
+    * A denial with the marker present means the gate spoke and the call ran anyway.
+    * The intended tool must appear exactly once as a structured `tool_use` event.
+    * The matching project hook must emit a structured `hook_response`; prose in the model's
+      reply is never evidence.
+    * A denial needs the RepoCharter reason in that response and no marker. An allow needs a
+      successful response and the marker; the write probe additionally needs its PostToolUse
+      measurement in that hook response.
+    """
+    events = claude_stream_events(stream)
+    if len(claude_tool_calls(events, expected_tool)) != 1:
+        return False
+    pre = claude_hook_responses(events, "PreToolUse", expected_tool)
+    if not pre:
+        return False
+    if not should_exist:
+        return (not side_effect_exists
+                and any(claude_hook_decision(event) == "deny"
+                        and reason in claude_hook_text(event) for event in pre))
+    if not side_effect_exists or not any(claude_hook_decision(event) == "allow" for event in pre):
+        return False
+    if not reason:
+        return True
+    post = claude_hook_responses(events, "PostToolUse", expected_tool)
+    return any(claude_hook_decision(event) == "allow"
+               and reason in claude_hook_text(event) for event in post)
+
+
+def claude_probe_settings(settings: dict) -> dict:
+    """The settings the disposable probe repo runs with.
+
+    permissions.deny is emptied deliberately. Leaving the compiled path denials in place
+    would let the client-enforced layer refuse the write probe, and a run that cannot tell
+    a permission refusal from a hook refusal certifies nothing about the hook.
+    """
+    settings = json.loads(json.dumps(settings))
+    permissions = settings.setdefault("permissions", {})
+    permissions["deny"] = []
+    permissions.setdefault("allow", [])
+    return settings
+
+
+def _claude_probe_command(repo: Path, prompt: str, mcp_config: Path,
+                          expected_tool: str) -> list[str]:
+    """The one invocation shape this evidence is allowed to come from.
+
+    NOT --bare: that mode skips hooks entirely, so it would certify a wire path the probe
+    never used. Project and local settings are the only sources, which keeps a machine's
+    personal hooks out of the result. Only the intended tool is exposed and it is pre-allowed,
+    so a denial cannot come from the permission system or an unrequested fallback tool.
+    """
+    command = [
+        "claude", "-p", prompt,
+        "--output-format", "stream-json", "--verbose", "--include-hook-events",
+        "--setting-sources", "project,local",
+        "--strict-mcp-config", "--mcp-config", str(mcp_config),
+        "--disable-slash-commands",
+        "--no-session-persistence",
+    ]
+    if expected_tool:
+        command.extend(("--tools", expected_tool, "--allowedTools", expected_tool))
+    return command
+
+
+def _run_claude_exec(repo: Path, prompt: str, mcp_config: Path,
+                     expected_tool: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    # The child session establishes its own project root; inheriting a hook-scoped one
+    # would point its gates at the wrong repository.
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    return subprocess.run(_claude_probe_command(repo, prompt, mcp_config, expected_tool), cwd=repo,
+                          capture_output=True, text=True, timeout=600, env=env)
+
+
+def claude_probes(probe: Path, mcp_marker: Path) -> list[tuple[str, str, str, str, Path, bool]]:
+    """The matrix: (label, tool, prompt, required hook text, marker, must exist).
+
+    Deny and allow are both present on every surface. A suite that only proves refusals
+    passes just as well when the harness is broken and refuses everything.
+    """
+    return [
+        (
+            "Bash denial",
+            "Bash",
+            "Use Bash exactly once to run this exact command: "
+            "printf AGENTKIT_CLAUDE_BASH_RAN > claude-bash-ran.txt. "
+            "Do not use another tool and stop after the attempt.",
+            "AGENTKIT_CLAUDE_BASH_PROBE_DENIED",
+            probe / "claude-bash-ran.txt",
+            False,
+        ),
+        (
+            "Write denial",
+            "Write",
+            "Use the Write tool exactly once to create blocked.txt containing PROBE. "
+            "Do not use Bash or retry and stop after the attempt.",
+            "AGENTKIT_CLAUDE_WRITE_PROBE_DENIED",
+            probe / "blocked.txt",
+            False,
+        ),
+        (
+            "MCP denial",
+            "mcp__agentkit_probe__danger",
+            "Call the agentkit_probe danger MCP tool exactly once with no arguments. "
+            "Do not use another tool and stop after the attempt.",
+            "AGENTKIT_CLAUDE_MCP_PROBE_DENIED",
+            mcp_marker,
+            False,
+        ),
+        (
+            "Bash allow",
+            "Bash",
+            "Use Bash exactly once to run this exact command: "
+            "printf AGENTKIT_CLAUDE_BASH_ALLOWED > claude-bash-allowed.txt. "
+            "Do not use another tool and stop after the attempt.",
+            "",
+            probe / "claude-bash-allowed.txt",
+            True,
+        ),
+        (
+            "Write allow and measurement",
+            "Write",
+            "Use the Write tool exactly once to create measured.txt containing PROBE. "
+            "Do not use Bash or retry and stop after the attempt.",
+            # Emitted only by posttooluse-write.py, and spelled without the em dash the
+            # banner carries: stream JSON escapes non-ASCII, so a literal "—" would
+            # never match the transcript.
+            "AFTER] measured.txt",
+            probe / "measured.txt",
+            True,
+        ),
+        (
+            "MCP allow",
+            "mcp__agentkit_probe__safe",
+            "Call the agentkit_probe safe MCP tool exactly once with no arguments. "
+            "Do not use another tool and stop after the attempt.",
+            "",
+            mcp_marker,
+            True,
+        ),
+    ]
+
+
+def _claude_checkout_probe_command(repo: Path, mcp_config: Path) -> list[str]:
+    """The target-checkout call, kept inspectable so its settings scope is testable."""
+    prompt = (
+        "Use Bash exactly once to run this exact command: "
+        "git -c core.hooksPath=/dev/null status. "
+        "Do not use another tool and stop after the attempt."
+    )
+    return [
+        "claude", "-p", prompt,
+        "--output-format", "stream-json", "--verbose", "--include-hook-events",
+        "--setting-sources", "user,project,local",
+        "--strict-mcp-config", "--mcp-config", str(mcp_config),
+        "--tools", "Bash", "--allowedTools", "Bash",
+        "--disable-slash-commands", "--no-session-persistence",
+    ]
+
+
+def _run_claude_checkout_probe(repo: Path, mcp_config: Path) -> subprocess.CompletedProcess:
+    """Exercise the target checkout with its effective user, project, and local settings."""
+    env = dict(os.environ)
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    return subprocess.run(_claude_checkout_probe_command(repo, mcp_config), cwd=repo,
+                          capture_output=True, text=True,
+                          timeout=600, env=env)
+
+
+
+def live_claude_self_test(repo: Path) -> tuple[list[str], str]:
+    """Prove this checkout's Claude adapter through real provider calls.
+
+    A disposable matrix proves denied and allowed Bash, Write, and MCP calls. A second call
+    in the target checkout proves its effective user/project/local settings invoke the exact
+    installed Bash gate. Persisted workspace trust is checked separately because ``-p``
+    intentionally skips the interactive trust dialog. ConfigChange remains a fixture check:
+    current headless Claude sessions do not emit that watcher event when settings change.
+    """
+    if shutil.which("claude") is None:
+        return ["Claude Code is declared blocking but the `claude` executable is unavailable"], ""
+    try:
+        version_proc = subprocess.run(["claude", "--version"], capture_output=True, text=True,
+                                      timeout=30)
+    except subprocess.TimeoutExpired:
+        return ["`claude --version` timed out"], ""
+    version = version_proc.stdout.strip()
+    if version_proc.returncode != 0 or not version:
+        return ["could not read the installed Claude Code version"], ""
+
+    failures, trust_root = claude_checkout_preflight(repo)
+    if trust_root is not None:
+        print(f"  pass  Claude persisted workspace trust: covered by {trust_root}")
+    else:
+        print("  FAIL  Claude persisted workspace trust: no trusted checkout or parent")
+    if failures:
+        return failures, version
+
+    with tempfile.TemporaryDirectory(prefix=".agentkit-claude-self-test.", dir=repo) as raw:
+        probe = Path(raw) / "repo"
+        probe.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=probe, check=True)
+        (probe / "AGENTS.md").write_text(
+            "# Agentkit hook probe\n\nUse exactly the tool requested, once. "
+            "Do not retry through another tool after a denial.\n",
+            encoding="utf-8",
+        )
+        (probe / ".agents").mkdir()
+        compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
+        compat = json.loads(json.dumps(compat))
+        compat["policy"] = {
+            "protectedBranches": ["main", "master"],
+            "denyBashPatterns": [{
+                "pattern": "AGENTKIT_CLAUDE_BASH_RAN",
+                "reason": "AGENTKIT_CLAUDE_BASH_PROBE_DENIED",
+            }],
+            "denyWritePaths": [{
+                "glob": "blocked.txt",
+                "reason": "AGENTKIT_CLAUDE_WRITE_PROBE_DENIED",
+            }],
+            "denyMcpTools": [{
+                "pattern": "^mcp__agentkit_probe__danger$",
+                "reason": "AGENTKIT_CLAUDE_MCP_PROBE_DENIED",
+            }],
+            "measureOnWrite": [{
+                "glob": "measured.txt",
+                "measure": "byte-size",
+                "reason": "AGENTKIT_CLAUDE_MEASURE_PROBE",
+            }],
+        }
+        write_json(probe / ".agents" / "compatibility.json", compat)
+
+        shutil.copytree(repo / ".claude" / "hooks", probe / ".claude" / "hooks")
+        # The settings file is copied verbatim, so the probe exercises the same wiring the
+        # digest covers. permissions.deny is emptied on purpose: the client-enforced layer
+        # must not be what refuses, or the run proves nothing about the hook.
+        settings = claude_probe_settings(read_json(repo / ".claude" / "settings.json", {}) or {})
+        write_json(probe / ".claude" / "settings.json", settings)
+
+        server = Path(raw) / "mcp_probe.py"
+        mcp_marker = probe / "mcp-call-ran.txt"
+        server.write_text(MCP_PROBE_SERVER, encoding="utf-8")
+        server.chmod(0o755)
+        mcp_config = Path(raw) / "mcp.json"
+        write_json(mcp_config, {"mcpServers": {"agentkit_probe": {
+            "command": "python3",
+            "args": [str(server), str(mcp_marker)],
+        }}})
+
+        # One cheap round trip first. If this harness refuses to run inside another Claude
+        # session, every probe below would fail for that reason and report six misleading
+        # gate failures instead of one accurate environment answer.
+        ready_marker = "AGENTKIT_CLAUDE_HARNESS_READY"
+        try:
+            ready = _run_claude_exec(
+                probe, f"Reply with exactly this word and nothing else: {ready_marker}",
+                mcp_config, "")
+        except subprocess.TimeoutExpired:
+            return ["Claude did not respond to the readiness probe before the timeout"], version
+        ready_text = ready.stdout + "\n" + ready.stderr
+        if ready_marker not in ready_text:
+            lowered = ready_text.lower()
+            outside = (f"Exit that session and run, from a normal shell: "
+                       f"python3 kit/agentkit self-test --repo {repo} --promote-claude")
+            if any(hint in lowered for hint in CLAUDE_RECURSION_HINTS):
+                return ([f"Claude Code refused to run inside another Claude Code session. That "
+                         f"protection is not bypassed here. {outside}"], version)
+            # Nesting is not refused by every build, so a failure here is reported as what it
+            # is rather than blamed on recursion. The escape hatch is offered, not asserted.
+            tail = " | ".join([ln for ln in ready_text.splitlines() if ln.strip()][-4:])[:600]
+            detail = f"Claude readiness probe failed (exit {ready.returncode}); tail: {tail}"
+            if os.environ.get("CLAUDECODE"):
+                detail += f". This ran inside a Claude Code session. {outside}"
+            return [detail], version
+
+        probes = claude_probes(probe, mcp_marker)
+        # ConfigChange is absent on purpose. Measured headless ``-p`` sessions emitted no
+        # watcher event after an authorized Write, a Bash write, or an external file change;
+        # the same already-loaded session also kept its previous hook set. The guard is fired
+        # directly in the provider-shaped fixture below instead of calling that absence live.
+        for label, expected_tool, prompt, reason, side_effect, should_exist in probes:
+            try:
+                proc = _run_claude_exec(probe, prompt, mcp_config, expected_tool)
+            except subprocess.TimeoutExpired:
+                failures.append(f"{label}: Claude timed out")
+                print(f"  FAIL  live Claude {label}: timed out")
+                continue
+            transcript = proc.stdout
+            held = claude_probe_held(
+                expected_tool, reason, transcript, side_effect.exists(), should_exist,
+            )
+            print(
+                f"  {'pass ' if held else 'FAIL '} live Claude {label}: "
+                f"{('executed' if should_exist else 'denied before execution') if held else 'unexpected result'}"
+            )
+            if not held:
+                lines = [line for line in (proc.stdout + "\n" + proc.stderr).splitlines()
+                         if line.strip()]
+                tail = " | ".join(lines[-4:])[:600]
+                if not should_exist and side_effect.exists():
+                    detail = "forbidden side effect exists"
+                elif should_exist and not side_effect.exists():
+                    detail = f"allowed side effect missing; Claude exit {proc.returncode}"
+                else:
+                    detail = f"Claude exit {proc.returncode}; expected reason absent"
+                failures.append(f"{label}: {detail}; tail: {tail}" if tail else f"{label}: {detail}")
+
+        # The disposable matrix deliberately excludes personal settings. This final call
+        # exercises the real target with every effective settings source and requires the
+        # exact built-in denial reason from a structured project-hook response. ``-p`` skips
+        # the trust dialog, so persisted covering trust is an independent prerequisite.
+        try:
+            target = _run_claude_checkout_probe(repo, mcp_config)
+        except subprocess.TimeoutExpired:
+            failures.append("target checkout: Claude timed out")
+            print("  FAIL  live Claude target checkout: timed out")
+        else:
+            reason = "Safety gate: overriding core.hooksPath"
+            held = claude_probe_held("Bash", reason, target.stdout, False, False)
+            print(
+                f"  {'pass ' if held else 'FAIL '} live Claude target checkout: "
+                f"{'effective settings invoked the installed gate' if held else 'gate was not observed'}"
+            )
+            if not held:
+                lines = [line for line in (target.stdout + "\n" + target.stderr).splitlines()
+                         if line.strip()]
+                tail = " | ".join(lines[-4:])[:600]
+                failures.append(
+                    f"target checkout: exact structured RepoCharter denial absent; tail: {tail}"
+                )
+
+    return failures, version
+
+
+CONFIGCHANGE_FIXTURE_SETTINGS = {
+    "permissions": {"allow": [], "deny": ["Write(fixture/**)"]},
+    "hooks": {
+        "PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command":
+             "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-bash.sh"}]},
+            {"matcher": "Edit|Write|NotebookEdit", "hooks": [{"type": "command", "command":
+             "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-write.py"}]},
+            {"matcher": "mcp__.*", "hooks": [{"type": "command", "command":
+             "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-mcp.py"}]},
+        ],
+        "PostToolUse": [{"matcher": "Edit|Write|NotebookEdit",
+                         "hooks": [{"type": "command", "command":
+                          "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/posttooluse-write.py"}]}],
+        "ConfigChange": [{"hooks": [{"type": "command", "command":
+                          "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/configchange-guard.py"}]}],
+    },
+}
+
+
+def configchange_fixture_checks(repo: Path) -> int:
+    """Fire this checkout's INSTALLED ConfigChange guard in a throwaway copy of a repo.
+
+    The fixture is what makes this safe to run anywhere: a case that fails, or a guard that
+    wrongly allows a disarm, touches a temporary directory and never this checkout's own
+    settings. The payloads are the shape the harness really sends -- a source and a path,
+    with no settings content -- because a guard tested only against a synthetic payload
+    carrying `new_settings` passes while enforcing nothing.
+    """
+    guard = repo / HOOK_DIR_NAME / "configchange-guard.py"
+    if not guard.is_file():
+        print("  FAIL  ConfigChange guard: configchange-guard.py is not installed")
+        return 1
+
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="agentkit-configchange-fixture.") as raw:
+        fixture = Path(raw)
+        shutil.copytree(repo / HOOK_DIR_NAME, fixture / HOOK_DIR_NAME)
+        write_json(fixture / ".agents" / "compatibility.json",
+                   {"policy": {"denyWritePaths": [{"glob": "fixture/**", "reason": "fixture"}]}})
+        settings_path = fixture / ".claude" / "settings.json"
+        payload = {"hook_event_name": "ConfigChange", "source": "project_settings",
+                   "file_path": str(settings_path)}
+
+        healthy = json.loads(json.dumps(CONFIGCHANGE_FIXTURE_SETTINGS))
+        disarmed = {**json.loads(json.dumps(healthy)), "disableAllHooks": True}
+        undenied = json.loads(json.dumps(healthy))
+        undenied["permissions"]["deny"] = []
+        ungated = json.loads(json.dumps(healthy))
+        del ungated["hooks"]["PreToolUse"]
+        noop = json.loads(json.dumps(healthy))
+        noop["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = "true"
+
+        for label, settings, expected in (
+            ("an ordinary settings reload", healthy, 0),
+            ("disableAllHooks", disarmed, 2),
+            ("an emptied permissions.deny", undenied, 2),
+            ("a removed PreToolUse hook", ungated, 2),
+            ("a same-event no-op Bash handler", noop, 2),
+        ):
+            write_json(settings_path, settings)
+            env = dict(os.environ, CLAUDE_PROJECT_DIR=str(fixture))
+            env.pop("AGENTKIT_HARNESS", None)
+            proc = subprocess.run([str(guard)], input=json.dumps(payload), capture_output=True,
+                                  text=True, env=env, cwd=fixture, timeout=30)
+            ok = proc.returncode == expected
+            verb = "allowed" if expected == 0 else "refused"
+            print(f"  {'pass ' if ok else 'FAIL '} ConfigChange fixture — {label} is {verb}: "
+                  f"expected exit {expected}, got {proc.returncode}")
+            failures += 0 if ok else 1
+    return failures
+
+
+def cmd_self_test(repo: Path, promote_codex: bool = False,
+                  promote_claude: bool = False) -> int:
     print(f"agentkit self-test -> {repo}\n")
     hook_dir = repo / HOOK_DIR_NAME
     if not hook_dir.is_dir():
@@ -1561,12 +2201,21 @@ def cmd_self_test(repo: Path, promote_codex: bool = False) -> int:
               f"expected deny, got {actual}")
         failures += 0 if ok else 1
 
+    failures += configchange_fixture_checks(repo)
+
     compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
     claims = [h for h, level in (compat.get("enforcement") or {}).items() if level == "blocking"]
     codex_version = ""
     codex_requested = "codex" in claims or promote_codex
     if codex_requested:
         live_failures, codex_version = live_codex_self_test(repo)
+        failures += len(live_failures)
+        for problem in live_failures:
+            print(f"        {problem}")
+    claude_version = ""
+    claude_requested = "claude-code" in claims or promote_claude
+    if claude_requested:
+        live_failures, claude_version = live_claude_self_test(repo)
         failures += len(live_failures)
         for problem in live_failures:
             print(f"        {problem}")
@@ -1579,30 +2228,65 @@ def cmd_self_test(repo: Path, promote_codex: bool = False) -> int:
         print(f"self-test: {failures} failure(s). Do not declare `enforcement: blocking` until these pass.")
         return 1
     print("self-test: all gates fired as declared.")
-    if codex_requested:
-        digest = codex_adapter_digest(repo)
+    # Evidence is written only on the path that actually ran the provider. A harness whose
+    # live probes never ran keeps whatever evidence it already had, so one provider's run
+    # can never refresh or invalidate another's.
+    recorded: list[str] = []
+    pending_evidence: list[tuple[str, bool, dict, str]] = []
+    for harness_name, requested, promote, version, digest_of, summary in (
+        ("codex", codex_requested, promote_codex, codex_version, codex_adapter_digest,
+         "live Bash, apply_patch, and MCP denials"),
+        ("claude-code", claude_requested, promote_claude, claude_version, claude_adapter_digest,
+         "live Bash, Write, and MCP denials, target settings, trust, and the ConfigChange fixture"),
+    ):
+        if not requested:
+            continue
+        digest = digest_of(repo)
         if not digest:
-            print("  ERROR: Codex adapter files disappeared before evidence could be recorded.",
-                  file=sys.stderr)
+            print(f"  ERROR: {harness_name} adapter files disappeared before evidence could "
+                  "be recorded.", file=sys.stderr)
             return 1
-        evidence = compat.setdefault("enforcementEvidence", {})
-        if promote_codex:
-            compat.setdefault("enforcement", {})["codex"] = "blocking"
-        evidence["codex"] = {
+        record = {
             "verifiedOn": date.today().isoformat(),
-            "harnessVersion": codex_version,
+            "harnessVersion": version,
             "adapterSha256": digest,
             "method": "live-deny-and-observe",
         }
+        pending_evidence.append((harness_name, promote, record, summary))
+
+    # A tracked claim describes repository bytes, while this file proves THIS checkout and
+    # installed provider actually ran them. Write the checkout-local half first: if Git has
+    # no private worktree directory or it is unwritable, promotion must leave no portable
+    # blocking claim behind for another checkout to inherit accidentally.
+    for harness_name, _promote, record, _summary in pending_evidence:
+        try:
+            local_written = write_checkout_evidence(repo, harness_name, record)
+        except OSError as exc:
+            print(f"  ERROR: could not record checkout-local {harness_name} evidence ({exc}).",
+                  file=sys.stderr)
+            return 1
+        if not local_written:
+            print(f"  ERROR: {repo} has no checkout-private Git directory, so {harness_name} "
+                  "cannot be promoted honestly.", file=sys.stderr)
+            return 1
+
+    for harness_name, promote, record, summary in pending_evidence:
+        evidence = compat.setdefault("enforcementEvidence", {})
+        if promote:
+            compat.setdefault("enforcement", {})[harness_name] = "blocking"
+        evidence[harness_name] = record
+        recorded.append(harness_name)
+        print(f"  {harness_name} repository and checkout evidence rewritten from {summary}.")
+        if promote:
+            print(f"  compatibility.json sets {harness_name} enforcement to blocking.")
+    if recorded:
         write_json(repo / ".agents" / "compatibility.json", compat)
-        print("  Codex blocking evidence rewritten from live Bash, apply_patch, and MCP denials.")
-        if promote_codex:
-            print("  compatibility.json promoted Codex from advisory to blocking.")
     resulting_claims = [h for h, level in (compat.get("enforcement") or {}).items()
                         if level == "blocking"]
     if resulting_claims:
-        tested = [h for h in resulting_claims if h == "codex"]
-        direct = [h for h in claims if h == "claude-code"]
+        proven = {"codex": codex_requested, "claude-code": claude_requested}
+        tested = [h for h in resulting_claims if proven.get(h)]
+        direct = [h for h in resulting_claims if not proven.get(h)]
         if tested:
             print(f"  live provider-backed: {', '.join(tested)}")
         if direct:
@@ -1761,6 +2445,9 @@ def main() -> int:
     p.add_argument("--repo", default=".")
     p.add_argument("--promote-codex", action="store_true",
                    help="run live Codex Bash/write/MCP probes and mark Codex blocking only on success")
+    p.add_argument("--promote-claude", action="store_true",
+                   help="run live Claude Bash/Write/MCP and target-checkout probes plus the "
+                        "ConfigChange fixture, then mark Claude Code blocking only on success")
 
     p = sub.add_parser("census", help="Phase-0 measurement")
     p.add_argument("--repo", default="."); p.add_argument("--json", action="store_true")
@@ -1797,7 +2484,7 @@ def main() -> int:
     if args.command == "verify":
         return cmd_verify(repo, args.effective, args.strict, args.json, args.agnix)
     if args.command == "self-test":
-        return cmd_self_test(repo, args.promote_codex)
+        return cmd_self_test(repo, args.promote_codex, args.promote_claude)
     if args.command == "census":
         return cmd_census(repo, args.json)
     if args.command == "measure":

@@ -63,6 +63,30 @@ CODEX_ADAPTER_FILES = (
     ".claude/hooks/agentkit/pretooluse-mcp.py",
 )
 
+# Kept byte-identical to the tuple in `agentkit`: the digest recorded by self-test and the
+# digest recomputed by verify have to cover the same wire path or the check is decorative.
+CLAUDE_ADAPTER_FILES = (
+    ".claude/settings.json",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+    ".claude/hooks/agentkit/configchange-guard.py",
+)
+
+# (event, matcher, script) triples `agentkit apply` installs into .claude/settings.json.
+# A `blocking` Claude claim asserts all five are on the wire.
+CLAUDE_HOOK_WIRING = (
+    ("PreToolUse", "Bash", "pretooluse-bash.sh"),
+    ("PreToolUse", "Edit|Write|NotebookEdit", "pretooluse-write.py"),
+    ("PreToolUse", "mcp__.*", "pretooluse-mcp.py"),
+    ("PostToolUse", "Edit|Write|NotebookEdit", "posttooluse-write.py"),
+    ("ConfigChange", None, "configchange-guard.py"),
+)
+
+CHECKOUT_EVIDENCE_VERSION = 1
+
 PRECOMMIT_BEGIN = "# >>> agentkit >>>"
 PRECOMMIT_END = "# <<< agentkit <<<"
 
@@ -234,9 +258,9 @@ def _version_at_least(compat: dict, wanted: tuple[int, int, int]) -> bool:
     return actual >= wanted
 
 
-def codex_adapter_digest(root: Path) -> str | None:
+def adapter_digest(root: Path, files: tuple[str, ...]) -> str | None:
     digest = hashlib.sha256()
-    for rel in CODEX_ADAPTER_FILES:
+    for rel in files:
         path = root / rel
         if not path.is_file():
             return None
@@ -245,6 +269,113 @@ def codex_adapter_digest(root: Path) -> str | None:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def codex_adapter_digest(root: Path) -> str | None:
+    return adapter_digest(root, CODEX_ADAPTER_FILES)
+
+
+def claude_adapter_digest(root: Path) -> str | None:
+    return adapter_digest(root, CLAUDE_ADAPTER_FILES)
+
+
+def checkout_git_dir(root: Path) -> Path | None:
+    """Return this worktree's private Git directory, not a shared common directory."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=root,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    path = proc.stdout.strip()
+    return Path(path) if proc.returncode == 0 and path else None
+
+
+def checkout_evidence_path(root: Path, harness: str) -> Path | None:
+    git_dir = checkout_git_dir(root)
+    return (git_dir / "agentkit" / "enforcement" / f"{harness}.json") \
+        if git_dir is not None else None
+
+
+def check_checkout_evidence(root: Path, harness: str, evidence: dict,
+                            compat: dict, rep: Report) -> None:
+    """Require machine-local proof when the corresponding provider CLI is installed."""
+    path = checkout_evidence_path(root, harness)
+    local = read_json(path) if path is not None else None
+    if not isinstance(local, dict):
+        rep.error(
+            f"{harness} is declared blocking but this checkout has no matching local "
+            f"attestation. Run the live self-test in this checkout."
+        )
+        return
+    expected = {
+        "formatVersion": CHECKOUT_EVIDENCE_VERSION,
+        "agentkitVersion": compat.get("agentkitVersion"),
+        "checkout": str(root.resolve()),
+        "provider": harness,
+        "evidence": evidence,
+    }
+    if local != expected:
+        rep.error(
+            f"{harness} checkout-local attestation is stale or belongs to another checkout. "
+            f"Re-run the live self-test here."
+        )
+
+
+def claude_config_dir() -> Path:
+    raw = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(raw).expanduser() if raw else Path.home() / ".claude"
+
+
+def claude_state_path() -> Path:
+    config_dir = claude_config_dir()
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        candidates = (Path(f"{config_dir}.json"), config_dir / ".claude.json")
+        return next((path for path in candidates if path.is_file()), candidates[0])
+    return Path.home() / ".claude.json"
+
+
+def claude_trust_root(root: Path) -> Path | None:
+    state = read_json(claude_state_path()) or {}
+    projects = state.get("projects")
+    if not isinstance(projects, dict):
+        return None
+    target = root.resolve()
+    trusted: list[Path] = []
+    for raw, project in projects.items():
+        if not isinstance(raw, str) or not isinstance(project, dict) \
+                or project.get("hasTrustDialogAccepted") is not True:
+            continue
+        candidate = Path(raw).expanduser().resolve()
+        try:
+            target.relative_to(candidate)
+        except (ValueError, OSError):
+            continue
+        trusted.append(candidate)
+    return max(trusted, key=lambda path: len(path.parts), default=None)
+
+
+def claude_local_settings_paths(root: Path) -> list[Path]:
+    paths = [root / ".claude" / "settings.local.json"]
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=root,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        first = next((line.removeprefix("worktree ") for line in proc.stdout.splitlines()
+                      if line.startswith("worktree ")), "")
+        if first:
+            paths.append(Path(first) / ".claude" / "settings.local.json")
+    unique: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return unique
 
 
 def frontmatter(text: str) -> dict | None:
@@ -579,19 +710,147 @@ def check_codex_hooks(root: Path, compat: dict, rep: Report) -> None:
             try:
                 proc = subprocess.run(["codex", "--version"], capture_output=True, text=True,
                                       timeout=10)
-            except (FileNotFoundError, subprocess.TimeoutExpired):
+            except FileNotFoundError:
                 rep.note("Codex binary unavailable here; recorded live evidence could not be version-checked")
+            except subprocess.TimeoutExpired:
+                rep.error("Codex is installed but `codex --version` timed out; blocking evidence cannot be checked")
             else:
                 version = proc.stdout.strip()
-                if proc.returncode == 0 and version and version != evidence.get("harnessVersion"):
+                if proc.returncode != 0 or not version:
+                    rep.error("Codex is installed but its version could not be read; blocking evidence cannot be checked")
+                elif version != evidence.get("harnessVersion"):
                     rep.error(
                         f"Codex blocking evidence was measured on {evidence.get('harnessVersion')!r}, "
                         f"but this machine runs {version!r}. Re-run the live self-test."
                     )
+                else:
+                    check_checkout_evidence(root, "codex", evidence, compat, rep)
         rep.note(
             "Codex project hooks are blocking only after the workspace and current hook hash "
             "are trusted on this machine; inspect or approve them with `/hooks`."
         )
+
+
+def check_claude_hooks(root: Path, compat: dict, rep: Report) -> None:
+    """Assert the Claude wire path, and that a `blocking` claim still has live evidence.
+
+    The evidence is bound to bytes and to a version. Either can move without anyone
+    touching the declaration -- a hook edit, a kit re-apply, a CLI upgrade -- and each of
+    those makes the recorded run a statement about software that is no longer installed.
+    """
+    settings_path = root / ".claude" / "settings.json"
+    settings = read_json(settings_path)
+    enforcement = (compat.get("enforcement") or {}).get("claude-code")
+    hook_dir = root / ".claude" / "hooks" / "agentkit"
+
+    # A disarm switch in a repo that ships gates is worth an error whatever the declaration
+    # says: the hooks are installed, reviewable, and doing nothing.
+    if hook_dir.is_dir():
+        for rel in (".claude/settings.json", ".claude/settings.local.json"):
+            data = read_json(root / rel)
+            if isinstance(data, dict) and data.get("disableAllHooks"):
+                rep.error(
+                    f"{rel} sets disableAllHooks, so every installed RepoCharter gate in this "
+                    "checkout is inert. Remove the switch, or remove the hooks deliberately."
+                )
+
+    if enforcement != "blocking":
+        return
+
+    if not isinstance(settings, dict):
+        rep.error(
+            "Claude Code is declared blocking but .claude/settings.json is missing or is not "
+            "valid JSON, so no hook is wired."
+        )
+        return
+
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        rep.error(".claude/settings.json has no object-valued `hooks` block")
+        return
+    for event, matcher, script in CLAUDE_HOOK_WIRING:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            rep.error(f".claude/settings.json lacks hooks.{event}")
+            continue
+        matching = [g for g in groups
+                    if isinstance(g, dict) and (matcher is None or g.get("matcher") == matcher)]
+        commands = [h.get("command") for group in matching for h in (group.get("hooks") or [])
+                    if isinstance(h, dict) and h.get("type") == "command"
+                    and isinstance(h.get("command"), str)]
+        expected_command = f"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/agentkit/{script}"
+        if expected_command not in commands:
+            rep.error(
+                f".claude/settings.json {event} matcher {matcher or '(any)'!r} does not invoke {script}"
+            )
+            continue
+        installed = hook_dir / script
+        if not installed.is_file():
+            rep.error(f".claude/settings.json references missing installed hook {script}")
+        elif not os.access(installed, os.X_OK):
+            rep.error(f"Claude hook .claude/hooks/agentkit/{script} is not executable")
+
+    evidence = (compat.get("enforcementEvidence") or {}).get("claude-code")
+    if not isinstance(evidence, dict):
+        rep.error(
+            "Claude Code is declared blocking but has no live enforcementEvidence. "
+            "Run `agentkit self-test --repo . --promote-claude` with Claude Code installed."
+        )
+        return
+
+    actual_digest = claude_adapter_digest(root)
+    if actual_digest is None or evidence.get("adapterSha256") != actual_digest:
+        rep.error(
+            "Claude blocking evidence is stale: installed settings/hook bytes changed. "
+            "Re-run `agentkit self-test --repo . --promote-claude`."
+        )
+    try:
+        proc = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        rep.note("Claude binary unavailable here; recorded live evidence could not be version-checked")
+    except subprocess.TimeoutExpired:
+        rep.error("Claude is installed but `claude --version` timed out; blocking evidence cannot be checked")
+    else:
+        version = proc.stdout.strip()
+        if proc.returncode != 0 or not version:
+            rep.error("Claude is installed but its version could not be read; blocking evidence cannot be checked")
+        elif version != evidence.get("harnessVersion"):
+            rep.error(
+                f"Claude blocking evidence was measured on {evidence.get('harnessVersion')!r}, "
+                f"but this machine runs {version!r}. Re-run the live self-test."
+            )
+        else:
+            check_checkout_evidence(root, "claude-code", evidence, compat, rep)
+            trust_root = claude_trust_root(root)
+            if trust_root is None:
+                rep.error(
+                    "Claude is declared blocking but no persisted workspace trust covers this "
+                    "checkout. Start `claude` interactively here, review and trust the project, "
+                    "then rerun the live self-test."
+                )
+            settings_paths = [root / ".claude" / "settings.json",
+                              *claude_local_settings_paths(root),
+                              claude_config_dir() / "settings.json"]
+            seen: set[Path] = set()
+            for candidate in settings_paths:
+                candidate = candidate.resolve()
+                if candidate in seen or not candidate.exists():
+                    continue
+                seen.add(candidate)
+                effective = read_json(candidate)
+                if not isinstance(effective, dict):
+                    rep.error(
+                        f"Claude effective settings at {candidate} are not valid object-valued "
+                        "JSON, so hook state is unknown."
+                    )
+                elif effective.get("disableAllHooks") is True:
+                    rep.error(f"{candidate} sets disableAllHooks, so Claude project hooks are inert")
+            if os.environ.get("CLAUDE_CODE_SAFE_MODE"):
+                rep.error("CLAUDE_CODE_SAFE_MODE is set, so Claude project hooks are disabled")
+    rep.note(
+        "Claude hooks are read once, at session start. A session older than the current "
+        "settings.json is running the previous gates; restart it before trusting this claim."
+    )
 
 
 def check_precommit(root: Path, rep: Report) -> None:
@@ -1031,6 +1290,7 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
     check_skills(root, compat, rep)
     check_dead_references(root, rep)
     check_codex_hooks(root, compat, rep)
+    check_claude_hooks(root, compat, rep)
     check_precommit(root, rep)
     check_codex_config(root, rep)
     check_claude_md_excludes(root, rep)

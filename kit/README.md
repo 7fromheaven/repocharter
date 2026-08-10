@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
 `agentkit` name so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 237 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 300 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -41,7 +41,7 @@ and fill it in yourself.
 |---|---|---|---|
 | Core | `census` | measures startup context and existing configuration before anything changes | 0 |
 | Core | `apply` | installs the mechanical layer, idempotently (`--dry-run`) | 0 / 2 |
-| Core | `self-test` | fires forbidden and benign calls at installed hooks; `--promote-codex` requires live persisted-trust proof | 0 / 1 |
+| Core | `self-test` | fires forbidden and benign calls; provider promotion also proves target trust/settings and writes checkout-local evidence | 0 / 1 |
 | Core | `measure` | fires repository-declared policy and reports enforced, broken, or unmeasured rules | 0 / 1 |
 | Core | `verify` | runs checked-in schema, adapter, budget, residue, and validation checks; `--agnix` is optional | 0 / 1 |
 | Team | `fleet` | runs stage + census for every repo under a root, in one table | 0 |
@@ -63,6 +63,8 @@ kit/agentkit verify  --repo ~/dev/foo              # check the installed system
 # Under Codex: restart, review/trust /hooks, then:
 kit/agentkit self-test --repo ~/dev/foo --promote-codex
 kit/agentkit verify --repo ~/dev/foo --effective
+# Under Claude Code: restart, establish interactive workspace trust, then:
+kit/agentkit self-test --repo ~/dev/foo --promote-claude
 ```
 
 ### Only when replacing a supported legacy system
@@ -158,6 +160,27 @@ and installed CLI version only after Bash, `apply_patch`, and MCP are denied thr
 and an ordinary no-bypass run proves that project trust persists. Open `/hooks` after installation
 or any adapter change; a temporary trust override proves code paths, not operational enforcement.
 
+For Claude Code, `--promote-claude` drives the real `claude` executable in a disposable repository
+with project and local settings loaded — never `--bare`, which skips hooks and would certify a wire
+path the probe never used. The intended tool call and matching `hook_response` must appear in
+structured event output. Every probe tool is pre-allowed and the probe repo's `permissions.deny`
+is emptied, so a native permission refusal cannot be mistaken for the gate. Bash, Write and MCP are
+each proved in both directions, and the allowed write must also show its post-write response and
+measurement. Promotion separately requires persisted trust covering the target and runs a second
+probe with that checkout's effective user, project, and local settings.
+
+ConfigChange is not scored as a live event. Default permission mode may refuse writes before the
+hook, but bypass-authorized writes are possible; the measured limitation is that headless `-p`
+sessions emitted no watcher event after authorized Write, Bash, or external settings mutations. The
+guard is fired directly in a throwaway fixture against the provider-shaped source/path payload and
+the exact five handler mappings. Effective settings are inspected separately for disarm switches.
+
+`verify` re-derives each recorded adapter hash and re-reads the installed provider version. When a
+provider CLI is present, it also requires an exact checkout-local record under the worktree's
+absolute Git directory. A clone, sibling worktree, edited gate, upgraded CLI, or changed RepoCharter
+version therefore cannot inherit yesterday's machine claim. Provider-neutral CI without that CLI
+still performs portable byte checks and reports the unavailable provider check as a note.
+
 ## The gates
 
 | Policy surface | Claude Code | Codex | Enforces |
@@ -166,7 +189,7 @@ or any adapter change; a temporary trust override proves code paths, not operati
 | Writes | `Edit\|Write\|NotebookEdit` | `apply_patch` | `denyWritePaths`; Codex parses every path in a multi-file patch |
 | MCP | `mcp__.*` | `mcp__.*` | `denyMcpTools`, narrowable by argument |
 | Post-write | `Edit\|Write` | `apply_patch` | takes the after-measurement and reports the delta |
-| Config | `ConfigChange` | write guard on `.codex/hooks.json` and `.codex/config.toml` | refuses local hook disablement |
+| Config | `ConfigChange` | write guard on `.codex/hooks.json` and `.codex/config.toml` | refuses a settings reload that sets `disableAllHooks`, changes any exact kit handler mapping, or empties a declared `permissions.deny` |
 
 Codex does not support an interactive `ask` decision in `PreToolUse`. In an approval-capable turn,
 the adapter labels the call as confirmation-required and hands it to Codex's native permission
@@ -216,7 +239,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-237 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+300 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI
