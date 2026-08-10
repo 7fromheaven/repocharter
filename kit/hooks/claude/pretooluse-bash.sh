@@ -115,6 +115,193 @@ emit_pending_ask() {
   exit 0
 }
 
+# CSEP is intentionally a small shell recognizer rather than a full parser. Before its
+# regexes run, hide separators that the shell treats as literal data because they are
+# quoted or backslash-escaped. Keep nested shell contexts active: separators inside
+# `$(...)`, backticks, or a recognized shell's `-c` argument still delimit real commands.
+SHELL_C_PREFIX='(^|[;&|][[:space:]]*|\$\([[:space:]]*)((env|command|sudo)[[:space:]]+)?([^;&|[:space:]]*/)?(ba|da|z|k)?sh[[:space:]]+-[A-Za-z]*c[A-Za-z]*[[:space:]]*$'
+is_shell_c_prefix() {
+  printf '%s' "$1" | grep -qE "$SHELL_C_PREFIX"
+}
+
+mask_literal_separators() {
+  local text="$1" out="" state ch next current_depth
+  local i=0 top=0 length="${#1}"
+  local -a states depths
+  states[0]="shell"
+  depths[0]=0
+
+  while (( i < length )); do
+    state="${states[$top]}"
+    ch="${text:i:1}"
+    next=""
+    if (( i + 1 < length )); then
+      next="${text:$((i + 1)):1}"
+    fi
+
+    if [ "$state" = "single" ]; then
+      if [ "$ch" = "'" ]; then
+        out="${out}${ch}"
+        top=$((top - 1))
+      else
+        case "$ch" in
+          ';'|'&'|'|') out="${out}_" ;;
+          $'\n') out="${out}"$'\n'"_" ;;
+          *) out="${out}${ch}" ;;
+        esac
+      fi
+      i=$((i + 1))
+      continue
+    fi
+
+    if [ "$state" = "script_single" ] && [ "$ch" = "'" ]; then
+      out="${out})"
+      top=$((top - 1))
+      i=$((i + 1))
+      continue
+    fi
+
+    if [ "$state" = "script_double" ] && [ "$ch" = '"' ]; then
+      out="${out})"
+      top=$((top - 1))
+      i=$((i + 1))
+      continue
+    fi
+
+    # In a double-quoted `sh -c` argument, \" survives the outer shell as an actual
+    # quote in the nested script. Track those pairs as the nested shell's own quoted
+    # data so separators between them do not become commands.
+    if [ "$state" = "script_double" ] && [ "$ch" = "\\" ] && [ "$next" = '"' ]; then
+      out="${out}${next}"
+      top=$((top + 1))
+      states[$top]="script_inner_double"
+      depths[$top]=0
+      i=$((i + 2))
+      continue
+    fi
+    if [ "$state" = "script_inner_double" ] && [ "$ch" = "\\" ] && [ "$next" = '"' ]; then
+      out="${out}${next}"
+      top=$((top - 1))
+      i=$((i + 2))
+      continue
+    fi
+
+    # Outside single quotes, a backslash makes the next character literal. Mask an
+    # escaped separator (or continued newline) so CSEP cannot promote it to syntax.
+    if [ "$ch" = "\\" ]; then
+      if [ -n "$next" ]; then
+        case "$next" in
+          $'\n') ;;
+          ';'|'&'|'|') out="${out}${ch}_" ;;
+          *) out="${out}${ch}${next}" ;;
+        esac
+        i=$((i + 2))
+      else
+        out="${out}${ch}"
+        i=$((i + 1))
+      fi
+      continue
+    fi
+
+    if [ "$state" = "double" ] || [ "$state" = "script_inner_double" ]; then
+      if [ "$state" = "double" ] && [ "$ch" = '"' ]; then
+        out="${out}${ch}"
+        top=$((top - 1))
+      elif [ "$ch" = '$' ] && [ "$next" = '(' ]; then
+        out="${out}${ch}${next}"
+        top=$((top + 1))
+        states[$top]="command"
+        depths[$top]=1
+        i=$((i + 1))
+      elif [ "$ch" = '`' ]; then
+        out="${out}\$("
+        top=$((top + 1))
+        states[$top]="backtick"
+        depths[$top]=0
+      else
+        case "$ch" in
+          ';'|'&'|'|') out="${out}_" ;;
+          $'\n') out="${out}"$'\n'"_" ;;
+          *) out="${out}${ch}" ;;
+        esac
+      fi
+      i=$((i + 1))
+      continue
+    fi
+
+    if [ "$state" = "backtick" ] && [ "$ch" = '`' ]; then
+      out="${out})"
+      top=$((top - 1))
+      i=$((i + 1))
+      continue
+    fi
+
+    if [ "$state" = "command" ]; then
+      if [ "$ch" = '(' ]; then
+        current_depth="${depths[$top]}"
+        depths[$top]=$((current_depth + 1))
+        out="${out}${ch}"
+        i=$((i + 1))
+        continue
+      fi
+      if [ "$ch" = ')' ]; then
+        current_depth=$(( ${depths[$top]} - 1 ))
+        depths[$top]="$current_depth"
+        out="${out}${ch}"
+        if (( current_depth == 0 )); then
+          top=$((top - 1))
+        fi
+        i=$((i + 1))
+        continue
+      fi
+    fi
+
+    case "$ch" in
+      "'")
+        top=$((top + 1))
+        if is_shell_c_prefix "$out"; then
+          out="${out}\$("
+          states[$top]="script_single"
+        else
+          out="${out}${ch}"
+          states[$top]="single"
+        fi
+        depths[$top]=0 ;;
+      '"')
+        top=$((top + 1))
+        if is_shell_c_prefix "$out"; then
+          out="${out}\$("
+          states[$top]="script_double"
+        else
+          out="${out}${ch}"
+          states[$top]="double"
+        fi
+        depths[$top]=0 ;;
+      '`')
+        out="${out}\$("
+        top=$((top + 1))
+        states[$top]="backtick"
+        depths[$top]=0 ;;
+      '$')
+        if [ "$next" = '(' ]; then
+          out="${out}${ch}${next}"
+          top=$((top + 1))
+          states[$top]="command"
+          depths[$top]=1
+          i=$((i + 1))
+        else
+          out="${out}${ch}"
+        fi ;;
+      *) out="${out}${ch}" ;;
+    esac
+    i=$((i + 1))
+  done
+
+  printf '%s' "$out"
+}
+
+CMD_MATCH=$(mask_literal_separators "$CMD")
+
 # Command-position anchor (+ optional inline env-var assignments). POSIX-portable.
 CSEP='(^[[:space:]]*|[;&|][[:space:]]*|\$\([[:space:]]*)([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+ +)*'
 
@@ -214,7 +401,7 @@ if [ -z "$PROTECTED" ] && [ -f "$COMPAT" ]; then
   fi
 fi
 PROTECTED="(${PROTECTED:-main|master})"
-PUSH_LINES=$(echo "$CMD" | grep -E "${GIT}push([^[:alnum:]_]|$)" | grep -E "(^|[^[:alnum:]_])${PROTECTED}([^[:alnum:]_]|$)" || true)
+PUSH_LINES=$(echo "$CMD_MATCH" | grep -E "${GIT}push([^[:alnum:]_]|$)" | grep -E "(^|[^[:alnum:]_])${PROTECTED}([^[:alnum:]_]|$)" || true)
 if [[ -n $PUSH_LINES ]]; then
   if echo "$PUSH_LINES" | grep -qE -- '--force([^[:alnum:]_]|$)|(^|[[:space:]])-f([^[:alnum:]_]|$)'; then
     block "Safety gate: git push --force to a protected branch ${PROTECTED} is BLOCKED — force-push overwrites shared history. Use a feature branch and a PR."
@@ -224,44 +411,44 @@ fi
 
 # 2. Checks-bypass attempts (block). The bypass flag must co-occur with a real git write
 #    verb on the SAME line, so a --no-verify quoted inside a commit-message body is exempt.
-if echo "$CMD" | grep -qE "${GIT}(.*[^[:alnum:]_])?(commit|push|rebase|merge|cherry-pick|am|tag)(.*[[:space:]])(--no-verify|--no-gpg-sign)([^[:alnum:]_]|$)" ||
-  echo "$CMD" | grep -qE "${GIT}.*commit\.gpgsign=false"; then
+if echo "$CMD_MATCH" | grep -qE "${GIT}(.*[^[:alnum:]_])?(commit|push|rebase|merge|cherry-pick|am|tag)(.*[[:space:]])(--no-verify|--no-gpg-sign)([^[:alnum:]_]|$)" ||
+  echo "$CMD_MATCH" | grep -qE "${GIT}.*commit\.gpgsign=false"; then
   block "Safety gate: checks-bypass (--no-verify / --no-gpg-sign / commit.gpgsign=false) is BLOCKED. Investigate the failing gate; do not route around it."
 fi
 
 # 2b. Bypassing the hooks path itself (block). `git -c core.hooksPath=/dev/null push`
 #     disables Git hook controls without using --no-verify.
-if echo "$CMD" | grep -qE "${CSEP}git +.*-c +core\.hooksPath="; then
+if echo "$CMD_MATCH" | grep -qE "${CSEP}git +.*-c +core\.hooksPath="; then
   block "Safety gate: overriding core.hooksPath bypasses every git hook in one flag. BLOCKED. If a hook is wrong, fix the hook."
 fi
 
 # 3. git reset --hard (ask) — destroys uncommitted working-tree changes.
-echo "$CMD" | grep -qE "${GIT}reset +--hard([^[:alnum:]_]|$)" &&
+echo "$CMD_MATCH" | grep -qE "${GIT}reset +--hard([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git reset --hard' destroys uncommitted changes. Confirm cwd and target with the operator."
 
 # 3b. Working-tree-revert cousins of reset --hard (ask). Each can discard uncommitted work.
 #     checkout is exempt only for -b/-B branch creation.
-if echo "$CMD" | grep -qE "${GIT}checkout([^[:alnum:]_]|$)" &&
-  ! echo "$CMD" | grep -qE "${GIT}checkout +-[bB]([^[:alnum:]_]|$)"; then
+if echo "$CMD_MATCH" | grep -qE "${GIT}checkout([^[:alnum:]_]|$)" &&
+  ! echo "$CMD_MATCH" | grep -qE "${GIT}checkout +-[bB]([^[:alnum:]_]|$)"; then
   ask "Safety gate: 'git checkout' (other than -b/-B) can irrecoverably revert uncommitted changes. Confirm the target — and to un-apply a change under review, reverse the edit in place; never discard the working tree."
 fi
-echo "$CMD" | grep -qE "${GIT}restore([^[:alnum:]_]|$)" &&
+echo "$CMD_MATCH" | grep -qE "${GIT}restore([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git restore' reverts uncommitted changes irrecoverably. Confirm the target with the operator."
 # Force may arrive as an adjacent cluster (-fd), a SEPARATED cluster (-d -f), or the long
 # form (--force), anywhere within the clean invocation — but never across a command
 # separator (;&|), so a force flag on a LATER command cannot false-fire. The dash must
 # follow whitespace (a real flag token), so a filename containing "-f" stays silent.
 # The f/F match is anywhere in the cluster so forms such as `git clean -fd` are covered.
-echo "$CMD" | grep -qE "${GIT}clean( +[^;&|]*)? +(-[A-Za-z]*[fF][A-Za-z]*|--force)([^[:alnum:]_]|$)" &&
+echo "$CMD_MATCH" | grep -qE "${GIT}clean( +[^;&|]*)? +(-[A-Za-z]*[fF][A-Za-z]*|--force)([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git clean' with a force flag (any position: -f/-fd/-d -f/--force) deletes untracked files irrecoverably. Confirm the target."
-echo "$CMD" | grep -qE "${GIT}stash +(drop|clear)([^[:alnum:]_]|$)" &&
+echo "$CMD_MATCH" | grep -qE "${GIT}stash +(drop|clear)([^[:alnum:]_]|$)" &&
   ask "Safety gate: 'git stash drop/clear' discards stashed work irrecoverably. Confirm with the operator."
 
 # 4. Recursive rm outside safe paths (ask). Matches any short-flag cluster containing r/R
 #    (-rf, -fr, -Rf, -rfv, -r) or --recursive.
 SAFE_PATHS="/tmp/|/private/tmp/|\\.cache|/dist/|/build/|/gen/|coverage${SAFE_PATHS_EXTRA:+|${SAFE_PATHS_EXTRA}}"
-if echo "$CMD" | grep -qE "${CSEP}rm +(-[A-Za-z]*[rR][A-Za-z]*|--recursive)([^[:alnum:]_]|$)" &&
-  ! echo "$CMD" | grep -qE "$SAFE_PATHS"; then
+if echo "$CMD_MATCH" | grep -qE "${CSEP}rm +(-[A-Za-z]*[rR][A-Za-z]*|--recursive)([^[:alnum:]_]|$)" &&
+  ! echo "$CMD_MATCH" | grep -qE "$SAFE_PATHS"; then
   ask "Safety gate: recursive rm outside safe paths (${SAFE_PATHS}). Confirm the target with the operator."
 fi
 
@@ -287,7 +474,7 @@ DB_RESET='(migrate|db) +reset|db:(drop|reset)|migrate:(reset|fresh)|db +push +--
 # keeps `grep -rn "DROP TABLE" .` out of the match.
 DB_RUNNER='npx +(-y +)?|bunx +|pnpm +(exec +|dlx +)|yarn +(exec +|dlx +)?|npm +exec +|php +|python3? +|bundle +exec +|poetry +run +|docker +(compose +)?(exec|run) +[^;&|]*'
 
-if echo "$CMD" | grep -qiE "${CSEP}(${DB_RUNNER})?(${DB_TOOL})([^[:alnum:]_]|$)"; then
+if echo "$CMD_MATCH" | grep -qiE "${CSEP}(${DB_RUNNER})?(${DB_TOOL})([^[:alnum:]_]|$)"; then
   echo "$CMD" | grep -qiE "(^|[^[:alnum:]_])(${DB_WIPE})" &&
     block "Safety gate: destructive database operation is BLOCKED — dropping, truncating or flushing destroys data that no branch protection or backup policy here covers. If this is genuinely intended, the operator runs it."
   echo "$CMD" | grep -qiE "(^|[^[:alnum:]_])(${DB_RESET})" &&
@@ -295,7 +482,7 @@ if echo "$CMD" | grep -qiE "${CSEP}(${DB_RUNNER})?(${DB_TOOL})([^[:alnum:]_]|$)"
 fi
 
 # Tools whose whole purpose is destruction take no verb: the command IS the damage.
-echo "$CMD" | grep -qE "${CSEP}(dropdb|dropuser)([^[:alnum:]_]|$)" &&
+echo "$CMD_MATCH" | grep -qE "${CSEP}(dropdb|dropuser)([^[:alnum:]_]|$)" &&
   block "Safety gate: '${CMD%% *}' destroys a database or role outright. The operator runs this, not an agent."
 
 # Every universal BLOCK has now had its turn. Queue a repository prompt only when no
@@ -308,7 +495,7 @@ emit_pending_ask
 #    op can silently set the wrong context for a later mutative op. Ask-gated commands
 #    above have already exited.
 GIT_MUTATIVE='(add|checkout|clean|commit|rm|mv|reset|merge|rebase|cherry-pick|stash|worktree|revert|restore|push)([^[:alnum:]_]|$)'
-if echo "$CMD" | grep -qE "${GIT}${GIT_MUTATIVE}|${CSEP}(rm +|mv +)"; then
+if echo "$CMD_MATCH" | grep -qE "${GIT}${GIT_MUTATIVE}|${CSEP}(rm +|mv +)"; then
   set +e
   PWD_NOW=$(pwd 2>/dev/null || echo "<pwd-failed>")
   CWD_PREFIX="cwd"

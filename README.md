@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.3.1** · CLI: `kit/agentkit`
+> Current version: **RepoCharter 0.3.2** · CLI: `kit/agentkit`
 >
-> **223 tests** · **zero runtime dependencies**
+> **237 tests** · **zero runtime dependencies**
 
 RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
 repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
@@ -272,7 +272,7 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter 0.3.1 is used in production repositories today. Its 223-test suite is intentionally
+RepoCharter is used in production repositories today. Its 237-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -310,7 +310,7 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         223 tests, no dependencies, mostly negative
+kit/tests/         237 tests, no dependencies, mostly negative
 ```
 
 **Ready to try RepoCharter?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is
