@@ -14,7 +14,8 @@ const providers = [
     name: "Claude Code",
     monogram: "CL",
     context: "Shared context",
-    guardrails: "Advisory",
+    guardrails: "Verified per checkout",
+    verified: true,
   },
   {
     name: "OpenCode",

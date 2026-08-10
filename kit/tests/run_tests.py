@@ -7,6 +7,8 @@ paths. Positive cases ensure the same policies do not block ordinary work.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -412,36 +414,129 @@ def test_mcp_gate(tmp: Path) -> None:
 
 # ── the ConfigChange guard ────────────────────────────────────────────────────────────
 
+def _entry(script: str) -> dict:
+    return {"hooks": [{"type": "command", "command":
+            f"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/agentkit/{script}"}]}
+
+
+def _healthy_settings() -> dict:
+    return {
+        "permissions": {"allow": [], "deny": ["Write(lib/content/live/**)"]},
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", **_entry("pretooluse-bash.sh")},
+                {"matcher": "Edit|Write|NotebookEdit", **_entry("pretooluse-write.py")},
+                {"matcher": "mcp__.*", **_entry("pretooluse-mcp.py")},
+            ],
+            "PostToolUse": [{"matcher": "Edit|Write|NotebookEdit", **_entry("posttooluse-write.py")}],
+            "ConfigChange": [_entry("configchange-guard.py")],
+        },
+    }
+
+
 def test_configchange(tmp: Path) -> None:
     section("ConfigChange guard — disarming the gates is loud")
-    repo = make_repo(tmp / "cfg")
-    (repo / ".claude" / "settings.json").write_text(json.dumps({
-        "permissions": {"deny": ["Write(lib/content/live/**)"]},
-        "hooks": {"PreToolUse": [], "PostToolUse": []},
-    }), encoding="utf-8")
+    # The declaration must name denials, or the emptied-permissions.deny check has nothing
+    # to protect and correctly stays quiet.
+    repo = make_repo(tmp / "cfg", {"denyWritePaths": [{"glob": "lib/content/live/**", "reason": "r"}]})
+    settings = repo / ".claude" / "settings.json"
+    local = repo / ".claude" / "settings.local.json"
 
-    code, _, err = run_hook("configchange-guard.py", {
-        "file_path": str(repo / ".claude" / "settings.json"),
-        "new_settings": {"disableAllHooks": True}}, repo)
+    def on_disk(data: dict, path: Path = settings) -> dict:
+        """The payload the harness actually sends: a path, never the settings themselves."""
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return {"hook_event_name": "ConfigChange", "source": "project_settings",
+                "file_path": str(path)}
+
+    code, _, err = run_hook("configchange-guard.py",
+                            on_disk({**_healthy_settings(), "disableAllHooks": True}), repo)
     check("disableAllHooks refused", code == 2, f"exit {code}")
     check("and explains the blast radius", "every safety gate" in err, err[:120])
 
-    code, _, err = run_hook("configchange-guard.py", {
-        "file_path": str(repo / ".claude" / "settings.json"),
-        "new_settings": {"permissions": {"deny": []}, "hooks": {"PreToolUse": [], "PostToolUse": []}}}, repo)
+    dropped = _healthy_settings()
+    dropped["permissions"]["deny"] = []
+    code, _, err = run_hook("configchange-guard.py", on_disk(dropped), repo)
     check("emptying permissions.deny refused", code == 2, f"exit {code}")
+    check("and names the declaration as the fix", "compatibility.json" in err, err[:200])
+
+    missing = _healthy_settings()
+    del missing["hooks"]["PreToolUse"]
+    code, _, err = run_hook("configchange-guard.py", on_disk(missing), repo)
+    check("dropping a hook event refused", code == 2, f"exit {code}")
+    check("and names the missing event", "PreToolUse" in err, err[:200])
+
+    noop = _healthy_settings()
+    noop["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = "true"
+    code, _, err = run_hook("configchange-guard.py", on_disk(noop), repo)
+    check("replacing the Bash handler with a same-event no-op is refused", code == 2,
+          f"exit {code}")
+    check("and names the missing Bash wiring", "pretooluse-bash.sh" in err, err[:240])
+
+    code, _, _ = run_hook("configchange-guard.py", on_disk(_healthy_settings()), repo)
+    check("an innocuous settings change is allowed", code == 0, f"exit {code}")
+
+    section("ConfigChange guard — the payload the harness really sends")
+    # The regression this class of defect produced: the guard waited for a `new_settings`
+    # key the harness never sends, so every branch below it ran against {} and refused
+    # indiscriminately. Both directions are asserted against the real shape.
+    settings.write_text(json.dumps(_healthy_settings()), encoding="utf-8")
+    code, _, err = run_hook("configchange-guard.py", {
+        "hook_event_name": "ConfigChange", "source": "project_settings",
+        "file_path": str(settings)}, repo)
+    check("a benign reload is not refused for lack of a settings payload", code == 0,
+          f"exit {code}: {err[:160]}")
 
     code, _, err = run_hook("configchange-guard.py", {
-        "file_path": str(repo / ".claude" / "settings.json"),
-        "new_settings": {"permissions": {"deny": ["Write(lib/content/live/**)"]},
-                         "hooks": {"PreToolUse": []}}}, repo)
-    check("dropping a hook event refused", code == 2, f"exit {code}")
+        "hook_event_name": "ConfigChange", "source": "local_settings",
+        "file_path": str(local)}, repo)
+    check("an absent settings.local.json is allowed", code == 0, f"exit {code}")
 
+    local.write_text(json.dumps({"disableAllHooks": True}), encoding="utf-8")
+    code, _, err = run_hook("configchange-guard.py", {
+        "hook_event_name": "ConfigChange", "source": "local_settings",
+        "file_path": str(local)}, repo)
+    check("disableAllHooks in settings.local.json refused", code == 2, f"exit {code}")
+
+    local.write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}), encoding="utf-8")
+    code, _, err = run_hook("configchange-guard.py", {
+        "hook_event_name": "ConfigChange", "source": "local_settings",
+        "file_path": str(local)}, repo)
+    check("an ordinary local allow-list change is not refused", code == 0,
+          f"exit {code}: {err[:160]}")
+
+    # A user- or enterprise-scope settings.json carries neither this repo's hooks nor its
+    # denials. Judging it by the project's baseline would refuse every machine's own config.
+    outside = tmp / "cfg" / "elsewhere" / ".claude"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "settings.json").write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    code, _, err = run_hook("configchange-guard.py", {
+        "hook_event_name": "ConfigChange", "source": "user_settings",
+        "file_path": str(outside / "settings.json")}, repo)
+    check("a settings.json outside the project is not judged by project rules", code == 0,
+          f"exit {code}: {err[:160]}")
+
+    section("ConfigChange guard — fails closed when it cannot tell")
+    settings.write_text("{not json at all", encoding="utf-8")
+    code, _, err = run_hook("configchange-guard.py", {
+        "hook_event_name": "ConfigChange", "source": "project_settings",
+        "file_path": str(settings)}, repo)
+    check("an unparseable settings file refuses the reload", code == 2, f"exit {code}")
+
+    code, _, err = run_hook("configchange-guard.py", {
+        "hook_event_name": "ConfigChange", "source": "project_settings"}, repo)
+    check("a payload naming neither path nor settings refuses", code == 2, f"exit {code}")
+
+    settings.write_text(json.dumps(_healthy_settings()), encoding="utf-8")
     code, _, _ = run_hook("configchange-guard.py", {
-        "file_path": str(repo / ".claude" / "settings.json"),
-        "new_settings": {"permissions": {"deny": ["Write(lib/content/live/**)"], "allow": ["Bash(ls:*)"]},
-                         "hooks": {"PreToolUse": [], "PostToolUse": []}}}, repo)
-    check("an innocuous settings change is allowed", code == 0, f"exit {code}")
+        "hook_event_name": "ConfigChange", "source": "other",
+        "file_path": str(repo / ".claude" / "unrelated.json")}, repo)
+    check("an unwatched config file is allowed", code == 0, f"exit {code}")
+
+    settings.unlink()
+    code, _, err = run_hook("configchange-guard.py", {
+        "hook_event_name": "ConfigChange", "source": "project_settings",
+        "file_path": str(settings)}, repo)
+    check("deleting the project settings refuses the reload", code == 2, f"exit {code}")
 
 
 # ── the residue verifier ──────────────────────────────────────────────────────────────
@@ -847,6 +942,324 @@ def test_apply(tmp: Path) -> None:
     check("self-test proves fail-closed", "fails CLOSED" in st.stdout, st.stdout[-200:])
 
 
+def _stub_claude(bin_dir: Path, version: str) -> Path:
+    """A fake `claude --version` on PATH, so version drift is testable without an upgrade."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "claude"
+    stub.write_text(f'#!/bin/sh\n[ "$1" = "--version" ] && echo "{version}" && exit 0\nexit 1\n',
+                    encoding="utf-8")
+    stub.chmod(0o755)
+    return stub
+
+
+def _stub_codex(bin_dir: Path, version: str) -> Path:
+    """A fake `codex --version` for checkout-attestation verifier tests."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "codex"
+    stub.write_text(f'#!/bin/sh\n[ "$1" = "--version" ] && echo "{version}" && exit 0\nexit 1\n',
+                    encoding="utf-8")
+    stub.chmod(0o755)
+    return stub
+
+
+def test_claude_enforcement_evidence(tmp: Path) -> None:
+    """A `blocking` Claude claim is a claim about bytes and a version. Both must be checked."""
+    root = tmp / "claude-evidence"
+    repo = make_repo(root)
+    git_init(repo)
+    (repo / "CLAUDE.md").unlink()  # apply installs the shim; a stale @-import would be refused
+    installed = subprocess.run([sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo),
+                                "--allow-dirty"], capture_output=True, text=True, timeout=120)
+    check("the fixture installs cleanly before anything is claimed about it",
+          installed.returncode == 0, installed.stdout[-300:] + installed.stderr[-300:])
+    compat_path = repo / ".agents" / "compatibility.json"
+
+    def declare(enforcement: str, evidence=None) -> None:
+        compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        compat.setdefault("enforcement", {})["claude-code"] = enforcement
+        if evidence is None:
+            compat.pop("enforcementEvidence", None)
+        else:
+            compat["enforcementEvidence"] = {"claude-code": evidence}
+        compat_path.write_text(json.dumps(compat, indent=2), encoding="utf-8")
+
+    git_bin = str(Path(shutil.which("git") or "/usr/bin/git").parent)
+    base_test_path = os.pathsep.join(dict.fromkeys((git_bin, "/usr/bin", "/bin")))
+    claude_config = tmp / "claude-config"
+    claude_config.mkdir()
+    Path(f"{claude_config}.json").write_text(json.dumps({"projects": {
+        str(repo.parent): {"hasTrustDialogAccepted": True},
+    }}), encoding="utf-8")
+
+    def report_with(path_env: Path | None = None, extra_env: dict | None = None) -> dict:
+        env = dict(os.environ)
+        if path_env is not None:
+            env["PATH"] = str(path_env) + os.pathsep + base_test_path
+        env["CLAUDE_CONFIG_DIR"] = str(claude_config)
+        env.update(extra_env or {})
+        proc = subprocess.run([sys.executable, str(RESIDUE), "--repo", str(repo), "--json"],
+                              capture_output=True, text=True, timeout=60, env=env)
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return {"errors": [f"residue crashed: {proc.stderr[:300]}"], "notes": []}
+
+    def errors_with(fragment: str, path_env: Path | None = None,
+                    extra_env: dict | None = None) -> bool:
+        report = report_with(path_env, extra_env)
+        return any(fragment in e for e in report.get("errors", []))
+
+    section("Claude promotion — a blocking claim without live evidence is refused")
+    declare("blocking")
+    check("blocking with no enforcementEvidence is an error",
+          errors_with("no live enforcementEvidence"))
+    declare("advisory")
+    check("the same checkout is clean while it stays advisory",
+          not errors_with("enforcementEvidence"))
+
+    section("Claude promotion — evidence is bound to the adapter bytes")
+    true_digest = agentkit_mod.claude_adapter_digest(repo)
+    check("the digest covers settings.json and every script it invokes",
+          isinstance(true_digest, str) and len(true_digest) == 64, str(true_digest))
+    good = {"verifiedOn": "2026-08-10", "harnessVersion": "9.9.9 (Claude Code)",
+            "adapterSha256": true_digest, "method": "live-deny-and-observe"}
+
+    declare("blocking", {**good, "adapterSha256": "0" * 64})
+    check("a hash that does not match the installed adapter is stale",
+          errors_with("Claude blocking evidence is stale"))
+
+    stub_bin = tmp / "stubbin"
+    _stub_claude(stub_bin, "9.9.9 (Claude Code)")
+    declare("blocking", good)
+    check("portable evidence alone does not certify this checkout",
+          errors_with("no matching local attestation", stub_bin))
+    local_evidence = agentkit_mod.checkout_evidence_path(repo, "claude-code")
+    check("the local record lives in this checkout's private Git directory",
+          local_evidence is not None and repo.resolve() / ".git" in local_evidence.parents,
+          str(local_evidence))
+    check("a matching checkout-local record can be written",
+          agentkit_mod.write_checkout_evidence(repo, "claude-code", good))
+    check("matching repository bytes, version, trust, and local attestation verify clean",
+          not errors_with("Claude blocking evidence", stub_bin)
+          and not errors_with("attestation", stub_bin)
+          and not errors_with("workspace trust", stub_bin))
+
+    local_original = local_evidence.read_text(encoding="utf-8")
+    local_data = json.loads(local_original)
+    local_data["checkout"] = str(repo.parent / "some-other-clone")
+    local_evidence.write_text(json.dumps(local_data), encoding="utf-8")
+    check("a copied or path-mismatched local attestation is rejected",
+          errors_with("belongs to another checkout", stub_bin))
+    local_evidence.write_text(local_original, encoding="utf-8")
+
+    Path(f"{claude_config}.json").write_text(json.dumps({"projects": {}}), encoding="utf-8")
+    check("provider output cannot substitute for persisted interactive trust",
+          errors_with("no persisted workspace trust", stub_bin))
+    Path(f"{claude_config}.json").write_text(json.dumps({"projects": {
+        str(repo.parent): {"hasTrustDialogAccepted": True},
+    }}), encoding="utf-8")
+
+    (claude_config / "settings.json").write_text(
+        json.dumps({"disableAllHooks": True}), encoding="utf-8")
+    check("a user-level disableAllHooks invalidates blocking evidence",
+          errors_with("sets disableAllHooks", stub_bin))
+    (claude_config / "settings.json").write_text("{}", encoding="utf-8")
+    check("Claude safe mode invalidates blocking evidence",
+          errors_with("CLAUDE_CODE_SAFE_MODE", stub_bin, {"CLAUDE_CODE_SAFE_MODE": "1"}))
+
+    guard = repo / ".claude" / "hooks" / "agentkit" / "configchange-guard.py"
+    original = guard.read_text(encoding="utf-8")
+    guard.write_text(original + "# one byte of drift\n", encoding="utf-8")
+    check("editing a hook script the adapter invokes invalidates the evidence",
+          errors_with("Claude blocking evidence is stale"))
+    guard.write_text(original, encoding="utf-8")
+
+    settings_path = repo / ".claude" / "settings.json"
+    settings_original = settings_path.read_text(encoding="utf-8")
+    settings = json.loads(settings_original)
+    settings["permissions"]["allow"] = ["Bash(ls:*)"]
+    settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    check("editing settings.json invalidates the evidence too",
+          errors_with("Claude blocking evidence is stale"))
+    settings_path.write_text(settings_original, encoding="utf-8")
+
+    section("Claude promotion — evidence is bound to the harness version")
+    _stub_claude(stub_bin, "9.9.10 (Claude Code)")
+    check("a different installed Claude version invalidates the evidence",
+          errors_with("but this machine runs", stub_bin))
+    _stub_claude(stub_bin, "9.9.9 (Claude Code)")
+    check("the matching version does not", not errors_with("but this machine runs", stub_bin))
+
+    section("Claude promotion — a missing Claude cannot be silently passed")
+    empty_bin = tmp / "emptybin"
+    empty_bin.mkdir(parents=True, exist_ok=True)
+    local_evidence.unlink()
+    check("verify degrades to a note rather than a false pass",
+          not errors_with("but this machine runs", empty_bin))
+    missing_report = report_with(empty_bin)
+    check("offline verification does not demand machine-local proof without the provider",
+          not any("attestation" in error for error in missing_report.get("errors", [])),
+          str(missing_report.get("errors", []))[:300])
+    env = dict(os.environ, PATH=str(empty_bin) + os.pathsep + base_test_path,
+               CLAUDE_CONFIG_DIR=str(claude_config))
+    declare("advisory")
+    st = subprocess.run([sys.executable, str(KIT / "agentkit"), "self-test", "--repo", str(repo),
+                         "--promote-claude"], capture_output=True, text=True, timeout=180, env=env)
+    check("self-test --promote-claude fails when `claude` is absent", st.returncode == 1,
+          st.stdout[-300:])
+    check("and says the executable is unavailable", "executable is unavailable" in st.stdout,
+          st.stdout[-300:])
+    after = json.loads(compat_path.read_text(encoding="utf-8"))
+    check("a failed live run PROMOTES NOTHING",
+          after["enforcement"]["claude-code"] == "advisory",
+          after["enforcement"]["claude-code"])
+    check("and writes no evidence",
+          "claude-code" not in (after.get("enforcementEvidence") or {}))
+
+    section("Claude promotion — the probe cannot be satisfied by a native denial")
+    argv = agentkit_mod._claude_probe_command(repo, "x", repo / "mcp.json", "Bash")
+    check("--bare is never used, because it skips hooks", "--bare" not in argv, " ".join(argv))
+    check("hook lifecycle events are streamed", "--include-hook-events" in argv)
+    check("project and local settings are the only sources",
+          "project,local" in argv, " ".join(argv))
+    check("only the intended probe tool is exposed and pre-allowed",
+          argv[argv.index("--tools") + 1] == "Bash"
+          and argv[argv.index("--allowedTools") + 1] == "Bash"
+          and "Read" not in argv, " ".join(argv))
+    target_argv = agentkit_mod._claude_checkout_probe_command(repo, repo / "mcp.json")
+    check("the target probe includes user, project, and local settings",
+          "user,project,local" in target_argv, " ".join(target_argv))
+    check("the target probe uses the harmless hooksPath bypass signature",
+          any("git -c core.hooksPath=/dev/null status" in part for part in target_argv),
+          " ".join(target_argv))
+    probe_settings = agentkit_mod.claude_probe_settings(
+        {"permissions": {"deny": ["Write(blocked.txt)"], "allow": []}})
+    check("the probe repo empties permissions.deny",
+          probe_settings["permissions"]["deny"] == [])
+
+    # The matrix is unpacked positionally by the live loop, so an added or dropped field is
+    # a crash mid-run rather than a failed check. Assert its shape without a model call.
+    probes = agentkit_mod.claude_probes(repo, repo / "mcp-call-ran.txt")
+    check("every live probe carries exactly the six fields the runner unpacks",
+          all(len(p) == 6 for p in probes), str([len(p) for p in probes]))
+    check("every probe names a marker path outside the transcript",
+          all(isinstance(p[4], Path) for p in probes))
+    check("the matrix proves refusals AND that ordinary work still runs",
+          {p[5] for p in probes} == {True, False},
+          str(sorted(p[0] for p in probes)))
+    check("each denial requires its own RepoCharter reason",
+          all(p[3] for p in probes if p[5] is False),
+          str([p[0] for p in probes if p[5] is False and not p[3]]))
+    check("Bash, Write and MCP are each covered in both directions",
+          all(sum(1 for p in probes if surface in p[0]) == 2
+              for surface in ("Bash", "Write", "MCP")),
+          str([p[0] for p in probes]))
+
+    def stream(tool: str = "Bash", pre: dict | None = None,
+               post: dict | None = None, extra: list[dict] | None = None) -> str:
+        events = [{"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": tool, "id": "toolu_probe", "input": {}},
+        ]}}]
+        if pre is not None:
+            events.append({"type": "system", "subtype": "hook_response",
+                           "hook_event": "PreToolUse", "hook_name": f"PreToolUse:{tool}",
+                           "exit_code": 0, "outcome": "success", **pre})
+        if post is not None:
+            events.append({"type": "system", "subtype": "hook_response",
+                           "hook_event": "PostToolUse", "hook_name": f"PostToolUse:{tool}",
+                           "exit_code": 0, "outcome": "success", **post})
+        events.extend(extra or [])
+        return "\n".join(json.dumps(event) for event in events)
+
+    deny_output = json.dumps({"hookSpecificOutput": {
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Repo policy: AGENTKIT_X_DENIED",
+    }})
+    measurement_output = json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "additionalContext": "[agentkit measurement — AFTER] measured.txt: bytes",
+    }})
+    held = agentkit_mod.claude_probe_held
+    check("prose containing a reason but no structured tool call is not evidence",
+          not held("Bash", "AGENTKIT_X_DENIED", "AGENTKIT_X_DENIED", False, False))
+    check("a native denial without a project hook response is AMBIGUOUS, not a pass",
+          not held("Bash", "AGENTKIT_X_DENIED", stream(extra=[{
+              "type": "system", "subtype": "permission_denied", "tool_name": "Bash",
+              "message": "Claude requested permissions, but you haven't granted it yet.",
+          }]), False, False))
+    check("a response for the wrong intended tool is not evidence",
+          not held("Bash", "AGENTKIT_X_DENIED",
+                   stream("Write", {"output": deny_output}), False, False))
+    check("a RepoCharter reason whose marker landed anyway is a FAILURE",
+          not held("Bash", "AGENTKIT_X_DENIED",
+                   stream(pre={"output": deny_output}), True, False))
+    check("a structured project-hook denial passes",
+          held("Bash", "AGENTKIT_X_DENIED",
+               stream(pre={"output": deny_output}), False, False))
+    check("an allow whose side effect never landed is a FAILURE",
+          not held("Bash", "", stream(pre={"output": ""}), False, True))
+    check("an allow with a successful structured response and side effect passes",
+          held("Bash", "", stream(pre={"output": ""}), True, True))
+    check("an allow that must also show a measurement fails without it",
+          not held("Write", "AFTER] measured.txt",
+                   stream("Write", {"output": ""}), True, True))
+    check("and passes with it",
+          held("Write", "AFTER] measured.txt",
+               stream("Write", {"output": ""}, {"output": measurement_output}), True, True))
+
+    section("Claude promotion — an installed guard that allows everything fails self-test")
+    # Headless Claude emitted no ConfigChange event for authorized settings mutations. Its
+    # provider-shaped fixture therefore has to be able to fail rather than blessing a no-op.
+    guard_path = repo / ".claude" / "hooks" / "agentkit" / "configchange-guard.py"
+    guard_original = guard_path.read_text(encoding="utf-8")
+
+    def fixture_failures() -> int:
+        # The checker narrates each case on stdout. A deliberately broken guard would
+        # therefore print FAIL lines into a passing suite, which is exactly the kind of
+        # log nobody can read twice.
+        with contextlib.redirect_stdout(io.StringIO()):
+            return agentkit_mod.configchange_fixture_checks(repo)
+
+    check("a healthy installed guard passes the fixture", fixture_failures() == 0)
+    guard_path.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n", encoding="utf-8")
+    guard_path.chmod(0o755)
+    check("a guard that allows every settings change fails all four refusals",
+          fixture_failures() == 4)
+    guard_path.unlink()
+    check("a missing guard is a failure, not a skip", fixture_failures() == 1)
+    guard_path.write_text(guard_original, encoding="utf-8")
+    guard_path.chmod(0o755)
+
+    section("Claude promotion — a disarmed checkout cannot verify")
+    declare("advisory")
+    (repo / ".claude" / "settings.local.json").write_text(
+        json.dumps({"disableAllHooks": True}), encoding="utf-8")
+    check("disableAllHooks is an error even while Claude is only advisory",
+          errors_with("disableAllHooks"))
+    (repo / ".claude" / "settings.local.json").unlink()
+
+    section("Codex promotion — portable evidence also needs checkout-local proof")
+    compat = json.loads(compat_path.read_text(encoding="utf-8"))
+    codex_good = {
+        "verifiedOn": "2026-08-10",
+        "harnessVersion": "codex-cli 9.9.9",
+        "adapterSha256": agentkit_mod.codex_adapter_digest(repo),
+        "method": "live-deny-and-observe",
+    }
+    compat.setdefault("enforcement", {})["codex"] = "blocking"
+    compat.setdefault("enforcementEvidence", {})["codex"] = codex_good
+    compat_path.write_text(json.dumps(compat, indent=2), encoding="utf-8")
+    codex_bin = tmp / "codex-stubbin"
+    _stub_codex(codex_bin, "codex-cli 9.9.9")
+    check("Codex portable evidence alone is rejected in a fresh checkout",
+          errors_with("codex is declared blocking but this checkout has no matching local",
+                      codex_bin))
+    check("writing the matching Codex checkout record satisfies that requirement",
+          agentkit_mod.write_checkout_evidence(repo, "codex", codex_good)
+          and not errors_with("codex checkout-local attestation", codex_bin)
+          and not errors_with("codex is declared blocking but this checkout", codex_bin))
+
+
 def test_policy_and_supersede(tmp: Path) -> None:
     sys.path.insert(0, str(KIT / "lib"))
     import scaffold as sc
@@ -1240,6 +1653,7 @@ def main() -> int:
         test_mcp_gate(tmp)
         test_configchange(tmp)
         test_residue(tmp)
+        test_claude_enforcement_evidence(tmp / "claude-enforcement")
         test_policy_and_supersede(tmp / "policy")
         test_apply(tmp / "applytest")
         test_measure(tmp / "measure")
