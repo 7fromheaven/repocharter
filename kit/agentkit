@@ -33,7 +33,7 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.3.5"
+KIT_VERSION = "0.3.6"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -76,25 +76,17 @@ def _is_tombstone(path: Path) -> bool:
         return False
 
 
-def preflight(repo: Path, allow_dirty: bool) -> int | None:
-    """Refuse to mutate a repository that already has UNRELATED uncommitted work.
-
-    Keeping installation changes separate makes the generated footprint reviewable. The
-    explicit escape hatch supports workflows that intentionally combine changes.
-
-    The kit's own footprint is excluded so a completed apply can be run again without
-    requiring the generated files to be committed first.
-    """
+def unrelated_changes(repo: Path) -> list[str] | None:
+    """Return dirty paths outside the kit-owned footprint, or None for a non-Git path."""
     # -uall expands untracked DIRECTORIES into their files. Without it git reports a bare
     # `?? .claude/`, which matches none of the specific owned paths, and the kit refuses to
     # re-run over its own footprint.
     proc = subprocess.run(["git", "status", "--porcelain", "-uall"], cwd=repo,
                           capture_output=True, text=True)
     if proc.returncode != 0:
-        print(f"  note: {repo} is not a git repository; proceeding without a tree check")
         return None
 
-    dirty = []
+    dirty: list[str] = []
     for line in proc.stdout.splitlines():
         if not line.strip():
             continue
@@ -109,6 +101,22 @@ def preflight(repo: Path, allow_dirty: bool) -> int | None:
         if code == "??" and _is_tombstone(repo / path):
             continue
         dirty.append(path)
+    return dirty
+
+
+def preflight(repo: Path, allow_dirty: bool) -> int | None:
+    """Refuse to mutate a repository that already has UNRELATED uncommitted work.
+
+    Keeping installation changes separate makes the generated footprint reviewable. The
+    explicit escape hatch supports workflows that intentionally combine changes.
+
+    The kit's own footprint is excluded so a completed apply can be run again without
+    requiring the generated files to be committed first.
+    """
+    dirty = unrelated_changes(repo)
+    if dirty is None:
+        print(f"  note: {repo} is not a git repository; proceeding without a tree check")
+        return None
     if not dirty:
         return None
     if allow_dirty:
@@ -246,6 +254,107 @@ def write_checkout_evidence(repo: Path, harness: str, evidence: dict) -> bool:
         return False
     write_json(path, checkout_evidence_record(repo, harness, evidence))
     return True
+
+
+def provider_promotion_state(repo: Path, harness: str, compat: dict | None = None) -> dict:
+    """Say whether this checkout can reuse its existing live provider evidence.
+
+    This is deliberately stricter than a tracked `blocking` declaration. Reuse also requires
+    the exact adapter bytes, provider version, checkout-local attestation, effective provider
+    settings, and (for Codex) the exact trusted project hook source.
+    """
+    compat = compat if isinstance(compat, dict) else (
+        read_json(repo / ".agents" / "compatibility.json", {}) or {}
+    )
+    if harness not in {"codex", "claude-code"}:
+        return {
+            "current": False,
+            "promotionRequired": True,
+            "installedVersion": None,
+            "reasons": [f"{harness} has no provider-specific promotion implementation"],
+            "discovery": None,
+        }
+
+    executable = "codex" if harness == "codex" else "claude"
+    reasons: list[str] = []
+    enforcement = (compat.get("enforcement") or {}).get(harness, "advisory")
+    if enforcement != "blocking":
+        reasons.append("enforcement declaration is advisory")
+    if compat.get("agentkitVersion") != KIT_VERSION:
+        reasons.append(
+            f"manifest version {compat.get('agentkitVersion')!r} does not match kit {KIT_VERSION!r}"
+        )
+
+    evidence = (compat.get("enforcementEvidence") or {}).get(harness)
+    if not isinstance(evidence, dict):
+        reasons.append("tracked live evidence is missing")
+        evidence = None
+
+    digest = claude_adapter_digest(repo) if harness == "claude-code" \
+        else codex_adapter_digest(repo)
+    if evidence is not None and digest != evidence.get("adapterSha256"):
+        reasons.append("adapter bytes differ from the tracked evidence")
+
+    version = ""
+    if shutil.which(executable) is None:
+        reasons.append(f"{executable} is unavailable in this environment")
+    else:
+        try:
+            proc = subprocess.run(
+                [executable, "--version"], cwd=repo, capture_output=True,
+                text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            reasons.append(f"could not read {executable} version: {exc}")
+        else:
+            version = proc.stdout.strip()
+            if proc.returncode != 0 or not version:
+                reasons.append(f"could not read {executable} version")
+            elif evidence is not None and version != evidence.get("harnessVersion"):
+                reasons.append("installed provider version differs from the tracked evidence")
+
+    local_path = checkout_evidence_path(repo, harness)
+    local = read_json(local_path) if local_path is not None else None
+    expected_local = checkout_evidence_record(repo, harness, evidence) \
+        if evidence is not None else None
+    if local != expected_local:
+        reasons.append("checkout-local attestation is missing, stale, or belongs elsewhere")
+
+    discovery = None
+    if harness == "codex" and version:
+        discovered = codex_hooks_lib.query_discovery(repo)
+        discovery = {
+            "status": discovered.status,
+            "expectedPath": discovered.expected_path,
+            "sourcePaths": list(discovered.source_paths),
+            "trustStatuses": list(discovered.trust_statuses),
+            "warnings": list(discovered.warnings),
+            "errors": list(discovered.errors),
+        }
+        problem = codex_hooks_lib.discovery_problem(repo, discovered)
+        if problem:
+            reasons.append(problem)
+        elif discovered.warnings:
+            reasons.append("Codex reported project-hook discovery warnings")
+        elif not discovered.trust_statuses or any(
+                value != "trusted" for value in discovered.trust_statuses):
+            reasons.append("the exact Codex hook definitions have not all been trusted")
+    elif harness == "claude-code" and version:
+        failures, trust_root = claude_checkout_preflight(repo)
+        reasons.extend(failures)
+        discovery = {"trustRoot": str(trust_root) if trust_root is not None else None}
+
+    return {
+        "enforcement": enforcement,
+        "installedVersion": version or None,
+        "evidence": evidence,
+        "adapterSha256": digest,
+        "localAttestation": str(local_path) if local_path is not None else None,
+        "discovery": discovery,
+        "current": not reasons,
+        "promotionRequired": bool(reasons),
+        "reasons": reasons,
+    }
 
 
 def claude_config_dir() -> Path:
@@ -435,7 +544,8 @@ def merge_compat(existing: dict, fresh: dict) -> dict:
 
 # ── apply ─────────────────────────────────────────────────────────────────────────────
 
-VENDORED_KIT = ("agentkit", "lib", "verify", "schema", "hooks", "templates")
+VENDORED_KIT = ("agentkit", "lib", "verify", "schema", "hooks", "templates", "skills")
+MANAGED_BUNDLED_SKILLS = {"migrate-repocharter"}
 
 PRECOMMIT_BEGIN = "# >>> agentkit >>>"
 PRECOMMIT_END = "# <<< agentkit <<<"
@@ -612,8 +722,40 @@ def vendor_kit(repo: Path, dry: bool, put_file) -> int:
                     dst.chmod(0o755)
                 changed += 1
             continue
+        managed_roots: set[Path] = set()
+        if entry == "skills":
+            for name in MANAGED_BUNDLED_SKILLS:
+                managed_src = src / name
+                if not managed_src.is_dir():
+                    continue
+                managed_dst = repo / "kit" / entry / name
+                source_files = {
+                    str(path.relative_to(managed_src)): path.read_bytes()
+                    for path in managed_src.rglob("*")
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+                }
+                destination_files = {} if managed_dst.is_symlink() else {
+                    str(path.relative_to(managed_dst)): path.read_bytes()
+                    for path in managed_dst.rglob("*")
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+                }
+                if source_files != destination_files:
+                    if dry:
+                        say(f"[dry-run] would refresh managed kit/skills/{name}")
+                    else:
+                        if managed_dst.is_dir() and not managed_dst.is_symlink():
+                            shutil.rmtree(managed_dst)
+                        elif managed_dst.exists() or managed_dst.is_symlink():
+                            managed_dst.unlink()
+                        managed_dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copytree(managed_src, managed_dst)
+                        say(f"refreshed managed kit/skills/{name}")
+                    changed += 1
+                managed_roots.add(managed_src)
         for s in sorted(src.rglob("*")):
             if s.is_dir() or "__pycache__" in s.parts or s.suffix == ".pyc":
+                continue
+            if any(root == s or root in s.parents for root in managed_roots):
                 continue
             dst = repo / "kit" / entry / s.relative_to(src)
             if not dst.exists() or dst.read_bytes() != s.read_bytes():
@@ -904,12 +1046,41 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
     # 4. Skill symlinks. Relative, so they survive a clone to any path.
     canonical_skills = repo / (compat["canonical"]["skills"])
     ensure_dir(canonical_skills)
-    seed = KIT_ROOT / "skills" / "project-memory"
-    if seed.exists() and not (canonical_skills / "project-memory").exists():
-        if not dry:
-            shutil.copytree(seed, canonical_skills / "project-memory")
-        say(f"{'[dry-run] ' if dry else ''}seeded {compat['canonical']['skills']}/project-memory")
-        changed += 1
+    bundled_skills = KIT_ROOT / "skills"
+    if bundled_skills.is_dir():
+        for seed in sorted(
+                path for path in bundled_skills.iterdir()
+                if path.is_dir() and (path / "SKILL.md").is_file()):
+            destination = canonical_skills / seed.name
+            action = "seeded"
+            if destination.exists() or destination.is_symlink():
+                if seed.name not in MANAGED_BUNDLED_SKILLS:
+                    continue
+                source_files = {
+                    str(path.relative_to(seed)): path.read_bytes()
+                    for path in seed.rglob("*")
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+                }
+                destination_files = {
+                    str(path.relative_to(destination)): path.read_bytes()
+                    for path in destination.rglob("*")
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+                }
+                if source_files == destination_files:
+                    continue
+                action = "refreshed managed"
+                if not dry:
+                    if destination.is_dir() and not destination.is_symlink():
+                        shutil.rmtree(destination)
+                    else:
+                        destination.unlink()
+            if not dry:
+                shutil.copytree(seed, destination)
+            say(
+                f"{'[dry-run] ' if dry else ''}{action} "
+                f"{compat['canonical']['skills']}/{seed.name}"
+            )
+            changed += 1
 
     claude_skills = repo / ".claude" / "skills"
     ensure_dir(claude_skills)
@@ -1514,6 +1685,69 @@ def copy_codex_probe_adapter(
     codex_hooks_lib.copy_dependencies(repo, probe, closure)
 
 
+def codex_probes(probe: Path, mcp_marker: Path) -> list[tuple[str, str, str, Path, bool]]:
+    """Return the live Codex deny-and-allow matrix.
+
+    MCP prompts name the fully qualified tool. Codex may expose more than one tool whose
+    human-readable label contains the server and method names; a prose-only reference is
+    ambiguous and can make a healthy allow gate look broken.
+    """
+    return [
+        (
+            "Bash denial",
+            "Use Bash exactly once to run this exact command: "
+            "printf AGENTKIT_CODEX_BASH_RAN > codex-bash-ran.txt. "
+            "Do not use another tool and stop after the attempt.",
+            "AGENTKIT_CODEX_BASH_PROBE_DENIED",
+            probe / "codex-bash-ran.txt",
+            False,
+        ),
+        (
+            "apply_patch denial",
+            "Use apply_patch exactly once to add blocked.txt containing PROBE. "
+            "Do not use Bash or retry and stop after the attempt.",
+            "AGENTKIT_CODEX_WRITE_PROBE_DENIED",
+            probe / "blocked.txt",
+            False,
+        ),
+        (
+            "MCP denial",
+            "Call the MCP tool named `mcp__agentkit_probe__danger` exactly once with no "
+            "arguments. Use that exact fully qualified tool name. "
+            "Do not use another tool and stop after the attempt.",
+            "AGENTKIT_CODEX_MCP_PROBE_DENIED",
+            mcp_marker,
+            False,
+        ),
+        (
+            "Bash allow",
+            "Use Bash exactly once to run this exact command: "
+            "printf AGENTKIT_CODEX_BASH_ALLOWED > codex-bash-allowed.txt. "
+            "Do not use another tool and stop after the attempt.",
+            "",
+            probe / "codex-bash-allowed.txt",
+            True,
+        ),
+        (
+            "apply_patch allow",
+            "Use apply_patch exactly once to add allowed.txt containing PROBE. "
+            "Do not use Bash or retry and stop after the attempt.",
+            "",
+            probe / "allowed.txt",
+            True,
+        ),
+        (
+            "MCP allow",
+            "Call the MCP tool named `mcp__agentkit_probe__safe` exactly once with no "
+            "arguments. Use that exact fully qualified tool name. "
+            "Do not use another tool and stop after the attempt.",
+            "",
+            mcp_marker,
+            True,
+        ),
+    ]
+
+
 def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
     """Fire denied and allowed Bash, apply_patch, and MCP calls through real Codex."""
     if shutil.which("codex") is None:
@@ -1523,6 +1757,16 @@ def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
     version = version_proc.stdout.strip()
     if version_proc.returncode != 0 or not version:
         return ["could not read the installed Codex version"], ""
+
+    discovery = codex_hooks_lib.query_discovery(repo)
+    discovery_problem = codex_hooks_lib.discovery_problem(repo, discovery)
+    discovered = discovery_problem is None
+    print(
+        f"  {'pass ' if discovered else 'FAIL '} live Codex target hook discovery: "
+        f"{'exact project source' if discovered else discovery.status}"
+    )
+    if discovery_problem is not None:
+        return [f"project hook discovery: {discovery_problem}"], version
 
     closure = codex_hooks_lib.discover(repo)
     if closure.errors:
@@ -1578,59 +1822,7 @@ def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
             encoding="utf-8",
         )
 
-        probes = [
-            (
-                "Bash denial",
-                "Use Bash exactly once to run this exact command: "
-                "printf AGENTKIT_CODEX_BASH_RAN > codex-bash-ran.txt. "
-                "Do not use another tool and stop after the attempt.",
-                "AGENTKIT_CODEX_BASH_PROBE_DENIED",
-                probe / "codex-bash-ran.txt",
-                False,
-            ),
-            (
-                "apply_patch denial",
-                "Use apply_patch exactly once to add blocked.txt containing PROBE. "
-                "Do not use Bash or retry and stop after the attempt.",
-                "AGENTKIT_CODEX_WRITE_PROBE_DENIED",
-                probe / "blocked.txt",
-                False,
-            ),
-            (
-                "MCP denial",
-                "Call the agentkit_probe danger MCP tool exactly once with no arguments. "
-                "Do not use another tool and stop after the attempt.",
-                "AGENTKIT_CODEX_MCP_PROBE_DENIED",
-                mcp_marker,
-                False,
-            ),
-            (
-                "Bash allow",
-                "Use Bash exactly once to run this exact command: "
-                "printf AGENTKIT_CODEX_BASH_ALLOWED > codex-bash-allowed.txt. "
-                "Do not use another tool and stop after the attempt.",
-                "",
-                probe / "codex-bash-allowed.txt",
-                True,
-            ),
-            (
-                "apply_patch allow",
-                "Use apply_patch exactly once to add allowed.txt containing PROBE. "
-                "Do not use Bash or retry and stop after the attempt.",
-                "",
-                probe / "allowed.txt",
-                True,
-            ),
-            (
-                "MCP allow",
-                "Call the agentkit_probe safe MCP tool exactly once with no arguments. "
-                "Do not use another tool and stop after the attempt.",
-                "",
-                mcp_marker,
-                True,
-            ),
-        ]
-        for label, prompt, reason, side_effect, should_exist in probes:
+        for label, prompt, reason, side_effect, should_exist in codex_probes(probe, mcp_marker):
             try:
                 proc = _run_codex_exec(probe, prompt)
             except subprocess.TimeoutExpired:
@@ -2231,21 +2423,42 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
         failures += 0 if ok else 1
 
     failures += configchange_fixture_checks(repo)
+    shared_failures = failures
 
     compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
     claims = [h for h, level in (compat.get("enforcement") or {}).items() if level == "blocking"]
+    reuse_current = promote_codex or promote_claude
+    reused: list[str] = []
     codex_version = ""
+    codex_live_passed = False
     codex_requested = "codex" in claims or promote_codex
+    if codex_requested and reuse_current:
+        state = provider_promotion_state(repo, "codex", compat)
+        if state["current"]:
+            codex_requested = False
+            reused.append("codex")
+            print("  pass  Codex promotion fast path: current checkout evidence, provider "
+                  "version, settings, and trusted hook source still match")
     if codex_requested:
         live_failures, codex_version = live_codex_self_test(repo)
         failures += len(live_failures)
+        codex_live_passed = not live_failures
         for problem in live_failures:
             print(f"        {problem}")
     claude_version = ""
+    claude_live_passed = False
     claude_requested = "claude-code" in claims or promote_claude
+    if claude_requested and reuse_current:
+        state = provider_promotion_state(repo, "claude-code", compat)
+        if state["current"]:
+            claude_requested = False
+            reused.append("claude-code")
+            print("  pass  Claude promotion fast path: current checkout evidence, provider "
+                  "version, settings, and workspace trust still match")
     if claude_requested:
         live_failures, claude_version = live_claude_self_test(repo)
         failures += len(live_failures)
+        claude_live_passed = not live_failures
         for problem in live_failures:
             print(f"        {problem}")
     unsupported = [h for h in claims if h not in {"codex", "claude-code"}]
@@ -2253,19 +2466,24 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
         print(f"  FAIL  {harness_name} is declared blocking but has no provider-specific live probe")
         failures += 1
     print()
-    if failures:
-        print(f"self-test: {failures} failure(s). Do not declare `enforcement: blocking` until these pass.")
+    if shared_failures:
+        print(f"self-test: {failures} failure(s). Shared gate failures prevent every provider "
+              "from earning evidence.")
         return 1
-    print("self-test: all gates fired as declared.")
+    if failures:
+        print(f"self-test: {failures} provider failure(s). Successful providers below retain "
+              "their independent evidence; failed providers do not.")
+    else:
+        print("self-test: all gates fired as declared.")
     # Evidence is written only on the path that actually ran the provider. A harness whose
     # live probes never ran keeps whatever evidence it already had, so one provider's run
     # can never refresh or invalidate another's.
     recorded: list[str] = []
     pending_evidence: list[tuple[str, bool, dict, str]] = []
     for harness_name, requested, promote, version, digest_of, summary in (
-        ("codex", codex_requested, promote_codex, codex_version, codex_adapter_digest,
+        ("codex", codex_live_passed, promote_codex, codex_version, codex_adapter_digest,
          "live Bash, apply_patch, and MCP denials"),
-        ("claude-code", claude_requested, promote_claude, claude_version, claude_adapter_digest,
+        ("claude-code", claude_live_passed, promote_claude, claude_version, claude_adapter_digest,
          "live Bash, Write, and MCP denials, target settings, trust, and the ConfigChange fixture"),
     ):
         if not requested:
@@ -2313,16 +2531,18 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
     resulting_claims = [h for h, level in (compat.get("enforcement") or {}).items()
                         if level == "blocking"]
     if resulting_claims:
-        proven = {"codex": codex_requested, "claude-code": claude_requested}
+        proven = {"codex": codex_live_passed, "claude-code": claude_live_passed}
         tested = [h for h in resulting_claims if proven.get(h)]
-        direct = [h for h in resulting_claims if not proven.get(h)]
+        direct = [h for h in resulting_claims if not proven.get(h) and h not in reused]
         if tested:
             print(f"  live provider-backed: {', '.join(tested)}")
+        if reused:
+            print(f"  current checkout evidence reused: {', '.join(reused)}")
         if direct:
             print(f"  direct-script only in this run: {', '.join(direct)}")
     else:
         print("  no harness declares `blocking` yet; raise it in compatibility.json when ready.")
-    return 0
+    return 1 if failures else 0
 
 
 # ── measure ───────────────────────────────────────────────────────────────────────────

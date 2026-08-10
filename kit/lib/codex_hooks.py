@@ -12,9 +12,14 @@ discover what it depends on.
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
 import shlex
 import shutil
+import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +38,257 @@ EXTERNAL_FILE_LAUNCHERS = re.compile(
 class CodexHookClosure:
     dependencies: tuple[str, ...]
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CodexHookDiscovery:
+    """What Codex reports for this checkout's project hook layer."""
+
+    status: str
+    expected_path: str
+    source_paths: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+    trust_statuses: tuple[str, ...] = ()
+
+
+def _hook_error_text(value: object) -> str:
+    if isinstance(value, dict):
+        message = value.get("message")
+        path = value.get("path")
+        if isinstance(message, str) and isinstance(path, str):
+            return f"{path}: {message}"
+        if isinstance(message, str):
+            return message
+    return str(value)
+
+
+def query_discovery(
+    repo: Path,
+    *,
+    executable: str = "codex",
+    timeout: int = 20,
+    env: dict[str, str] | None = None,
+) -> CodexHookDiscovery:
+    """Ask Codex which project hook file it discovered for ``repo``.
+
+    Hook-definition trust is intentionally not required here. Codex's documented lifecycle lists
+    configured hooks before deciding whether their current hashes may run, which makes the source
+    path a safe preflight surface. No hook is executed by this query.
+    """
+    repo = repo.resolve()
+    expected = (repo / ".codex" / "hooks.json").resolve()
+    if not expected.is_file():
+        return CodexHookDiscovery("not-installed", str(expected))
+
+    command = executable
+    if os.sep not in executable:
+        command = shutil.which(executable) or ""
+    if not command:
+        return CodexHookDiscovery(
+            "unavailable", str(expected), errors=("Codex executable is unavailable",)
+        )
+
+    requests = (
+        {
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "repocharter-hook-preflight",
+                    "title": "RepoCharter hook preflight",
+                    "version": "1",
+                },
+                "capabilities": None,
+            },
+        },
+        {"method": "hooks/list", "id": 2, "params": {"cwds": [str(repo)]}},
+    )
+    payload = "".join(json.dumps(request) + "\n" for request in requests)
+    try:
+        proc = subprocess.Popen(
+            [command, "app-server", "--stdio"],
+            cwd=repo,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+    except FileNotFoundError:
+        return CodexHookDiscovery(
+            "unavailable", str(expected), errors=("Codex executable is unavailable",)
+        )
+    except OSError as exc:
+        return CodexHookDiscovery(
+            "unavailable", str(expected), errors=(f"Codex hooks/list could not start: {exc}",)
+        )
+
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    stdout_lines: queue.Queue[str | None] = queue.Queue()
+    stderr_lines: list[str] = []
+
+    def read_stdout() -> None:
+        try:
+            for line in proc.stdout:
+                stdout_lines.put(line)
+        finally:
+            stdout_lines.put(None)
+
+    def read_stderr() -> None:
+        stderr_lines.extend(proc.stderr)
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    response = None
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        proc.stdin.write(payload)
+        proc.stdin.flush()
+        while response is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                line = stdout_lines.get(timeout=min(0.25, remaining))
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and candidate.get("id") == 2:
+                response = candidate
+    except (BrokenPipeError, OSError) as exc:
+        stderr_lines.append(f"Codex hooks/list transport failed: {exc}\n")
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+
+    if response is None:
+        message = "Codex hooks/list timed out" if timed_out else "Codex hooks/list returned no response"
+        detail = next((line.strip() for line in reversed(stderr_lines) if line.strip()), "")
+        if detail:
+            message += f": {detail}"
+        return CodexHookDiscovery("error", str(expected), errors=(message,))
+    if response.get("error") is not None:
+        return CodexHookDiscovery(
+            "error", str(expected), errors=(_hook_error_text(response["error"]),)
+        )
+
+    result = response.get("result")
+    entries = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(entries, list):
+        return CodexHookDiscovery(
+            "error", str(expected), errors=("Codex hooks/list response has no data array",)
+        )
+    entry = next(
+        (
+            item
+            for item in entries
+            if isinstance(item, dict)
+            and isinstance(item.get("cwd"), str)
+            and Path(item["cwd"]).resolve() == repo
+        ),
+        entries[0] if len(entries) == 1 and isinstance(entries[0], dict) else None,
+    )
+    if not isinstance(entry, dict):
+        return CodexHookDiscovery(
+            "error", str(expected), errors=("Codex hooks/list omitted the requested checkout",)
+        )
+
+    warnings = tuple(str(value) for value in entry.get("warnings") or [])
+    error_list = [_hook_error_text(value) for value in entry.get("errors") or []]
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return CodexHookDiscovery(
+            "error", str(expected), warnings=warnings,
+            errors=tuple(error_list) + ("Codex hooks/list entry has no hooks array",),
+        )
+    sources: set[str] = set()
+    trust_statuses: set[str] = set()
+    for hook in hooks:
+        if not isinstance(hook, dict) or hook.get("source") != "project":
+            continue
+        raw = hook.get("sourcePath")
+        if not isinstance(raw, str) or not raw:
+            error_list.append("Codex reported a project hook without a sourcePath")
+            continue
+        resolved = str(Path(raw).resolve())
+        sources.add(resolved)
+        if resolved == str(expected):
+            trust = hook.get("trustStatus")
+            trust_statuses.add(trust if isinstance(trust, str) and trust else "unknown")
+    source_paths = tuple(sorted(sources))
+    errors = tuple(error_list)
+    if errors:
+        status = "error"
+    elif source_paths == (str(expected),):
+        status = "exact"
+    elif source_paths:
+        status = "wrong-checkout"
+    else:
+        status = "missing"
+    return CodexHookDiscovery(
+        status=status,
+        expected_path=str(expected),
+        source_paths=source_paths,
+        warnings=warnings,
+        errors=errors,
+        trust_statuses=tuple(sorted(trust_statuses)),
+    )
+
+
+def discovery_problem(repo: Path, result: CodexHookDiscovery) -> str | None:
+    """Render a safe remediation when project-hook discovery is not exact."""
+    if result.errors or result.warnings:
+        detail = "; ".join((*result.errors, *result.warnings))
+        return f"Codex project-hook discovery reported diagnostics: {detail}"
+    if result.status == "exact":
+        return None
+    if result.status == "not-installed":
+        return ".codex/hooks.json is not installed; run `agentkit apply` first"
+    if result.status == "wrong-checkout":
+        seen = ", ".join(result.source_paths)
+        return (
+            f"Codex did not resolve project hooks exclusively from {result.expected_path}; "
+            f"reported sources: {seen}. "
+            "This checkout cannot earn blocking evidence. Preserve it and continue in an "
+            "independent clone with a normal .git directory"
+        )
+    if result.status == "missing":
+        if (repo / ".git").is_file():
+            return (
+                "Codex returned zero project hooks for this linked worktree. Persist exact-path "
+                "workspace trust once; if a fresh query remains empty, preserve this worktree "
+                "and continue in an independent clone with a normal .git directory"
+            )
+        return (
+            "Codex returned zero project hooks. Confirm this exact project is trusted, hooks are "
+            "enabled, and .codex/hooks.json appears in `/hooks`"
+        )
+    detail = result.status
+    return f"Codex project-hook discovery could not be proved: {detail}"
 
 
 def _group_commands(group: dict, label: str) -> tuple[list[tuple[str, str]], list[str]]:

@@ -33,6 +33,24 @@ _spec.loader.exec_module(agentkit_mod)
 PASSED, FAILED = 0, 0
 CURRENT = ""
 
+# Git exports repository-local variables to hooks. If the suite is itself run by the
+# pre-commit hook, those values otherwise leak into every disposable fixture repository;
+# GIT_INDEX_FILE in particular can make a nested `git worktree add` operate on the parent
+# commit's temporary index. This process owns only test fixtures, so clear the complete set
+# reported by `git rev-parse --local-env-vars` before spawning any fixture Git command.
+GIT_LOCAL_ENV_VARS = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+}
+
+
+def clear_parent_git_environment() -> None:
+    for name in GIT_LOCAL_ENV_VARS:
+        os.environ.pop(name, None)
+
 
 def section(name: str) -> None:
     global CURRENT
@@ -827,6 +845,25 @@ def test_apply(tmp: Path) -> None:
     check("settings.json created", (repo / ".claude" / "settings.json").exists())
     check("hooks installed", (repo / ".claude" / "hooks" / "agentkit" / "pretooluse-bash.sh").exists())
     check("Codex hooks.json installed", (repo / ".codex" / "hooks.json").exists())
+    check("the durable project-memory skill is seeded",
+          (repo / ".agents" / "skills" / "project-memory" / "SKILL.md").is_file())
+    migration_skill = repo / ".agents" / "skills" / "migrate-repocharter"
+    check("the resumable migration skill is seeded",
+          (migration_skill / "SKILL.md").is_file()
+          and (migration_skill / "scripts" / "checkpoint.py").is_file()
+          and (migration_skill / "scripts" / "prepare_standalone.py").is_file())
+    migration_metadata = (migration_skill / "agents" / "openai.yaml").read_text(encoding="utf-8")
+    check("the migration skill metadata uses portable plain-style YAML",
+          migration_metadata.splitlines() == [
+              "interface:",
+              "  display_name: RepoCharter Migration",
+              "  short_description: Run a safe, resumable RepoCharter migration",
+              "  default_prompt: Use $migrate-repocharter to migrate this repository end to end and stop before external actions.",
+          ], migration_metadata)
+    migration_link = repo / ".claude" / "skills" / "migrate-repocharter"
+    check("the migration skill reaches Claude through a relative symlink",
+          migration_link.is_symlink() and not os.path.isabs(os.readlink(migration_link)),
+          os.readlink(migration_link) if migration_link.is_symlink() else "not a symlink")
     check("CLAUDE.md is a relative symlink, not an @-import",
           (repo / "CLAUDE.md").is_symlink()
           and not os.path.isabs(os.readlink(repo / "CLAUDE.md")),
@@ -857,9 +894,49 @@ def test_apply(tmp: Path) -> None:
           any("posttooluse-write.py" in command for command in codex_commands),
           str(codex_commands))
 
+    migration_body = migration_skill / "SKILL.md"
+    expected_migration_body = (KIT / "skills" / "migrate-repocharter" / "SKILL.md").read_bytes()
+    migration_body.write_text("stale managed workflow\n", encoding="utf-8")
+    project_memory = repo / ".agents" / "skills" / "project-memory" / "SKILL.md"
+    project_memory.write_bytes(project_memory.read_bytes() + b"\nRepository-owned note.\n")
+    refreshed = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("apply refreshes its managed migration workflow",
+          migration_body.read_bytes() == expected_migration_body
+          and "refreshed managed" in refreshed.stdout,
+          refreshed.stdout[-300:])
+    check("apply preserves a repository-owned project-memory customization",
+          project_memory.read_bytes().endswith(b"Repository-owned note.\n"))
+
+    vendored_migration = repo / "kit" / "skills" / "migrate-repocharter"
+    (vendored_migration / "obsolete.py").write_text("removed upstream\n", encoding="utf-8")
+    exact_vendor = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("refresh removes obsolete files from the vendored managed workflow",
+          exact_vendor.returncode == 0
+          and not (vendored_migration / "obsolete.py").exists()
+          and "refreshed managed kit/skills/migrate-repocharter" in exact_vendor.stdout,
+          exact_vendor.stdout[-400:] + exact_vendor.stderr[-200:])
+
     second = subprocess.run([sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
                             capture_output=True, text=True, timeout=120)
-    check("second apply is idempotent", "0 change(s)" in second.stdout, second.stdout[-200:])
+    check("the refreshed apply is idempotent", "0 change(s)" in second.stdout, second.stdout[-200:])
+
+    shutil.rmtree(migration_skill)
+    migration_skill.symlink_to("missing-managed-skill")
+    repaired_link = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("apply repairs a broken symlink at the managed skill destination",
+          repaired_link.returncode == 0
+          and migration_skill.is_dir() and not migration_skill.is_symlink()
+          and (migration_skill / "SKILL.md").is_file(),
+          repaired_link.stdout[-400:] + repaired_link.stderr[-200:])
 
     section("apply — must NOT disarm a repo that already has hooks")
     # Applying agentkit must merge hook groups instead of replacing foreign entries.
@@ -1030,6 +1107,478 @@ def _stub_codex(bin_dir: Path, version: str) -> Path:
                     encoding="utf-8")
     stub.chmod(0o755)
     return stub
+
+
+def _stub_codex_hooks_server(path: Path) -> Path:
+    """A tiny app-server fixture whose reported hook source is selected by env."""
+    path.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+import threading
+import time
+
+def emit(request_id, result):
+    print(json.dumps({"id": request_id, "result": result}), flush=True)
+
+def delayed_emit(request_id, result):
+    time.sleep(0.2)
+    emit(request_id, result)
+
+for raw in sys.stdin:
+    request = json.loads(raw)
+    request_id = request.get("id")
+    if request_id == 1:
+        result = {"userAgent": "codex-hook-discovery-fixture"}
+    elif request_id == 2:
+        cwd = request["params"]["cwds"][0]
+        source = os.environ.get("CODEX_HOOK_SOURCE", "")
+        mode = os.environ.get("CODEX_HOOK_MODE", "normal")
+        hooks = [] if not source else [{
+            "eventName": "PreToolUse",
+            "matcher": "Bash",
+            "source": "project",
+            "sourcePath": source,
+        }]
+        if hooks and mode != "missing-trust":
+            hooks[0]["trustStatus"] = os.environ.get("CODEX_HOOK_TRUST", "untrusted")
+        if hooks and mode == "mixed":
+            hooks.append({
+                "eventName": "PreToolUse",
+                "matcher": "apply_patch",
+                "source": "project",
+                "sourcePath": os.environ["CODEX_HOOK_SECOND_SOURCE"],
+                "trustStatus": "trusted",
+            })
+        errors = ([{"message": "fixture parse failure", "path": source}]
+                  if mode == "error" else [])
+        warnings = (["fixture discovery warning"] if mode == "warning" else [])
+        result = {"data": [{
+            "cwd": cwd,
+            "hooks": hooks,
+            "warnings": warnings,
+            "errors": errors,
+        }]}
+        if mode == "async":
+            threading.Thread(target=delayed_emit, args=(request_id, result), daemon=True).start()
+            continue
+    else:
+        result = {}
+    emit(request_id, result)
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_codex_hook_discovery(tmp: Path) -> None:
+    """Promotion must reject silent linked-worktree source substitution."""
+    repo = make_repo(tmp)
+    git_init(repo)
+    git_commit_all(repo)
+    installed = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    stub = _stub_codex_hooks_server(tmp / "codex-stub")
+    base_env = dict(os.environ)
+
+    section("Codex promotion — exact checkout hook discovery")
+    exact_env = {**base_env, "CODEX_HOOK_SOURCE": str(repo / ".codex" / "hooks.json")}
+    exact = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub), env=exact_env,
+    )
+    check("the discovery fixture starts from an installed adapter",
+          installed.returncode == 0, installed.stdout[-300:] + installed.stderr[-300:])
+    check("the exact target hook source passes before definition trust",
+          exact.status == "exact" and exact.trust_statuses == ("untrusted",), str(exact))
+    check("exact discovery has no remediation",
+          agentkit_mod.codex_hooks_lib.discovery_problem(repo, exact) is None, str(exact))
+
+    asynchronous = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**exact_env, "CODEX_HOOK_MODE": "async"},
+    )
+    check("discovery keeps app-server stdin open for an asynchronous hooks response",
+          asynchronous.status == "exact", str(asynchronous))
+
+    missing = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub), env={**base_env, "CODEX_HOOK_SOURCE": ""},
+    )
+    check("zero discovered project hooks fail",
+          missing.status == "missing", str(missing))
+    check("zero-hook remediation names project trust instead of a bypass",
+          "exact project is trusted" in
+          (agentkit_mod.codex_hooks_lib.discovery_problem(repo, missing) or "")
+          and "bypass" not in
+          (agentkit_mod.codex_hooks_lib.discovery_problem(repo, missing) or "").lower(),
+          str(missing))
+
+    primary = tmp / "primary" / ".codex" / "hooks.json"
+    wrong = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**base_env, "CODEX_HOOK_SOURCE": str(primary)},
+    )
+    problem = agentkit_mod.codex_hooks_lib.discovery_problem(repo, wrong) or ""
+    check("a primary-checkout hook substituted for the target fails",
+          wrong.status == "wrong-checkout", str(wrong))
+    check("source substitution routes to an independent normal clone",
+          "independent clone" in problem and "normal .git directory" in problem, problem)
+
+    errored = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**base_env, "CODEX_HOOK_SOURCE": str(repo / ".codex" / "hooks.json"),
+             "CODEX_HOOK_MODE": "error"},
+    )
+    check("a reported discovery error cannot be hidden by one exact source",
+          errored.status == "error" and "fixture parse failure" in " ".join(errored.errors),
+          str(errored))
+
+    mixed = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**exact_env, "CODEX_HOOK_MODE": "mixed",
+             "CODEX_HOOK_SECOND_SOURCE": str(primary)},
+    )
+    check("one exact source cannot hide a second checkout's project hooks",
+          mixed.status == "wrong-checkout"
+          and agentkit_mod.codex_hooks_lib.discovery_problem(repo, mixed) is not None,
+          str(mixed))
+
+    warned = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**exact_env, "CODEX_HOOK_MODE": "warning"},
+    )
+    check("discovery diagnostics fail even when the expected source is present",
+          warned.status == "exact"
+          and "fixture discovery warning" in
+          (agentkit_mod.codex_hooks_lib.discovery_problem(repo, warned) or ""),
+          str(warned))
+
+    missing_trust = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**exact_env, "CODEX_HOOK_MODE": "missing-trust"},
+    )
+    check("a project hook without trust state cannot look fully trusted",
+          missing_trust.status == "exact" and missing_trust.trust_statuses == ("unknown",),
+          str(missing_trust))
+
+    probe_matrix = agentkit_mod.codex_probes(repo, repo / "mcp-marker")
+    mcp_prompts = {label: prompt for label, prompt, _reason, _marker, _exists in probe_matrix
+                   if label.startswith("MCP ")}
+    check("Codex MCP probes name the exact qualified tool and cannot match an alias",
+          "`mcp__agentkit_probe__danger`" in mcp_prompts.get("MCP denial", "")
+          and "`mcp__agentkit_probe__safe`" in mcp_prompts.get("MCP allow", ""),
+          str(mcp_prompts))
+
+
+def test_migration_workflow(tmp: Path) -> None:
+    """The on-demand workflow must checkpoint and preserve recovery state itself."""
+    source = tmp / "source"
+    source.mkdir(parents=True)
+    git_init(source)
+    (source / "AGENTS.md").write_text("# migration fixture\n", encoding="utf-8")
+    (source / "README.md").write_text("base\n", encoding="utf-8")
+    (source / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    hooks = source / ".githooks"
+    hooks.mkdir()
+    precommit = hooks / "pre-commit"
+    precommit.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    precommit.chmod(0o755)
+    git_commit_all(source)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "ssh://example.invalid/fixture.git"],
+        cwd=source, check=True,
+    )
+
+    (source / "README.md").write_text("staged\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=source, check=True)
+    (source / "README.md").write_text("staged\nunstaged\n", encoding="utf-8")
+    (source / "notes.txt").write_text("untracked\n", encoding="utf-8")
+    (source / "notes-link").symlink_to("notes.txt")
+    (source / "cache").mkdir()
+    (source / "cache" / "generated.pyc").write_bytes(b"ignored")
+    before = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=source, check=True, capture_output=True,
+    ).stdout
+
+    destination = tmp / "standalone"
+    script = KIT / "skills" / "migrate-repocharter" / "scripts" / "prepare_standalone.py"
+    prepared = subprocess.run(
+        [sys.executable, str(script), "--repo", str(source), "--dest", str(destination),
+         "--branch", "chore/repocharter-test", "--mode", "preserve-state"],
+        capture_output=True, text=True, timeout=120,
+    )
+    after = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=destination, check=True, capture_output=True,
+    ).stdout if destination.is_dir() else b""
+
+    section("migration skill — standalone recovery is agent-operated")
+    check("the standalone helper completes", prepared.returncode == 0,
+          prepared.stdout[-500:] + prepared.stderr[-500:])
+    check("the destination is an independent normal clone",
+          (destination / ".git").is_dir() and not (destination / ".git").is_file())
+    check("staged, unstaged, and untracked status transfers byte-for-byte",
+          before == after, f"before={before!r} after={after!r}")
+    check("untracked symlinks are preserved without dereferencing",
+          (destination / "notes-link").is_symlink()
+          and os.readlink(destination / "notes-link") == "notes.txt")
+    check("ignored generated content is not copied",
+          not (destination / "cache" / "generated.pyc").exists())
+    check("the canonical origin replaces the temporary local clone remote",
+          subprocess.run(["git", "remote", "get-url", "origin"], cwd=destination,
+                         capture_output=True, text=True).stdout.strip()
+          == "ssh://example.invalid/fixture.git")
+    check("the repository's pre-commit lane is activated in the clone",
+          subprocess.run(["git", "config", "core.hooksPath"], cwd=destination,
+                         capture_output=True, text=True).stdout.strip() == ".githooks")
+
+    clean_destination = tmp / "clean-standalone"
+    clean_prepared = subprocess.run(
+        [sys.executable, str(script), "--repo", str(source),
+         "--dest", str(clean_destination), "--branch", "chore/repocharter-clean-test"],
+        capture_output=True, text=True, timeout=120,
+    )
+    clean_status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=clean_destination, capture_output=True, text=True,
+    ).stdout if clean_destination.is_dir() else "missing"
+    check("clean-head mode leaves unrelated source WIP out of the migration clone",
+          clean_prepared.returncode == 0 and clean_status == ""
+          and (clean_destination / "README.md").read_text(encoding="utf-8") == "base\n"
+          and not (clean_destination / "notes.txt").exists(),
+          clean_prepared.stderr[-300:] + clean_status)
+    source_after_clean = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=source, check=True, capture_output=True,
+    ).stdout
+    check("clean-head recovery does not alter the dirty source",
+          source_after_clean == before,
+          f"before={before!r} after={source_after_clean!r}")
+
+    destination_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=destination, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    repeated = subprocess.run(
+        [sys.executable, str(script), "--repo", str(source), "--dest", str(destination)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("an existing destination is refused without replacement",
+          repeated.returncode != 0 and "left untouched" in repeated.stderr,
+          repeated.stderr[-300:])
+    check("refusal leaves the verified clone intact",
+          subprocess.run(["git", "rev-parse", "HEAD"], cwd=destination, check=True,
+                         capture_output=True, text=True).stdout.strip() == destination_head)
+
+    old_kit = source / "kit" / "agentkit"
+    old_kit.parent.mkdir()
+    old_kit.write_text("KIT_VERSION = '0.3.1'\n", encoding="utf-8")
+    source_checkpoint = KIT / "skills" / "migrate-repocharter" / "scripts" / "checkpoint.py"
+    preupgrade = subprocess.run(
+        [sys.executable, str(source_checkpoint), "--repo", str(source), "--json"],
+        capture_output=True, text=True, timeout=120,
+    )
+    try:
+        preupgrade_report = json.loads(preupgrade.stdout)
+    except json.JSONDecodeError:
+        preupgrade_report = {}
+    check("a new distribution checkpoints an older target without using old helper APIs",
+          preupgrade.returncode == 0
+          and preupgrade_report.get("upgradeRequired") is True
+          and preupgrade_report.get("expectedAgentkitVersion") == agentkit_mod.KIT_VERSION,
+          preupgrade.stderr[-300:] + str(preupgrade_report)[:500])
+    check("dirty pre-upgrade work selects a clean-HEAD clone",
+          preupgrade_report.get("route") == "standalone-clone"
+          and preupgrade_report.get("standaloneMode") == "clean-head",
+          str(preupgrade_report)[:600])
+
+    git_commit_all(source)
+    installed = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(source)],
+        capture_output=True, text=True, timeout=120,
+    )
+    git_commit_all(source)
+    linked = tmp / "linked"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "checkpoint-linked", str(linked), "HEAD"],
+        cwd=source, check=True, capture_output=True,
+    )
+    bin_dir = tmp / "bin"
+    bin_dir.mkdir()
+    codex_stub = bin_dir / "codex"
+    codex_stub.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+if sys.argv[1:] == ["--version"]:
+    print("codex-fixture 1")
+    raise SystemExit
+for raw in sys.stdin:
+    request = json.loads(raw)
+    if request.get("id") == 1:
+        result = {"userAgent": "fixture"}
+    else:
+        cwd = request["params"]["cwds"][0]
+        hooks = []
+        if os.environ.get("CODEX_HOOK_MODE") == "exact":
+            hooks = [{"eventName": "PreToolUse", "matcher": "Bash", "source": "project",
+                      "sourcePath": cwd + "/.codex/hooks.json", "trustStatus": "trusted"}]
+        result = {"data": [{"cwd": cwd, "hooks": hooks, "warnings": [], "errors": []}]}
+    print(json.dumps({"id": request.get("id"), "result": result}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    codex_stub.chmod(0o755)
+    _stub_claude(bin_dir, "claude-fixture 1")
+    checkpoint_script = (
+        linked / ".agents" / "skills" / "migrate-repocharter" / "scripts" / "checkpoint.py"
+    )
+    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", "")}
+    checkpoint = subprocess.run(
+        [sys.executable, str(checkpoint_script), "--repo", str(linked), "--json"],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    try:
+        report = json.loads(checkpoint.stdout)
+    except json.JSONDecodeError:
+        report = {}
+    check("the checkpoint fixture starts from a complete apply",
+          installed.returncode == 0 and checkpoint.returncode == 0,
+          installed.stderr[-200:] + checkpoint.stderr[-300:])
+    check("zero Codex hooks in a linked worktree select standalone recovery",
+          report.get("route") == "standalone-clone", str(report)[:600])
+    check("the checkpoint names Codex promotion as still required",
+          report.get("providers", {}).get("codex", {}).get("promotionRequired") is True,
+          str(report)[:600])
+
+    compat_path = source / ".agents" / "compatibility.json"
+    compat = json.loads(compat_path.read_text(encoding="utf-8"))
+    codex_evidence = {
+        "verifiedOn": "2026-08-10",
+        "harnessVersion": "codex-fixture 1",
+        "adapterSha256": agentkit_mod.codex_adapter_digest(source),
+        "method": "live-deny-and-observe",
+    }
+    claude_evidence = {
+        "verifiedOn": "2026-08-10",
+        "harnessVersion": "claude-fixture 1",
+        "adapterSha256": agentkit_mod.claude_adapter_digest(source),
+        "method": "live-deny-and-observe",
+    }
+    compat["enforcement"] = {"codex": "blocking", "claude-code": "blocking"}
+    compat["enforcementEvidence"] = {
+        "codex": codex_evidence,
+        "claude-code": claude_evidence,
+    }
+    compat_path.write_text(json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+    agentkit_mod.write_checkout_evidence(source, "codex", codex_evidence)
+    agentkit_mod.write_checkout_evidence(source, "claude-code", claude_evidence)
+    claude_config = tmp / "claude-config"
+    Path(f"{claude_config}.json").write_text(json.dumps({
+        "projects": {str(source.resolve()): {"hasTrustDialogAccepted": True}}
+    }), encoding="utf-8")
+
+    previous_path = os.environ.get("PATH")
+    previous_claude_config = os.environ.get("CLAUDE_CONFIG_DIR")
+    previous_hook_mode = os.environ.get("CODEX_HOOK_MODE")
+    os.environ["PATH"] = str(bin_dir) + os.pathsep + (previous_path or "")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config)
+    os.environ["CODEX_HOOK_MODE"] = "exact"
+    try:
+        codex_state = agentkit_mod.provider_promotion_state(source, "codex", compat)
+        claude_state = agentkit_mod.provider_promotion_state(source, "claude-code", compat)
+        (source / "docs-note.md").write_text("documentation only\n", encoding="utf-8")
+        docs_only_state = agentkit_mod.provider_promotion_state(source, "codex", compat)
+
+        original_codex_live = agentkit_mod.live_codex_self_test
+        original_claude_live = agentkit_mod.live_claude_self_test
+        agentkit_mod.live_codex_self_test = lambda _repo: (_ for _ in ()).throw(
+            AssertionError("Codex live probes should have been skipped")
+        )
+        agentkit_mod.live_claude_self_test = lambda _repo: (_ for _ in ()).throw(
+            AssertionError("Claude live probes should have been skipped")
+        )
+        fast_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(fast_output):
+                fast_result = agentkit_mod.cmd_self_test(
+                    source, promote_codex=True, promote_claude=True,
+                )
+        finally:
+            agentkit_mod.live_codex_self_test = original_codex_live
+            agentkit_mod.live_claude_self_test = original_claude_live
+
+        policy_path = source / ".claude" / "hooks" / "agentkit" / "_policy.py"
+        original_policy = policy_path.read_bytes()
+        policy_path.write_bytes(original_policy + b"# invalidated\n")
+        invalidated = agentkit_mod.provider_promotion_state(source, "codex", compat)
+        policy_path.write_bytes(original_policy)
+
+        partial_compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        partial_compat["enforcement"] = {"codex": "advisory", "claude-code": "advisory"}
+        partial_compat.pop("enforcementEvidence", None)
+        compat_path.write_text(json.dumps(partial_compat, indent=2) + "\n", encoding="utf-8")
+        for harness in ("codex", "claude-code"):
+            local_path = agentkit_mod.checkout_evidence_path(source, harness)
+            if local_path is not None:
+                local_path.unlink(missing_ok=True)
+        original_codex_live = agentkit_mod.live_codex_self_test
+        original_claude_live = agentkit_mod.live_claude_self_test
+        agentkit_mod.live_codex_self_test = lambda _repo: (
+            ["fixture Codex trust failure"], "codex-fixture 1",
+        )
+        agentkit_mod.live_claude_self_test = lambda _repo: ([], "claude-fixture 1")
+        partial_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(partial_output):
+                partial_result = agentkit_mod.cmd_self_test(
+                    source, promote_codex=True, promote_claude=True,
+                )
+        finally:
+            agentkit_mod.live_codex_self_test = original_codex_live
+            agentkit_mod.live_claude_self_test = original_claude_live
+        partial_after = json.loads(compat_path.read_text(encoding="utf-8"))
+    finally:
+        if previous_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = previous_path
+        if previous_claude_config is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = previous_claude_config
+        if previous_hook_mode is None:
+            os.environ.pop("CODEX_HOOK_MODE", None)
+        else:
+            os.environ["CODEX_HOOK_MODE"] = previous_hook_mode
+
+    section("migration skill — current promotion evidence is a fast path")
+    check("matching Codex evidence and exact trusted discovery are current",
+          codex_state["current"], str(codex_state))
+    check("matching Claude evidence and persisted workspace trust are current",
+          claude_state["current"], str(claude_state))
+    check("a documentation-only change does not demand live promotion",
+          docs_only_state["current"], str(docs_only_state))
+    check("explicit promotion flags reuse current evidence without provider probes",
+          fast_result == 0
+          and "current checkout evidence reused: codex, claude-code" in fast_output.getvalue(),
+          fast_output.getvalue()[-800:])
+    check("changed adapter bytes invalidate the fast path",
+          invalidated["promotionRequired"]
+          and any("adapter bytes differ" in reason for reason in invalidated["reasons"]),
+          str(invalidated))
+    check("one provider failure does not discard another provider's successful proof",
+          partial_result == 1
+          and partial_after["enforcement"]["codex"] == "advisory"
+          and partial_after["enforcement"]["claude-code"] == "blocking"
+          and "codex" not in (partial_after.get("enforcementEvidence") or {})
+          and "claude-code" in (partial_after.get("enforcementEvidence") or {}),
+          partial_output.getvalue()[-900:])
 
 
 def test_codex_foreign_hook_closure(tmp: Path) -> None:
@@ -1691,6 +2240,8 @@ def test_vendor_and_precommit(tmp: Path) -> None:
     check("kit/agentkit is vendored", (repo / "kit" / "agentkit").exists())
     check("and it is executable", os.access(repo / "kit" / "agentkit", os.X_OK))
     check("the residue checker comes with it", (repo / "kit" / "verify" / "residue.py").exists())
+    check("the managed migration workflow is vendored for self-refresh",
+          (repo / "kit" / "skills" / "migrate-repocharter" / "SKILL.md").is_file())
     check("tests are NOT vendored (runtime, not workshop)",
           not (repo / "kit" / "tests").exists())
 
@@ -1885,6 +2436,10 @@ def test_stale_session_tombstone(tmp: Path) -> None:
 
 
 def main() -> int:
+    clear_parent_git_environment()
+    section("test harness — disposable Git fixtures are isolated from parent hooks")
+    check("parent repository-local Git environment is scrubbed",
+          not (GIT_LOCAL_ENV_VARS & os.environ.keys()))
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         # Keep quarantine/revert tests inside the disposable tree. This makes the same
@@ -1897,6 +2452,8 @@ def main() -> int:
         test_mcp_gate(tmp)
         test_configchange(tmp)
         test_residue(tmp)
+        test_codex_hook_discovery(tmp / "codex-hook-discovery")
+        test_migration_workflow(tmp / "migration-workflow")
         test_codex_foreign_hook_closure(tmp / "codex-foreign-hook")
         test_claude_enforcement_evidence(tmp / "claude-enforcement")
         test_policy_and_supersede(tmp / "policy")

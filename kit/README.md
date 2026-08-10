@@ -6,12 +6,19 @@ repository, one version stamp, one command to install and one to check.
 RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
 `agentkit` name so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 322 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 367 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
 `verify`. The migration commands are specialized compatibility tools retained for recognized
 legacy layouts; they are not required for normal adoption.
+
+For an agent-owned adoption, upgrade, provider promotion, or integration, use
+`kit/skills/migrate-repocharter/SKILL.md`. `apply` installs that workflow through the existing
+project-skills adapter. Its checkpoint distinguishes current evidence from stale evidence, so a
+branch switch or documentation-only commit does not rerun the full provider matrix. If Codex
+silently substitutes the primary checkout's hooks for a linked worktree, the workflow preserves the
+current state in an independent normal clone instead of bypassing hook trust.
 
 ## Install into a repository
 
@@ -34,6 +41,10 @@ conforming repo reports `0 change(s)`.
 **Never writes:** `AGENTS.md`'s body or anything under `docs/project/`. Those files contain
 project-specific knowledge and remain human-authored. Copy `kit/templates/AGENTS.md.tmpl`
 and fill it in yourself.
+
+`migrate-repocharter` is the one product-managed project skill and is refreshed on upgrade;
+otherwise a fixed workflow could remain stale in the exact repositories that need it. Existing
+project skills, including any customized `project-memory`, are preserved rather than overwritten.
 
 Claude auto memory defaults **off** because `docs/project/` is the reviewed, portable home for
 durable knowledge. An explicit `autoMemory: "on"` exception must carry `autoMemoryReason`; `apply`
@@ -58,6 +69,9 @@ pre-existing `autoMemoryEnabled: true` is preserved and surfaced with a reason f
 | Specialized | `revert` | undoes the last mechanical migration from its manifest | 0 / 1 |
 
 ### The order for one repository
+
+An agent should execute this sequence through `$migrate-repocharter`; the commands are shown here so
+the protocol stays reviewable.
 
 ```sh
 kit/agentkit census  --repo ~/dev/foo             # measure before touching
@@ -166,6 +180,12 @@ and installed CLI version only after Bash, `apply_patch`, and MCP are denied thr
 and an ordinary no-bypass run proves that project trust persists. Open `/hooks` after installation
 or any adapter change; a temporary trust override proves code paths, not operational enforcement.
 
+Before Codex promotion, RepoCharter queries `hooks/list` for the exact checkout and requires every
+project hook source to resolve to that checkout's `.codex/hooks.json`. Zero hooks or a source path
+from another checkout fails before live probes. Codex 0.147 currently resolves linked-worktree
+project hooks from the primary checkout; after one exact persisted-trust retry reproduces that
+result, continue from an independent clone with a normal `.git/` directory.
+
 When `apply` preserves a foreign Codex hook, promotion derives a conservative closure from its
 command. Static checkout-relative scripts, including the exact
 `$(git rev-parse --show-toplevel)/...` form, are copied into the disposable probe and hashed into
@@ -193,6 +213,11 @@ provider CLI is present, it also requires an exact checkout-local record under t
 absolute Git directory. A clone, sibling worktree, edited gate, upgraded CLI, or changed RepoCharter
 version therefore cannot inherit yesterday's machine claim. Provider-neutral CI without that CLI
 still performs portable byte checks and reports the unavailable provider check as a note.
+
+An explicit promotion request reuses current checkout evidence when all of those bindings still
+match, Claude workspace trust/effective settings remain valid, and Codex reports the exact trusted
+hook source. Otherwise it runs the live provider probes and fails closed. This makes integration of
+an unchanged migration commit cheap without making tracked `blocking` text self-certifying.
 
 ## The gates
 
@@ -252,7 +277,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-322 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+367 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI
