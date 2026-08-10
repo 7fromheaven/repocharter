@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.3.3** · CLI: `kit/agentkit`
+> Current version: **RepoCharter 0.3.4** · CLI: `kit/agentkit`
 >
-> **300 tests** · **zero runtime dependencies**
+> **310 tests** · **zero runtime dependencies**
 
 RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
 repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
@@ -71,6 +71,12 @@ docs/project/
 
 The result is deliberately simple: one authored instruction file, one policy, and one durable
 project-memory layout. Provider-specific files are adapters, not competing sources of truth.
+
+Claude auto memory is disabled by default. RepoCharter already gives learned facts a reviewed,
+portable home under `docs/project/`; a hidden, machine-local `MEMORY.md` would duplicate that system
+and add startup context that other agents and CI cannot see. A repository may explicitly opt in by
+setting `autoMemory: "on"` and recording a nonempty `autoMemoryReason`, but auto memory never becomes
+authoritative project state.
 
 ## Provider support
 
@@ -289,6 +295,8 @@ optionally adds the network-fetched shared rule catalogue.
 
 - **Dirty worktrees are refused** unless you explicitly pass `--allow-dirty`.
 - **Existing hooks and unrelated settings are preserved**, including user allow-lists.
+- **Claude auto memory defaults off**; an explicit opt-in must record why its provider-local
+  scratchpad is appropriate for that repository.
 - **`AGENTS.md` and `docs/project/` remain human-owned.**
 - **Every install is idempotent**; a conforming repository reports zero changes.
 - **Pre-commit verification fails closed** if Python, the vendored CLI, or a declared validation
@@ -299,7 +307,7 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter is used in production repositories today. Its 300-test suite is intentionally
+RepoCharter is used in production repositories today. Its 310-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -328,6 +336,18 @@ and ZCode currently provide portable context without RepoCharter tool-call enfor
 - RepoCharter does not synchronize credentials, connector authorization, environment files, or
   customer data.
 
+## License and contributions
+
+RepoCharter is licensed under the [Apache License 2.0](LICENSE). Copyright for
+individual contributions remains with their respective contributors. Unless explicitly stated
+otherwise, contributions submitted for inclusion are licensed under Apache-2.0 as described in
+section 5 of the license.
+
+Portions of the Bash safety policy were adapted from
+[ctx-fieldbook](https://github.com/armenr/ctx-fieldbook), created by **Armen Rostamian**, and are
+used and relicensed with permission. See [NOTICE](NOTICE) for the durable
+attribution carried by redistributed copies.
+
 ---
 
 ## Repository layout
@@ -340,7 +360,9 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         300 tests, no dependencies, mostly negative
+kit/tests/         310 tests, no dependencies, mostly negative
+LICENSE            Apache License 2.0
+NOTICE             contributor and upstream attribution
 ```
 
 **Ready to try RepoCharter?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is

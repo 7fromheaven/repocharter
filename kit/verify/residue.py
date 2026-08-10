@@ -530,13 +530,16 @@ def check_declaration(root: Path, compat: dict, rep: Report) -> None:
             f"compatibility.json declares autoMemory = {declared!r} but settings.json yields "
             f"{actual!r}. Update the declaration or the setting so they agree."
         )
-    if declared == "off" and not compat.get("autoMemoryReason"):
-        rep.error("autoMemory is 'off' but autoMemoryReason is empty. Say what data boundary it protects.")
+    reason = compat.get("autoMemoryReason")
+    if declared == "on" and (not isinstance(reason, str) or not reason.strip()):
+        rep.error(
+            "autoMemory is 'on' but autoMemoryReason is empty. RepoCharter disables Claude-only "
+            "machine-local startup context by default; document why this repository opts in."
+        )
     if actual == "on":
         rep.note(
-            "auto memory is ON: up to 200 lines or 25 KB of machine-local MEMORY.md joins the "
-            "Claude-visible startup set, which CI cannot see. That is more than the entire "
-            "repo-authored budget. Intended, but it should not be a surprise."
+            "auto memory is ON by explicit exception: up to 200 lines or 25 KB of machine-local "
+            "MEMORY.md joins the Claude-visible startup set, which CI and other agents cannot see."
         )
 
     adapters = compat.get("adapters") or []

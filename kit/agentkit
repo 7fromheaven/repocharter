@@ -33,7 +33,7 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.3.3"
+KIT_VERSION = "0.3.4"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -332,8 +332,9 @@ def claude_checkout_preflight(repo: Path) -> tuple[list[str], Path | None]:
 def default_compat(repo: Path) -> dict:
     """The declaration a fresh repo starts from.
 
-    autoMemory defaults to "on" to match Claude Code. A repository with a data boundary can
-    disable it and record why; `verify` checks the declaration against settings.json.
+    autoMemory defaults to "off" because RepoCharter already gives durable knowledge one
+    reviewed, portable home. A repository may opt into Claude-only machine-local memory and
+    record why; `verify` checks both the exception and the effective settings value.
     """
     return {
         "$schema": "../kit/schema/compatibility.schema.json",
@@ -358,7 +359,7 @@ def default_compat(repo: Path) -> dict:
              "note": "client-scoped: import from the Codex source as Project + Symlink, then confirm $<name> appears"},
         ],
         "enforcement": {"claude-code": "advisory", "codex": "advisory", "zcode": "advisory"},
-        "autoMemory": "on",
+        "autoMemory": "off",
         "budgets": {
             "codexProjectDocMaxBytes": 32768,
             "codexBudgetSource": "codex-rs/config/src/config_toml.rs DEFAULT_PROJECT_DOC_MAX_BYTES @ 85e0661c3baa (2026-08-07)",
@@ -697,10 +698,10 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
         if not dry:
             path.mkdir(parents=True, exist_ok=True)
 
-    # 1. The declaration. On a FIRST install the declaration is derived from what the repo
-    #    already does, not from the kit's preference: a repo that has deliberately disabled
-    #    auto memory should not be handed a declaration saying otherwise and then fail its
-    #    own verify on the first run. The default only applies where reality is silent.
+    # 1. The declaration. On a FIRST install, preserve an explicit pre-existing auto-memory
+    #    setting rather than silently changing an operator choice. Where reality is silent,
+    #    RepoCharter's portable OFF default applies. An explicit ON is an exception and must
+    #    carry a reason so the provider-specific hidden context is visible in review.
     compat_path = repo / ".agents" / "compatibility.json"
     existing = read_json(compat_path)
     fresh = default_compat(repo)
@@ -708,11 +709,21 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
         current_settings = read_json(repo / ".claude" / "settings.json", {}) or {}
         if "autoMemoryEnabled" in current_settings:
             fresh["autoMemory"] = "on" if current_settings["autoMemoryEnabled"] else "off"
-            if fresh["autoMemory"] == "off":
+            if fresh["autoMemory"] == "on":
                 fresh["autoMemoryReason"] = (
-                    "Carried over from this repo's existing settings.json at agentkit install. "
-                    "Replace this with the actual reason, or turn it back on."
+                    "Preserved an explicit pre-existing autoMemoryEnabled: true setting during "
+                    "RepoCharter installation. Replace this with why Claude-only machine-local "
+                    "startup context is wanted here, or turn it off."
                 )
+    if existing and existing.get("autoMemory") == "on" and not str(
+            existing.get("autoMemoryReason") or "").strip():
+        # Releases through 0.3.3 wrote ON as the fleet default, so an unreasoned ON is
+        # not evidence of an operator choice. Move that inherited default to the new safe
+        # baseline. A deliberate ON survives because the declaration records why.
+        existing = dict(existing)
+        existing["autoMemory"] = "off"
+        existing.pop("autoMemoryReason", None)
+        say("disabled the legacy unreasoned auto-memory default; add autoMemoryReason to opt in")
     compat = merge_compat(existing, fresh) if existing else fresh
     if existing != compat:
         put_json(compat_path, compat,
@@ -808,9 +819,9 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
         put_json(codex_path, codex_settings, "updated .codex/hooks.json (Codex safety adapter)")
         changed += 1
 
-    # 3. settings.json. agentkit owns ITS OWN hook entries and permissions.deny; everything
-    #    else -- the operator's allow list, their statusLine, and crucially THEIR HOOKS --
-    #    is preserved untouched.
+    # 3. settings.json. agentkit owns ITS OWN hook entries, permissions.deny, and the
+    #    compatibility manifest's declared auto-memory state; everything else -- the
+    #    operator's allow list, their statusLine, and crucially THEIR HOOKS -- is preserved.
     #
     #    Merge rather than replace so foreign hook groups remain installed. Claude Code runs
     #    every matching hook group, so agentkit's entries can coexist with existing ones.
@@ -868,7 +879,7 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
             deny.append(literal)
     permissions["deny"] = sorted(set(deny))
 
-    settings.setdefault("autoMemoryEnabled", compat.get("autoMemory", "on") == "on")
+    settings["autoMemoryEnabled"] = compat.get("autoMemory", "off") == "on"
 
     if json.dumps(settings, sort_keys=True) != before:
         put_json(settings_path, settings,

@@ -84,12 +84,13 @@
     "autoMemory": {
       "type": "string",
       "enum": ["on", "off"],
-      "description": "Declared state of Claude Code auto memory. Asserted against settings.json `autoMemoryEnabled`; a mismatch is an error. Default is `on` — Anthropic's own split puts learnings there. Set `off` where a data boundary exists, and say why in autoMemoryReason."
+      "description": "Declared state of Claude Code auto memory. Asserted against settings.json `autoMemoryEnabled`; a mismatch is an error. RepoCharter defaults to `off` because durable context belongs in reviewed, portable project files. `on` is an explicit Claude-only exception and requires autoMemoryReason."
     },
 
     "autoMemoryReason": {
       "type": "string",
-      "description": "Required when autoMemory is `off`. An unreviewed store the agent writes to unprompted is a data-at-rest surface; if that is the reason, name the data."
+      "minLength": 1,
+      "description": "Required when autoMemory is `on`. Explain why this repository accepts machine-local, unreviewed, Claude-only startup context instead of the canonical project-memory system."
     },
 
     "budgets": {

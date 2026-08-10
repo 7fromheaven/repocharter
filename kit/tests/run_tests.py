@@ -102,6 +102,7 @@ def make_repo(tmp: Path, policy: dict | None = None, compat_extra: dict | None =
                       "project": "docs/project", "skills": ".agents/skills"},
         "enforcement": {"claude-code": "advisory"},
         "autoMemory": "on",
+        "autoMemoryReason": "Test fixture explicitly keeps Claude's provider-local default.",
         "budgets": {"codexProjectDocMaxBytes": 32768, "claudeLineTarget": 200},
         "policy": policy or {},
     }
@@ -614,6 +615,31 @@ def test_residue(tmp: Path) -> None:
     rep = residue(repo)
     check("autoMemory declaration mismatch is an error", has(rep, "errors", "autoMemory"), str(rep["errors"])[:200])
 
+    repo = make_repo(tmp / "r7-missing-reason")
+    compat_path = repo / ".agents" / "compatibility.json"
+    compat = json.loads(compat_path.read_text(encoding="utf-8"))
+    compat.pop("autoMemoryReason")
+    compat_path.write_text(json.dumps(compat), encoding="utf-8")
+    rep = residue(repo)
+    check("autoMemory ON without an exception reason is an error",
+          has(rep, "errors", "opts in"), str(rep["errors"])[:200])
+    compat["autoMemoryReason"] = "   "
+    compat_path.write_text(json.dumps(compat), encoding="utf-8")
+    rep = residue(repo)
+    check("whitespace cannot masquerade as an auto-memory exception reason",
+          has(rep, "errors", "opts in"), str(rep["errors"])[:200])
+
+    repo = make_repo(tmp / "r7-off", compat_extra={"autoMemory": "off"})
+    compat_path = repo / ".agents" / "compatibility.json"
+    compat = json.loads(compat_path.read_text(encoding="utf-8"))
+    compat.pop("autoMemoryReason")
+    compat_path.write_text(json.dumps(compat), encoding="utf-8")
+    (repo / ".claude" / "settings.json").write_text(
+        json.dumps({"autoMemoryEnabled": False}), encoding="utf-8")
+    rep = residue(repo)
+    check("autoMemory OFF needs no exception reason",
+          not has(rep, "errors", "autoMemory"), str(rep["errors"])[:200])
+
     repo = make_repo(tmp / "r8")
     rules = repo / ".claude" / "rules"
     rules.mkdir(parents=True, exist_ok=True)
@@ -807,6 +833,9 @@ def test_apply(tmp: Path) -> None:
     check("AGENTS.md untouched by apply", (repo / "AGENTS.md").read_bytes() == original)
 
     settings = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    compat = json.loads((repo / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
+    check("auto memory defaults OFF in compatibility.json", compat["autoMemory"] == "off", str(compat))
+    check("apply disables Claude auto memory by default", settings["autoMemoryEnabled"] is False, str(settings))
     matchers = [g.get("matcher") for g in settings["hooks"]["PreToolUse"]]
     check("three PreToolUse matchers, not one", len(matchers) == 3, str(matchers))
     check("Edit|Write matcher present", any("Edit" in (m or "") for m in matchers), str(matchers))
@@ -840,6 +869,7 @@ def test_apply(tmp: Path) -> None:
     (legacy / "AGENTS.md").write_text("# t\n", encoding="utf-8")
     (legacy / ".claude" / "settings.json").write_text(json.dumps({
         "statusLine": {"type": "command", "command": "x"},
+        "autoMemoryEnabled": True,
         "hooks": {
             "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/their-gate.sh"}]}],
             "SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/router.sh startup"}]}],
@@ -851,6 +881,8 @@ def test_apply(tmp: Path) -> None:
     out = subprocess.run([sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(legacy)],
                          capture_output=True, text=True, timeout=120)
     merged = json.loads((legacy / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    legacy_compat = json.loads(
+        (legacy / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
     all_commands = [h["command"] for groups in merged["hooks"].values()
                     for g in groups for h in g.get("hooks", [])]
     check("apply reports what it preserved", "preserved 3 existing hook entries" in out.stdout, out.stdout[:400])
@@ -862,10 +894,47 @@ def test_apply(tmp: Path) -> None:
     check("both Bash hooks coexist",
           len([c for c in all_commands if "pretooluse-bash.sh" in c or "their-gate.sh" in c]) == 2, str(all_commands))
     check("unrelated statusLine preserved", merged.get("statusLine", {}).get("command") == "x")
+    check("an explicit pre-existing auto-memory opt-in is preserved",
+          merged.get("autoMemoryEnabled") is True and legacy_compat.get("autoMemory") == "on")
+    check("a preserved auto-memory opt-in gets a reviewable reason",
+          "pre-existing" in legacy_compat.get("autoMemoryReason", ""), str(legacy_compat))
 
     again = subprocess.run([sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(legacy)],
                            capture_output=True, text=True, timeout=120)
     check("re-apply over foreign hooks is still idempotent", "0 change(s)" in again.stdout, again.stdout[-200:])
+
+    section("apply — upgrades the inherited auto-memory default")
+    inherited = tmp / "inherited-auto-memory"
+    inherited.mkdir(parents=True, exist_ok=True)
+    git_init(inherited)
+    (inherited / "AGENTS.md").write_text("# t\n", encoding="utf-8")
+    (inherited / ".agents").mkdir()
+    old_compat = agentkit_mod.default_compat(inherited)
+    old_compat["agentkitVersion"] = "0.3.3"
+    old_compat["autoMemory"] = "on"
+    old_compat.pop("autoMemoryReason", None)
+    (inherited / ".agents" / "compatibility.json").write_text(
+        json.dumps(old_compat, indent=2) + "\n", encoding="utf-8")
+    (inherited / ".claude").mkdir()
+    (inherited / ".claude" / "settings.json").write_text(
+        json.dumps({"autoMemoryEnabled": True}, indent=2) + "\n", encoding="utf-8")
+    git_commit_all(inherited)
+    upgraded = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(inherited)],
+        capture_output=True, text=True, timeout=120,
+    )
+    inherited_compat = json.loads(
+        (inherited / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
+    inherited_settings = json.loads(
+        (inherited / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    check("an inherited unreasoned ON declaration migrates to OFF",
+          upgraded.returncode == 0 and inherited_compat.get("autoMemory") == "off",
+          upgraded.stderr + str(inherited_compat))
+    check("the upgrade disables Claude auto memory in settings.json",
+          inherited_settings.get("autoMemoryEnabled") is False, str(inherited_settings))
+    check("the migration is reported instead of happening silently",
+          "disabled the legacy unreasoned auto-memory default" in upgraded.stdout,
+          upgraded.stdout[-500:])
 
     section("apply — must preserve foreign Codex hooks too")
     codex_config_path = repo / ".codex" / "hooks.json"
