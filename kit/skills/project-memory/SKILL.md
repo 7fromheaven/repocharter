@@ -79,6 +79,7 @@ At **checkpoint** and at **handoff** — the two moments where both the failure 
 attention to record it exist at once. Writing a pitfall the moment it happens is the only
 time it is cheap; a week later nobody remembers the observable.
 
-Auto memory, where enabled, is a machine-local scratchpad. It is not shared across machines
-or code-reviewed, so nothing authoritative may live there. If a fact matters to the next
-person, it goes in `docs/project/`.
+RepoCharter disables Claude auto memory by default because this project layout already gives
+durable knowledge a reviewed, portable home. A repository may explicitly opt in with a recorded
+reason, but that machine-local scratchpad is neither shared nor code-reviewed. Nothing
+authoritative may live there; if a fact matters to the next person, it goes in `docs/project/`.

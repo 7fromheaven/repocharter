@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
 `agentkit` name so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 300 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 310 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -24,8 +24,8 @@ conforming repo reports `0 change(s)`.
 
 - `.agents/compatibility.json` — the declaration, merged rather than overwritten
 - `.claude/hooks/agentkit/*` — the gate scripts, vendored not symlinked
-- `.claude/settings.json` — **only** the `hooks` key and `permissions.deny`; every other
-  key, including your allow-list, is preserved untouched
+- `.claude/settings.json` — the managed `hooks`, `permissions.deny`, and declared auto-memory
+  state; every other key, including your allow-list, is preserved untouched
 - `.codex/hooks.json` — current project-hook schema, merged with foreign hook groups and keys
 - `.claude/skills/<name>` — relative symlinks into `.agents/skills/`
 - `.agnix.toml` — linter config with severities raised on the six rules that matter
@@ -34,6 +34,12 @@ conforming repo reports `0 change(s)`.
 **Never writes:** `AGENTS.md`'s body or anything under `docs/project/`. Those files contain
 project-specific knowledge and remain human-authored. Copy `kit/templates/AGENTS.md.tmpl`
 and fill it in yourself.
+
+Claude auto memory defaults **off** because `docs/project/` is the reviewed, portable home for
+durable knowledge. An explicit `autoMemory: "on"` exception must carry `autoMemoryReason`; `apply`
+then writes the matching `autoMemoryEnabled` setting. When upgrading an older RepoCharter manifest,
+an unreasoned inherited `on` is migrated to `off`. On a first installation only, an explicit
+pre-existing `autoMemoryEnabled: true` is preserved and surfaced with a reason for review.
 
 ## The commands
 
@@ -239,7 +245,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-300 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+310 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI

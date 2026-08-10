@@ -4,7 +4,8 @@
 # branch-protection or ruleset configuration requires this job to pass.
 #
 # Note also that CI cannot see the machine-local half of the Claude-visible startup set:
-# ~/.claude/CLAUDE.md, ancestor CLAUDE.md files, and MEMORY.md when auto memory is on. Those
+# ~/.claude/CLAUDE.md, ancestor CLAUDE.md files, and — where explicitly enabled — MEMORY.md.
+# Those
 # are reported by `agentkit verify --effective` on a developer machine and are deliberately
 # not gated here, because gating what CI cannot observe makes the budget a fiction.
 
