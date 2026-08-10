@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
 `agentkit` name so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 310 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 322 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -166,6 +166,13 @@ and installed CLI version only after Bash, `apply_patch`, and MCP are denied thr
 and an ordinary no-bypass run proves that project trust persists. Open `/hooks` after installation
 or any adapter change; a temporary trust override proves code paths, not operational enforcement.
 
+When `apply` preserves a foreign Codex hook, promotion derives a conservative closure from its
+command. Static checkout-relative scripts, including the exact
+`$(git rev-parse --show-toplevel)/...` form, are copied into the disposable probe and hashed into
+both attestations. Missing files, external implementations, variables, additional command
+substitutions, globs, and shell control flow fail clearly. The foreign group remains installed;
+never delete or bypass it to obtain a passing promotion.
+
 For Claude Code, `--promote-claude` drives the real `claude` executable in a disposable repository
 with project and local settings loaded — never `--bare`, which skips hooks and would certify a wire
 path the probe never used. The intended tool call and matching `hook_response` must appear in
@@ -245,7 +252,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-310 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+322 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI

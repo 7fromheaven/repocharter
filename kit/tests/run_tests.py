@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1031,6 +1032,180 @@ def _stub_codex(bin_dir: Path, version: str) -> Path:
     return stub
 
 
+def test_codex_foreign_hook_closure(tmp: Path) -> None:
+    """Preserved Codex hooks must travel with, and invalidate, their implementation bytes."""
+    repo = make_repo(tmp)
+    git_init(repo)
+    git_commit_all(repo)
+    installed = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("the foreign-hook fixture starts from a clean install",
+          installed.returncode == 0, installed.stdout[-300:] + installed.stderr[-300:])
+
+    foreign = repo / ".codex" / "hooks" / "push_gate.py"
+    foreign.parent.mkdir(parents=True)
+    foreign_text = """#!/usr/bin/env python3
+import json
+import sys
+
+payload = json.load(sys.stdin)
+command = (payload.get("tool_input") or {}).get("command", "")
+if "git push" in command and "main" in command:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+        "permissionDecision": "deny", "permissionDecisionReason": "foreign main guard"}}))
+"""
+    foreign.write_text(foreign_text, encoding="utf-8")
+    foreign.chmod(0o755)
+    config_path = repo / ".codex" / "hooks.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    def set_foreign(command: str) -> None:
+        groups = config["hooks"]["PreToolUse"]
+        groups[:] = [group for group in groups if group.get("matcher") != "Bash"]
+        groups.insert(0, {
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": command}],
+        })
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+    checkout_root_command = (
+        '/usr/bin/python3 "$(git rev-parse --show-toplevel)/.codex/hooks/push_gate.py"'
+    )
+    set_foreign(checkout_root_command)
+
+    section("Codex promotion — preserved foreign-hook closure")
+    closure = agentkit_mod.codex_hooks_lib.discover(repo)
+    check("an interpreter-prefixed checkout-root command resolves its local script",
+          closure.dependencies == (".codex/hooks/push_gate.py",) and not closure.errors,
+          str(closure))
+    digest_before = agentkit_mod.codex_adapter_digest(repo)
+    foreign.write_text(foreign_text + "# byte drift\n", encoding="utf-8")
+    digest_after = agentkit_mod.codex_adapter_digest(repo)
+    check("foreign hook bytes participate in the Codex adapter digest",
+          digest_before != digest_after and all(
+              isinstance(value, str) and len(value) == 64
+              for value in (digest_before, digest_after)
+          ), f"{digest_before} -> {digest_after}")
+    foreign.write_text(foreign_text, encoding="utf-8")
+
+    probe = tmp / "probe"
+    probe.mkdir()
+    git_init(probe)
+    agentkit_mod.copy_codex_probe_adapter(repo, probe, closure)
+    (probe / ".agents").mkdir()
+    compat = json.loads((repo / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
+    compat["policy"] = {
+        "protectedBranches": ["main", "master"],
+        "denyBashPatterns": [{
+            "pattern": "AGENTKIT_CODEX_BASH_RAN",
+            "reason": "AGENTKIT_CODEX_BASH_PROBE_DENIED",
+        }],
+        "denyWritePaths": [],
+        "denyMcpTools": [],
+        "measureOnWrite": [],
+    }
+    (probe / ".agents" / "compatibility.json").write_text(
+        json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+
+    def fire_bash(command: str) -> list[subprocess.CompletedProcess]:
+        payload = json.dumps({
+            "permission_mode": "default",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        })
+        installed_config = json.loads(
+            (probe / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+        results = []
+        for group in installed_config["hooks"]["PreToolUse"]:
+            matcher = group.get("matcher", "")
+            if not isinstance(matcher, str) or re.search(matcher, "Bash") is None:
+                continue
+            for handler in group.get("hooks") or []:
+                results.append(subprocess.run(
+                    handler["command"], shell=True, executable="/bin/sh", cwd=probe,
+                    input=payload, capture_output=True, text=True, timeout=30,
+                ))
+        return results
+
+    denied = fire_bash("printf AGENTKIT_CODEX_BASH_RAN > codex-bash-ran.txt")
+    denied_output = "\n".join(result.stdout + result.stderr for result in denied)
+    check("a preserved foreign hook lets the RepoCharter Bash denial probe reach its gate",
+          denied and all(result.returncode == 0 for result in denied)
+          and "AGENTKIT_CODEX_BASH_PROBE_DENIED" in denied_output,
+          denied_output[-500:])
+    allowed = fire_bash("printf AGENTKIT_CODEX_BASH_ALLOWED > codex-bash-allowed.txt")
+    allowed_output = "\n".join(result.stdout + result.stderr for result in allowed)
+    check("the same preserved hook lets the Bash allow probe remain allowed",
+          allowed and all(result.returncode == 0 for result in allowed)
+          and '"permissionDecision":"deny"' not in allowed_output.replace(" ", ""),
+          allowed_output[-500:])
+
+    codex_bin = tmp / "codex-stubbin"
+    _stub_codex(codex_bin, "codex-cli 9.9.9")
+    evidence = {
+        "verifiedOn": "2026-08-10",
+        "harnessVersion": "codex-cli 9.9.9",
+        "adapterSha256": agentkit_mod.codex_adapter_digest(repo),
+        "method": "live-deny-and-observe",
+    }
+    compat_path = repo / ".agents" / "compatibility.json"
+    compat = json.loads(compat_path.read_text(encoding="utf-8"))
+    compat.setdefault("enforcement", {})["codex"] = "blocking"
+    compat.setdefault("enforcementEvidence", {})["codex"] = evidence
+    compat_path.write_text(json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+    agentkit_mod.write_checkout_evidence(repo, "codex", evidence)
+
+    def verify_errors() -> list[str]:
+        env = dict(os.environ)
+        env["PATH"] = os.pathsep.join((
+            str(codex_bin), str(Path(shutil.which("git") or "/usr/bin/git").parent),
+            "/usr/bin", "/bin",
+        ))
+        verified = subprocess.run(
+            [sys.executable, str(RESIDUE), "--repo", str(repo), "--json"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        return json.loads(verified.stdout)["errors"]
+
+    check("matching foreign-hook bytes satisfy both halves of the Codex attestation",
+          not any("Codex blocking evidence is stale" in error for error in verify_errors()))
+    foreign.write_text(foreign_text + "# post-promotion drift\n", encoding="utf-8")
+    check("editing a preserved foreign hook invalidates the Codex attestation",
+          any("Codex blocking evidence is stale" in error for error in verify_errors()))
+    foreign.write_text(foreign_text, encoding="utf-8")
+
+    foreign.unlink()
+    missing = agentkit_mod.codex_hooks_lib.discover(repo)
+    check("a missing foreign hook dependency fails clearly",
+          any("missing checkout-local dependency" in error for error in missing.errors),
+          str(missing.errors))
+    residue = subprocess.run(
+        [sys.executable, str(RESIDUE), "--repo", str(repo), "--json"],
+        capture_output=True, text=True, timeout=60,
+    )
+    residue_report = json.loads(residue.stdout)
+    check("verify rejects the missing closure even while Codex is advisory",
+          any("Codex foreign hook closure" in error for error in residue_report["errors"]),
+          str(residue_report["errors"]))
+
+    foreign.write_text(foreign_text, encoding="utf-8")
+    set_foreign('python3 "$DYNAMIC_CODEX_HOOK"')
+    dynamic = agentkit_mod.codex_hooks_lib.discover(repo)
+    check("a dynamic foreign hook fails closed",
+          any("dynamic" in error for error in dynamic.errors), str(dynamic.errors))
+    set_foreign("python3 /tmp/external-codex-hook.py")
+    external = agentkit_mod.codex_hooks_lib.discover(repo)
+    check("an external foreign hook dependency fails closed",
+          any("external or absolute path" in error for error in external.errors),
+          str(external.errors))
+    set_foreign("python3 -c 'print(1)'")
+    inline = agentkit_mod.codex_hooks_lib.discover(repo)
+    check("inline foreign hook code fails closed",
+          any("inline code" in error for error in inline.errors), str(inline.errors))
+
+
 def test_claude_enforcement_evidence(tmp: Path) -> None:
     """A `blocking` Claude claim is a claim about bytes and a version. Both must be checked."""
     root = tmp / "claude-evidence"
@@ -1722,6 +1897,7 @@ def main() -> int:
         test_mcp_gate(tmp)
         test_configchange(tmp)
         test_residue(tmp)
+        test_codex_foreign_hook_closure(tmp / "codex-foreign-hook")
         test_claude_enforcement_evidence(tmp / "claude-enforcement")
         test_policy_and_supersede(tmp / "policy")
         test_apply(tmp / "applytest")

@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.3.4** · CLI: `kit/agentkit`
+> Current version: **RepoCharter 0.3.5** · CLI: `kit/agentkit`
 >
-> **310 tests** · **zero runtime dependencies**
+> **322 tests** · **zero runtime dependencies**
 
 RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
 repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
@@ -195,7 +195,10 @@ kit/agentkit verify --repo . --effective
 ```
 
 Promotion succeeds only after disposable deny/allow probes and an ordinary run confirm that
-persisted project-hook trust is active. See the
+persisted project-hook trust is active. Preserved foreign hooks are never dropped for the probe:
+RepoCharter copies statically referenced checkout-local scripts into the disposable checkout and
+binds their bytes into the attestation. A missing, external, or dynamic implementation fails
+promotion clearly; do not remove or rewrite that hook merely to make promotion green. See the
 [official Codex hook documentation](https://learn.chatgpt.com/docs/hooks) for the trust model.
 
 ### 6. Earn the same claim under Claude Code
@@ -307,7 +310,7 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter is used in production repositories today. Its 310-test suite is intentionally
+RepoCharter is used in production repositories today. Its 322-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -360,7 +363,7 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         310 tests, no dependencies, mostly negative
+kit/tests/         322 tests, no dependencies, mostly negative
 LICENSE            Apache License 2.0
 NOTICE             contributor and upstream attribution
 ```
