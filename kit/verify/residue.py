@@ -31,6 +31,11 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+import codex_hooks as codex_hooks_lib  # noqa: E402
+
 SPEC_SKILL_FIELDS = {
     "allowed-tools", "compatibility", "description", "license", "metadata", "name",
 }
@@ -272,7 +277,13 @@ def adapter_digest(root: Path, files: tuple[str, ...]) -> str | None:
 
 
 def codex_adapter_digest(root: Path) -> str | None:
-    return adapter_digest(root, CODEX_ADAPTER_FILES)
+    closure = codex_hooks_lib.discover(root)
+    if closure.errors:
+        return None
+    files = CODEX_ADAPTER_FILES + tuple(
+        path for path in closure.dependencies if path not in CODEX_ADAPTER_FILES
+    )
+    return adapter_digest(root, files)
 
 
 def claude_adapter_digest(root: Path) -> str | None:
@@ -647,6 +658,10 @@ def check_codex_hooks(root: Path, compat: dict, rep: Report) -> None:
     if not isinstance(hooks, dict):
         rep.error(".codex/hooks.json has no object-valued `hooks` block")
         return
+
+    closure = codex_hooks_lib.discover(root)
+    for problem in closure.errors:
+        rep.error(f"Codex foreign hook closure: {problem}")
 
     expected = (
         ("PreToolUse", "^Bash$", "pretooluse-bash.sh"),

@@ -33,12 +33,13 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.3.4"
+KIT_VERSION = "0.3.5"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
 import scaffold as scaffold_lib  # noqa: E402
 import stage as stage_lib  # noqa: E402
+import codex_hooks as codex_hooks_lib  # noqa: E402
 
 
 # ── preflight ─────────────────────────────────────────────────────────────────────────
@@ -192,7 +193,13 @@ def adapter_digest(repo: Path, files: tuple[str, ...]) -> str | None:
 
 
 def codex_adapter_digest(repo: Path) -> str | None:
-    return adapter_digest(repo, CODEX_ADAPTER_FILES)
+    closure = codex_hooks_lib.discover(repo)
+    if closure.errors:
+        return None
+    files = CODEX_ADAPTER_FILES + tuple(
+        path for path in closure.dependencies if path not in CODEX_ADAPTER_FILES
+    )
+    return adapter_digest(repo, files)
 
 
 def claude_adapter_digest(repo: Path) -> str | None:
@@ -1498,6 +1505,15 @@ def _run_codex_trust_probe(repo: Path) -> subprocess.CompletedProcess:
     return subprocess.run(command, cwd=repo, capture_output=True, text=True, timeout=300)
 
 
+def copy_codex_probe_adapter(
+        repo: Path, probe: Path, closure: codex_hooks_lib.CodexHookClosure) -> None:
+    """Install the exact managed and preserved Codex adapter closure into a probe repo."""
+    shutil.copytree(repo / ".claude" / "hooks", probe / ".claude" / "hooks")
+    (probe / ".codex").mkdir()
+    shutil.copy2(repo / ".codex" / "hooks.json", probe / ".codex" / "hooks.json")
+    codex_hooks_lib.copy_dependencies(repo, probe, closure)
+
+
 def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
     """Fire denied and allowed Bash, apply_patch, and MCP calls through real Codex."""
     if shutil.which("codex") is None:
@@ -1507,6 +1523,10 @@ def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
     version = version_proc.stdout.strip()
     if version_proc.returncode != 0 or not version:
         return ["could not read the installed Codex version"], ""
+
+    closure = codex_hooks_lib.discover(repo)
+    if closure.errors:
+        return [f"foreign hook closure: {problem}" for problem in closure.errors], version
 
     failures: list[str] = []
     # Put the disposable nested repo under the already-trusted project. Codex does not
@@ -1543,9 +1563,7 @@ def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
         }
         write_json(probe / ".agents" / "compatibility.json", compat)
 
-        shutil.copytree(repo / ".claude" / "hooks", probe / ".claude" / "hooks")
-        (probe / ".codex").mkdir()
-        shutil.copy2(repo / ".codex" / "hooks.json", probe / ".codex" / "hooks.json")
+        copy_codex_probe_adapter(repo, probe, closure)
         server = Path(raw) / "mcp_probe.py"
         mcp_marker = probe / "mcp-call-ran.txt"
         server.write_text(MCP_PROBE_SERVER, encoding="utf-8")
