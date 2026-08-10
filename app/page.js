@@ -1,4 +1,5 @@
 import CopyCommand from "./components/CopyCommand";
+import packageMetadata from "../package.json";
 
 const githubUrl = "https://github.com/7fromheaven/repocharter";
 
@@ -79,7 +80,7 @@ export default function Home() {
     operatingSystem: "Cross-platform",
     url: "https://repocharter.com",
     codeRepository: githubUrl,
-    softwareVersion: "0.3.0",
+    softwareVersion: packageMetadata.version,
     description:
       "Portable repository context and tested guardrails for coding-agent harnesses.",
   };
@@ -466,7 +467,9 @@ export default function Home() {
             <a href="#compatibility">Compatibility</a>
             <a href={githubUrl} target="_blank" rel="noreferrer">GitHub <ArrowUpRight /></a>
           </div>
-          <p className="footer-meta">RepoCharter 0.3.0 · CLI compatibility name: agentkit</p>
+          <p className="footer-meta">
+            RepoCharter {packageMetadata.version} · CLI compatibility name: agentkit
+          </p>
         </div>
       </footer>
 
