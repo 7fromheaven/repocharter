@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.3.5** · CLI: `kit/agentkit`
+> Current version: **RepoCharter 0.3.6** · CLI: `kit/agentkit`
 >
-> **322 tests** · **zero runtime dependencies**
+> **367 tests** · **zero runtime dependencies**
 
 RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
 repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
@@ -106,6 +106,22 @@ self-hosted models; model location does not upgrade advisory integration into ve
 
 RepoCharter requires Python 3 and nothing else. Clone this repository, then run the CLI directly from
 the checkout.
+
+### Agent-operated migration or upgrade
+
+For an existing repository, give your coding agent one request and let the checked-in workflow own
+the state transitions:
+
+> Migrate this repository to RepoCharter using
+> `<repocharter-checkout>/kit/skills/migrate-repocharter/SKILL.md`. Own the migration end to end,
+> preserve existing safety gates until their replacements are proved, and stop before push, merge,
+> deploy, publish, or bug submission unless I authorize those separately.
+
+The workflow checkpoints the exact checkout, resumes interrupted work, detects Codex's current
+linked-worktree hook-discovery defect before promotion, preserves dirty migration state in an
+independent clone when needed, and promotes only stale providers. Once installed, the same workflow
+is discoverable as `$migrate-repocharter` in supported harnesses. The manual steps below remain the
+auditable protocol the skill executes; they are not a prompt-shuttling requirement for the operator.
 
 ### 1. Measure before changing anything
 
@@ -363,7 +379,7 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         322 tests, no dependencies, mostly negative
+kit/tests/         367 tests, no dependencies, mostly negative
 LICENSE            Apache License 2.0
 NOTICE             contributor and upstream attribution
 ```
