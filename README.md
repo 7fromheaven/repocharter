@@ -21,7 +21,7 @@ With RepoCharter, you get:
 
 > Current version: **RepoCharter 0.3.7** · CLI: `kit/agentkit`
 >
-> **368 tests** · **zero runtime dependencies**
+> **374 tests** · **zero runtime dependencies**
 
 RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
 repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
@@ -109,19 +109,29 @@ the checkout.
 
 ### Agent-operated migration or upgrade
 
-For an existing repository, give your coding agent one request and let the checked-in workflow own
-the state transitions:
+Open your coding agent in the RepoCharter checkout. The distribution exposes its bundled workflow
+through each provider's native skill picker before anything is installed in the target repository.
+Name the target explicitly:
+
+```text
+Codex:      $migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions.
+Claude Code: /migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions.
+```
+
+The workflow resolves that target, moves into its exact checkout, and owns the state transitions.
+For another harness, or when starting the agent inside the target instead, use the portable path
+form:
 
 > Migrate this repository to RepoCharter using
 > `<repocharter-checkout>/kit/skills/migrate-repocharter/SKILL.md`. Own the migration end to end,
 > preserve existing safety gates until their replacements are proved, and stop before push, merge,
 > deploy, publish, or bug submission unless I authorize those separately.
 
-The workflow checkpoints the exact checkout, resumes interrupted work, detects Codex's current
-linked-worktree hook-discovery defect before promotion, preserves dirty migration state in an
-independent clone when needed, and promotes only stale providers. Once installed, the same workflow
-is discoverable as `$migrate-repocharter` in supported harnesses. The manual steps below remain the
-auditable protocol the skill executes; they are not a prompt-shuttling requirement for the operator.
+The workflow checkpoints the exact target checkout, resumes interrupted work, detects Codex's
+current linked-worktree hook-discovery defect before promotion, preserves dirty migration state in
+an independent clone when needed, and promotes only stale providers. `apply` installs the same
+workflow in the target for future resumes and upgrades. The manual steps below remain the auditable
+protocol the skill executes; they are not a prompt-shuttling requirement for the operator.
 
 ### 1. Measure before changing anything
 
@@ -374,12 +384,15 @@ attribution carried by redistributed copies.
 ```
 README.md          this file — the design, the commands, and the honest limits
 kit/agentkit       the RepoCharter CLI (compatibility name). Python 3, no dependencies.
+kit/skills/        bundled workflow bodies; one canonical copy of each procedure
+.agents/skills/    Codex bootstrap link to the migration workflow
+.claude/skills/    Claude Code bootstrap link through the canonical skill path
 kit/hooks/         Claude and Codex adapters over one policy engine
 kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         368 tests, no dependencies, mostly negative
+kit/tests/         374 tests, no dependencies, mostly negative
 LICENSE            Apache License 2.0
 NOTICE             contributor and upstream attribution
 ```

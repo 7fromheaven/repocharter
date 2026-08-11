@@ -1,4 +1,4 @@
 interface:
-  display_name: RepoCharter Migration
-  short_description: Run a safe, resumable RepoCharter migration
-  default_prompt: Use $migrate-repocharter to migrate this repository end to end and stop before external actions.
+  display_name: "RepoCharter Migration"
+  short_description: "Run a safe, resumable RepoCharter migration"
+  default_prompt: "Use $migrate-repocharter to migrate the requested repository end to end and stop before external actions."
