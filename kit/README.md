@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 `kit/repocharter` is the canonical executable. `kit/agentkit` remains a silent compatibility
 wrapper so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 389 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 396 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -280,7 +280,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-389 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+396 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI
