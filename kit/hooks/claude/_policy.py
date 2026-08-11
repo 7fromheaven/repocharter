@@ -1,4 +1,4 @@
-"""Shared policy loading for the agentkit Python hooks.
+"""Shared policy loading for the RepoCharter Python hooks.
 
 Every hook here fails CLOSED. Claude Code treats exit 1 as a non-blocking error and
 proceeds with the action; only exit 2 blocks. So any condition that leaves the gate unable
@@ -27,7 +27,7 @@ ALLOW = 0
 
 def fail_closed(message: str) -> None:
     """Refuse the call and say why. Never called for 'no policy declared'."""
-    sys.stderr.write(f"agentkit gate: {message}\n")
+    sys.stderr.write(f"RepoCharter gate: {message}\n")
     sys.exit(BLOCK)
 
 

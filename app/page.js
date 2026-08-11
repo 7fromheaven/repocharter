@@ -236,7 +236,7 @@ export default function Home() {
           </div>
 
           <div className="shell proof-strip reveal reveal--5" aria-label="RepoCharter facts">
-            <div><strong>237</strong><span>negative-first tests</span></div>
+            <div><strong>389</strong><span>negative-first tests</span></div>
             <div><strong>0</strong><span>CLI runtime dependencies</span></div>
             <div><strong>1</strong><span>canonical charter</span></div>
             <div><strong>5+</strong><span>agent harnesses reached</span></div>
@@ -428,7 +428,7 @@ export default function Home() {
                 <em>python3</em>
               </div>
               <div className="control-terminal__body">
-                <p><i>$</i> kit/agentkit verify --repo .</p>
+                <p><i>$</i> kit/repocharter verify --repo .</p>
                 <div className="terminal-gap" />
                 <p><span className="term-muted">schema</span><b>valid</b></p>
                 <p><span className="term-muted">context budget</span><b>within limit</b></p>
@@ -480,7 +480,7 @@ export default function Home() {
             <a href={githubUrl} target="_blank" rel="noreferrer">GitHub <ArrowUpRight /></a>
           </div>
           <p className="footer-meta">
-            RepoCharter {packageMetadata.version} · CLI compatibility name: agentkit
+            RepoCharter {packageMetadata.version} · CLI: repocharter · agentkit compatibility wrapper
           </p>
         </div>
       </footer>

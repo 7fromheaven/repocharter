@@ -153,7 +153,7 @@ def unsatisfiable(patterns: list[str]) -> bool:
     fence.
 
     Detection is empirical rather than analytical. Use the same bounded ERE expander and
-    composite-probe builder as ``agentkit measure``; the older one-pattern-at-a-time miner
+    composite-probe builder as ``repocharter measure``; the older one-pattern-at-a-time miner
     falsely rejected valid rules such as ``npm install -g`` because no individual fragment
     contained the entire command.
     """
@@ -406,7 +406,7 @@ def build_draft(root: Path) -> dict:
     unclassified = [{"_source": item["source"], "rule": item["rule"]} for item in prose]
 
     return {
-        "_generated": "agentkit policy scaffold",
+        "_generated": "repocharter policy scaffold",
         "_contract": (
             "NOTHING HERE IS ENFORCED. Move entries into `policy` (dropping the _source/_review "
             "keys) to turn them on. Review every imported regex against the source control flow "

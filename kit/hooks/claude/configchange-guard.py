@@ -40,7 +40,7 @@ from _policy import ALLOW, BLOCK, project_dir, read_payload  # noqa: E402
 
 WATCHED = ("settings.json", "settings.local.json")
 
-# The exact hook wiring `agentkit apply` installs. Checking event names alone is decorative:
+# The exact hook wiring `repocharter apply` installs. Checking event names alone is decorative:
 # replacing a real handler with ``true`` leaves every event present while enforcing nothing.
 HOOK_PREFIX = "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit"
 REQUIRED_HOOK_WIRING = (
@@ -53,7 +53,7 @@ REQUIRED_HOOK_WIRING = (
 
 
 def refuse(reason: str) -> None:
-    sys.stderr.write(f"agentkit ConfigChange guard: {reason}\n")
+    sys.stderr.write(f"RepoCharter ConfigChange guard: {reason}\n")
     sys.exit(BLOCK)
 
 
@@ -144,7 +144,7 @@ def main() -> None:
     if missing:
         refuse(
             f"refusing a settings change that leaves required project hook wiring absent: "
-            f"{'; '.join(missing)}. Re-add it, or change the policy and run `agentkit "
+            f"{'; '.join(missing)}. Re-add it, or change the policy and run `repocharter "
             "apply` so the removal is recorded rather than silent."
         )
 
@@ -156,7 +156,7 @@ def main() -> None:
             "refusing a settings change that empties permissions.deny while "
             ".agents/compatibility.json still declares path or MCP denials. Those are the "
             "client-enforced blocks; emptying them is disableAllHooks by another route. "
-            "Edit the declaration and run `agentkit apply` instead."
+            "Edit the declaration and run `repocharter apply` instead."
         )
 
     sys.exit(ALLOW)

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/7fromheaven/repocharter/kit/schema/compatibility.schema.json",
   "title": ".agents/compatibility.json",
-  "description": "The machine-readable declaration of a repository's agent-context layout. It is read by agentkit and the hooks, not loaded into model context. `agentkit verify` checks declared paths and settings against the filesystem.",
+  "description": "The machine-readable declaration of a repository's agent-context layout. It is read by RepoCharter and the hooks, not loaded into model context. `repocharter verify` checks declared paths and settings against the filesystem.",
   "type": "object",
   "required": ["agentkitVersion", "canonical", "enforcement", "autoMemory", "budgets"],
   "additionalProperties": false,
@@ -11,7 +11,7 @@
 
     "policyDraft": {
       "type": "object",
-      "description": "Output of `agentkit policy scaffold`. Entries are not enforced until a human reviews and promotes them into `policy`.",
+      "description": "Output of `repocharter policy scaffold`. Entries are not enforced until a human reviews and promotes them into `policy`.",
       "additionalProperties": true
     },
 
@@ -72,7 +72,7 @@
 
     "enforcementEvidence": {
       "type": "object",
-      "description": "Latest provider-specific live deny-and-observe result. `agentkit self-test` rewrites one snapshot per harness; the verifier invalidates it when the installed adapter bytes change.",
+      "description": "Latest provider-specific live deny-and-observe result. `repocharter self-test` rewrites one snapshot per harness; the verifier invalidates it when the installed adapter bytes change.",
       "additionalProperties": { "$ref": "#/$defs/enforcementEvidence" },
       "properties": {
         "codex": { "$ref": "#/$defs/enforcementEvidence" },
@@ -122,7 +122,7 @@
 
     "policy": {
       "type": "object",
-      "description": "What the mechanical gates enforce. Read at runtime by the Edit/Write and MCP hooks, and compiled into settings.json permissions.deny by `agentkit apply`. Anthropic's steer is followed here: hard tool/path blocks go to permissions.deny, and hooks carry only what permissions cannot express.",
+      "description": "What the mechanical gates enforce. Read at runtime by the Edit/Write and MCP hooks, and compiled into settings.json permissions.deny by `repocharter apply`. Anthropic's steer is followed here: hard tool/path blocks go to permissions.deny, and hooks carry only what permissions cannot express.",
       "additionalProperties": false,
       "properties": {
         "protectedBranches": {
@@ -133,7 +133,7 @@
         },
         "denyBashPatterns": {
           "type": "array",
-          "description": "Repository-specific Bash denials read at runtime by the Bash gate. `agentkit policy scaffold` can import candidates from a supported legacy shell gate.",
+          "description": "Repository-specific Bash denials read at runtime by the Bash gate. `repocharter policy scaffold` can import candidates from a supported legacy shell gate.",
           "items": { "$ref": "#/$defs/bashRule" },
           "default": []
         },
@@ -200,7 +200,7 @@
 
     "validation": {
       "type": "object",
-      "description": "Provider-neutral clean-code commands run by `agentkit verify`, and therefore by the installed pre-commit hook. Commands are argv arrays rather than shell strings so quoting cannot change what executes.",
+      "description": "Provider-neutral clean-code commands run by `repocharter verify`, and therefore by the installed pre-commit hook. Commands are argv arrays rather than shell strings so quoting cannot change what executes.",
       "required": ["commands"],
       "additionalProperties": false,
       "properties": {
@@ -233,7 +233,7 @@
         "missingSkillDiscovery": "Read .agents/skills/project-memory/SKILL.md directly",
         "missingPlanMode": "Use the active conversation plus docs/project/PLAN.md",
         "missingSubagents": "Execute independent work sequentially",
-        "missingHooks": "Run `agentkit verify` before handoff"
+        "missingHooks": "Run `repocharter verify` before handoff"
       }]
     },
 
@@ -241,7 +241,7 @@
       "type": "array",
       "items": { "type": "string" },
       "default": [],
-      "description": "Globs for retired content that remains checked in, such as fallback mirrors or archived versions. `agentkit apply` adds these paths to the agnix exclude list.",
+      "description": "Globs for retired content that remains checked in, such as fallback mirrors or archived versions. `repocharter apply` adds these paths to the agnix exclude list.",
       "examples": [["archive/legacy/**", "archive/v1/**"]]
     },
 

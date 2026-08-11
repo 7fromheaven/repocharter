@@ -68,7 +68,7 @@ CODEX_ADAPTER_FILES = (
     ".claude/hooks/agentkit/pretooluse-mcp.py",
 )
 
-# Kept byte-identical to the tuple in `agentkit`: the digest recorded by self-test and the
+# Kept byte-identical to the tuple in `repocharter`: the digest recorded by self-test and the
 # digest recomputed by verify have to cover the same wire path or the check is decorative.
 CLAUDE_ADAPTER_FILES = (
     ".claude/settings.json",
@@ -80,7 +80,7 @@ CLAUDE_ADAPTER_FILES = (
     ".claude/hooks/agentkit/configchange-guard.py",
 )
 
-# (event, matcher, script) triples `agentkit apply` installs into .claude/settings.json.
+# (event, matcher, script) triples `repocharter apply` installs into .claude/settings.json.
 # A `blocking` Claude claim asserts all five are on the wire.
 CLAUDE_HOOK_WIRING = (
     ("PreToolUse", "Bash", "pretooluse-bash.sh"),
@@ -469,7 +469,7 @@ def check_skills(root: Path, compat: dict, rep: Report) -> None:
         if skills:
             rep.error(
                 ".claude/skills does not exist, so Claude Code cannot see any project skill. "
-                "Run `agentkit apply` to create the relative symlinks."
+                "Run `repocharter apply` to create the relative symlinks."
             )
         return
 
@@ -647,7 +647,7 @@ def check_codex_hooks(root: Path, compat: dict, rep: Report) -> None:
     required = _version_at_least(compat, (0, 3, 0)) and (native_declared or enforcement != "none")
     if not path.exists():
         if required:
-            rep.error(".codex/hooks.json is missing; run `agentkit apply` to install the Codex adapter")
+            rep.error(".codex/hooks.json is missing; run `repocharter apply` to install the Codex adapter")
         return
 
     config = read_json(path)
@@ -716,14 +716,14 @@ def check_codex_hooks(root: Path, compat: dict, rep: Report) -> None:
         if not isinstance(evidence, dict):
             rep.error(
                 "Codex is declared blocking but has no live enforcementEvidence. "
-                "Run `agentkit self-test --repo .` with Codex installed."
+                "Run `repocharter self-test --repo .` with Codex installed."
             )
         else:
             actual_digest = codex_adapter_digest(root)
             if actual_digest is None or evidence.get("adapterSha256") != actual_digest:
                 rep.error(
                     "Codex blocking evidence is stale: installed hook/config bytes changed. "
-                    "Re-run `agentkit self-test --repo .`."
+                    "Re-run `repocharter self-test --repo .`."
                 )
             try:
                 proc = subprocess.run(["codex", "--version"], capture_output=True, text=True,
@@ -812,7 +812,7 @@ def check_claude_hooks(root: Path, compat: dict, rep: Report) -> None:
     if not isinstance(evidence, dict):
         rep.error(
             "Claude Code is declared blocking but has no live enforcementEvidence. "
-            "Run `agentkit self-test --repo . --promote-claude` with Claude Code installed."
+            "Run `repocharter self-test --repo . --promote-claude` with Claude Code installed."
         )
         return
 
@@ -820,7 +820,7 @@ def check_claude_hooks(root: Path, compat: dict, rep: Report) -> None:
     if actual_digest is None or evidence.get("adapterSha256") != actual_digest:
         rep.error(
             "Claude blocking evidence is stale: installed settings/hook bytes changed. "
-            "Re-run `agentkit self-test --repo . --promote-claude`."
+            "Re-run `repocharter self-test --repo . --promote-claude`."
         )
     try:
         proc = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=30)
@@ -892,7 +892,7 @@ def check_precommit(root: Path, rep: Report) -> None:
     if not configured:
         rep.error(
             "git core.hooksPath is unset, so the checked-in RepoCharter pre-commit gate "
-            "does not run. Run `agentkit apply`."
+            "does not run. Run `repocharter apply`."
         )
         return
 
@@ -915,7 +915,7 @@ def check_precommit(root: Path, rep: Report) -> None:
     if starts != 1 or ends != 1:
         rep.error(
             f"active pre-commit hook has {starts} RepoCharter start marker(s) and "
-            f"{ends} end marker(s); run `agentkit apply` to install one complete block"
+            f"{ends} end marker(s); run `repocharter apply` to install one complete block"
         )
         return
     begin, end = text.index(PRECOMMIT_BEGIN), text.index(PRECOMMIT_END)
@@ -923,14 +923,14 @@ def check_precommit(root: Path, rep: Report) -> None:
         rep.error("active pre-commit hook's RepoCharter markers are reversed")
         return
     managed = text[begin:end]
-    if "python3 kit/agentkit verify --repo ." not in managed:
-        rep.error("active pre-commit RepoCharter block does not invoke `agentkit verify`")
+    if "python3 kit/repocharter verify --repo ." not in managed:
+        rep.error("active pre-commit RepoCharter block does not invoke `repocharter verify`")
 
     for number, line in enumerate(text[:begin].splitlines(), 1):
         if re.match(r"^[ \t]*exit(?:[ \t]|$)", line):
             rep.error(
                 f"active pre-commit RepoCharter block is unreachable: line {number} exits "
-                "before the managed block. Run `agentkit apply` to reposition it."
+                "before the managed block. Run `repocharter apply` to reposition it."
             )
             break
 
@@ -1274,7 +1274,7 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
         if compat_path.exists():
             rep.error(".agents/compatibility.json is not valid JSON")
             return rep
-        rep.error(".agents/compatibility.json is missing. Run `agentkit apply` first.")
+        rep.error(".agents/compatibility.json is missing. Run `repocharter apply` first.")
         return rep
 
     check_schema(root, compat, rep)
@@ -1326,7 +1326,7 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="agentkit conformance residue checks")
+    parser = argparse.ArgumentParser(description="RepoCharter conformance residue checks")
     parser.add_argument("--repo", default=".", help="repository root (default: cwd)")
     parser.add_argument("--effective", action="store_true", help="also diff Codex's real prompt ledger")
     parser.add_argument("--strict", action="store_true", help="treat warnings as errors")
@@ -1335,7 +1335,7 @@ def main() -> int:
 
     root = Path(args.repo).resolve()
     if not root.is_dir():
-        print(f"agentkit: {root} is not a directory", file=sys.stderr)
+        print(f"repocharter: {root} is not a directory", file=sys.stderr)
         return 2
 
     rep = run(root, args.effective, args.strict)
@@ -1353,11 +1353,11 @@ def main() -> int:
         for error in rep.errors:
             print(f" ERROR: {error}")
         print()
-        summary = (f"agentkit residue [{rep.stage}]: {len(rep.errors)} error(s), "
+        summary = (f"RepoCharter residue [{rep.stage}]: {len(rep.errors)} error(s), "
                    f"{len(rep.warnings)} warning(s), {len(rep.todos)} migration todo(s)")
         print(summary)
         if rep.todos and not rep.errors:
-            print("  Nothing is broken. The todos are migration work — run `agentkit migrate` "
+            print("  Nothing is broken. The todos are migration work — run `repocharter migrate` "
                   "for a plan.")
     return 1 if rep.errors else 0
 

@@ -59,7 +59,7 @@ Follow its route:
    target. If unrelated work exists, use the standalone helper in `clean-head` mode; do not stack
    migration plumbing over it.
 3. Scaffold repository policy while legacy gates are still active. Fire every declared fence with
-   `agentkit measure`; retire a legacy safety gate only after the replacement is proven no weaker.
+   `repocharter measure`; retire a legacy safety gate only after the replacement is proven no weaker.
 4. Reach the mechanical fixed point: `apply --dry-run` reports zero changes, strict verification
    passes, measurement passes, and every validation command declared by the repository passes.
 5. Use the checkpoint's provider states. Promote only a provider whose `promotionRequired` is
@@ -84,9 +84,9 @@ persisted-trust test has reproduced the defect.
 When promotion is actually required:
 
 - Codex: start a fresh trusted session in the target checkout, review the current definitions in
-  `/hooks`, then run `agentkit self-test --repo . --promote-codex`.
+  `/hooks`, then run `repocharter self-test --repo . --promote-codex`.
 - Claude Code: start a fresh session in the target checkout, establish workspace trust, then run
-  `agentkit self-test --repo . --promote-claude`.
+  `repocharter self-test --repo . --promote-claude`.
 
 An approval-capable agent may operate both installed provider CLIs. Provider identity is not the
 boundary; the target checkout, fresh settings, native trust, and live deny/allow evidence are.

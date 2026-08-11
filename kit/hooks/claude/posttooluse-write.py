@@ -86,7 +86,7 @@ def main() -> None:
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
                 "additionalContext": (
-                    "[agentkit measurement — AFTER] " + " | ".join(lines) +
+                    "[RepoCharter measurement — AFTER] " + " | ".join(lines) +
                     " . Report these numbers with the change and review unexpected deltas."
                 ),
             }

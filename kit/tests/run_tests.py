@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free agentkit test suite: ``python3 kit/tests/run_tests.py``.
+"""Dependency-free RepoCharter test suite: ``python3 kit/tests/run_tests.py``.
 
 Negative cases exercise commands each gate must refuse, malformed inputs, and fail-closed
 paths. Positive cases ensure the same policies do not block ordinary work.
@@ -21,12 +21,14 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parent.parent
 HOOKS = KIT / "hooks" / "claude"
 RESIDUE = KIT / "verify" / "residue.py"
+REPO_CHARTER = KIT / "repocharter"
+AGENTKIT_COMPAT = KIT / "agentkit"
 
-# `agentkit` has no .py suffix, so it needs an explicit loader to import.
+# `repocharter` has no .py suffix, so it needs an explicit loader to import.
 sys.path.insert(0, str(KIT))
 import importlib.util as _ilu
 from importlib.machinery import SourceFileLoader as _SFL
-_spec = _ilu.spec_from_loader("agentkit_mod", _SFL("agentkit_mod", str(KIT / "agentkit")))
+_spec = _ilu.spec_from_loader("agentkit_mod", _SFL("agentkit_mod", str(REPO_CHARTER)))
 agentkit_mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(agentkit_mod)
 
@@ -134,6 +136,66 @@ def make_repo(tmp: Path, policy: dict | None = None, compat_extra: dict | None =
     return repo
 
 
+def test_cli_entrypoints(tmp: Path) -> None:
+    """The RepoCharter command is canonical and the old path is a silent compatibility shim."""
+    section("CLI identity — RepoCharter is canonical and agentkit remains compatible")
+    check("kit/repocharter exists and is executable",
+          REPO_CHARTER.is_file() and os.access(REPO_CHARTER, os.X_OK))
+    check("kit/agentkit compatibility wrapper exists and is executable",
+          AGENTKIT_COMPAT.is_file() and os.access(AGENTKIT_COMPAT, os.X_OK))
+
+    canonical_version = subprocess.run(
+        [sys.executable, str(REPO_CHARTER), "--version"], capture_output=True, text=True)
+    compatibility_version = subprocess.run(
+        [sys.executable, str(AGENTKIT_COMPAT), "--version"], capture_output=True, text=True)
+    check("the canonical command identifies RepoCharter 0.4.0",
+          canonical_version.returncode == 0
+          and canonical_version.stdout.strip() == "RepoCharter 0.4.0"
+          and not canonical_version.stderr,
+          canonical_version.stdout + canonical_version.stderr)
+    check("the compatibility command has identical version behavior",
+          compatibility_version.returncode == canonical_version.returncode
+          and compatibility_version.stdout == canonical_version.stdout
+          and compatibility_version.stderr == canonical_version.stderr,
+          compatibility_version.stdout + compatibility_version.stderr)
+
+    canonical_help = subprocess.run(
+        [sys.executable, str(REPO_CHARTER), "--help"], capture_output=True, text=True)
+    compatibility_help = subprocess.run(
+        [sys.executable, str(AGENTKIT_COMPAT), "--help"], capture_output=True, text=True)
+    check("both paths expose the same canonical help",
+          canonical_help.returncode == compatibility_help.returncode == 0
+          and canonical_help.stdout == compatibility_help.stdout
+          and canonical_help.stderr == compatibility_help.stderr
+          and canonical_help.stdout.startswith("usage: repocharter "),
+          canonical_help.stdout[:200] + compatibility_help.stdout[:200])
+
+    missing = tmp / "does-not-exist"
+    canonical_error = subprocess.run(
+        [sys.executable, str(REPO_CHARTER), "verify", "--repo", str(missing)],
+        capture_output=True, text=True)
+    compatibility_error = subprocess.run(
+        [sys.executable, str(AGENTKIT_COMPAT), "verify", "--repo", str(missing)],
+        capture_output=True, text=True)
+    check("both paths preserve errors, streams, and exit status",
+          canonical_error.returncode == compatibility_error.returncode == 2
+          and canonical_error.stdout == compatibility_error.stdout
+          and canonical_error.stderr == compatibility_error.stderr
+          and "repocharter:" in canonical_error.stderr
+          and "agentkit:" not in canonical_error.stderr,
+          canonical_error.stdout + canonical_error.stderr
+          + compatibility_error.stdout + compatibility_error.stderr)
+
+    wrapper = AGENTKIT_COMPAT.read_text(encoding="utf-8")
+    check("the compatibility wrapper contains no CLI business logic or warning",
+          len(wrapper.splitlines()) <= 16
+          and "repocharter" in wrapper
+          and "execv" in wrapper
+          and "ArgumentParser" not in wrapper
+          and "deprecated" not in wrapper.lower(),
+          wrapper[:500])
+
+
 def test_public_migration_skill_bootstrap(tmp: Path) -> None:
     """The source distribution must expose the migration workflow before apply."""
     section("public bootstrap — migration skill is natively discoverable before apply")
@@ -149,8 +211,9 @@ def test_public_migration_skill_bootstrap(tmp: Path) -> None:
               extracted.stdout[-500:] + extracted.stderr[-500:])
     else:
         distribution = source_root
-        check("the checked-out public distribution contains its runtime",
-              (distribution / "kit" / "agentkit").is_file())
+        check("the checked-out public distribution contains both entrypoints",
+              (distribution / "kit" / "repocharter").is_file()
+              and (distribution / "kit" / "agentkit").is_file())
 
     bundled = distribution / "kit" / "skills" / "migrate-repocharter"
     codex = distribution / ".agents" / "skills" / "migrate-repocharter"
@@ -342,7 +405,7 @@ def test_bash_gate(tmp: Path) -> None:
     section("Bash gate — fails CLOSED (the bug this kit exists to fix)")
     code, _, err = run_hook("pretooluse-bash.sh", "this is not json", repo)
     check("malformed payload exits 2", code == 2, f"exit {code}")
-    check("and explains itself on stderr", "agentkit safety gate" in err, err[:80])
+    check("and explains itself on stderr", "RepoCharter safety gate" in err, err[:80])
 
     section("Bash gate — cwd context injection")
     code, out, _ = run_hook("pretooluse-bash.sh", {"tool_name": "Bash", "tool_input": {"command": "git add ."}}, repo)
@@ -927,6 +990,8 @@ def test_apply(tmp: Path) -> None:
 
     settings = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
     compat = json.loads((repo / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
+    check("the compatibility manifest records RepoCharter 0.4.0",
+          compat["agentkitVersion"] == "0.4.0", str(compat))
     check("auto memory defaults OFF in compatibility.json", compat["autoMemory"] == "off", str(compat))
     check("apply disables Claude auto memory by default", settings["autoMemoryEnabled"] is False, str(settings))
     matchers = [g.get("matcher") for g in settings["hooks"]["PreToolUse"]]
@@ -2065,7 +2130,7 @@ def test_claude_enforcement_evidence(tmp: Path) -> None:
     }})
     measurement_output = json.dumps({"hookSpecificOutput": {
         "hookEventName": "PostToolUse",
-        "additionalContext": "[agentkit measurement — AFTER] measured.txt: bytes",
+        "additionalContext": "[RepoCharter measurement — AFTER] measured.txt: bytes",
     }})
     held = agentkit_mod.claude_probe_held
     check("prose containing a reason but no structured tool call is not evidence",
@@ -2332,8 +2397,10 @@ def test_vendor_and_precommit(tmp: Path) -> None:
                           capture_output=True, text=True)
 
     section("apply — the repo becomes self-sufficient")
-    check("kit/agentkit is vendored", (repo / "kit" / "agentkit").exists())
-    check("and it is executable", os.access(repo / "kit" / "agentkit", os.X_OK))
+    check("kit/repocharter is vendored", (repo / "kit" / "repocharter").exists())
+    check("and the canonical command is executable", os.access(repo / "kit" / "repocharter", os.X_OK))
+    check("kit/agentkit compatibility wrapper is vendored", (repo / "kit" / "agentkit").exists())
+    check("and the compatibility wrapper is executable", os.access(repo / "kit" / "agentkit", os.X_OK))
     check("the residue checker comes with it", (repo / "kit" / "verify" / "residue.py").exists())
     check("the managed migration workflow is vendored for self-refresh",
           (repo / "kit" / "skills" / "migrate-repocharter" / "SKILL.md").is_file())
@@ -2343,7 +2410,9 @@ def test_vendor_and_precommit(tmp: Path) -> None:
     section("apply — the check is wired to fire on commit")
     hook = repo / ".githooks" / "pre-commit"
     check("a pre-commit hook exists", hook.exists())
-    check("it calls agentkit verify", "agentkit verify" in hook.read_text(encoding="utf-8"))
+    check("it calls the canonical RepoCharter command",
+          "kit/repocharter verify" in hook.read_text(encoding="utf-8")
+          and "kit/agentkit verify" not in hook.read_text(encoding="utf-8"))
     check("core.hooksPath is set, or git would never run it",
           run("git", "config", "core.hooksPath").stdout.strip() == ".githooks")
 
@@ -2379,7 +2448,7 @@ def test_vendor_and_precommit(tmp: Path) -> None:
     check("a missing python3 BLOCKS rather than skips",
           "python3 not found" in text and "exit 1" in text)
     check("a missing vendored kit BLOCKS rather than skips",
-          "kit/agentkit is missing" in text)
+          "kit/repocharter is missing" in text)
     # An AGENTS.md over Codex's 32,768-byte cap is a BLOCKING finding at every stage.
     (repo / "AGENTS.md").write_text("# rules\n\n" + ("x" * 100 + "\n") * 400, encoding="utf-8")
     run("git", "add", "AGENTS.md")
@@ -2480,6 +2549,76 @@ def test_vendor_and_precommit(tmp: Path) -> None:
           again.stdout[-300:])
 
 
+def test_legacy_cli_upgrade(tmp: Path) -> None:
+    """A 0.3.8 checkout gains the canonical command without losing its old entrypoint."""
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    git_init(repo)
+    (repo / "AGENTS.md").write_text("# legacy 0.3.8 fixture\n", encoding="utf-8")
+    (repo / "docs" / "project").mkdir(parents=True)
+    (repo / ".agents").mkdir()
+    compat = agentkit_mod.default_compat(repo)
+    compat["agentkitVersion"] = "0.3.8"
+    (repo / ".agents" / "compatibility.json").write_text(
+        json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+
+    old_cli = repo / "kit" / "agentkit"
+    old_cli.parent.mkdir()
+    old_cli.write_text("#!/usr/bin/env python3\nprint('agentkit 0.3.8')\n", encoding="utf-8")
+    old_cli.chmod(0o755)
+    old_hook = repo / ".githooks" / "pre-commit"
+    old_hook.parent.mkdir()
+    old_hook.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'user-before\\n' >/dev/null\n"
+        "# >>> agentkit >>>\n"
+        "python3 kit/agentkit verify --repo .\n"
+        "# <<< agentkit <<<\n"
+        "printf 'user-after\\n' >/dev/null\n",
+        encoding="utf-8",
+    )
+    old_hook.chmod(0o755)
+    git_commit_all(repo)
+
+    upgraded = subprocess.run(
+        [sys.executable, str(REPO_CHARTER), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    upgraded_compat = json.loads(
+        (repo / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
+    hook_text = old_hook.read_text(encoding="utf-8")
+    compatibility_version = subprocess.run(
+        [sys.executable, str(repo / "kit" / "agentkit"), "--version"],
+        capture_output=True, text=True,
+    )
+
+    section("apply — 0.3.8 command transition is backward compatible")
+    check("the 0.3.8 fixture upgrades successfully", upgraded.returncode == 0,
+          upgraded.stdout[-500:] + upgraded.stderr[-500:])
+    check("the upgrade records 0.4.0 and vendors both executable entrypoints",
+          upgraded_compat.get("agentkitVersion") == "0.4.0"
+          and os.access(repo / "kit" / "repocharter", os.X_OK)
+          and os.access(repo / "kit" / "agentkit", os.X_OK),
+          str(upgraded_compat))
+    check("the old command delegates to the canonical 0.4.0 identity",
+          compatibility_version.returncode == 0
+          and compatibility_version.stdout.strip() == "RepoCharter 0.4.0"
+          and not compatibility_version.stderr,
+          compatibility_version.stdout + compatibility_version.stderr)
+    check("the managed lane moves to repocharter without touching user hook content",
+          "python3 kit/repocharter verify --repo ." in hook_text
+          and "python3 kit/agentkit verify --repo ." not in hook_text
+          and "user-before" in hook_text and "user-after" in hook_text,
+          hook_text)
+    repeated = subprocess.run(
+        [sys.executable, str(REPO_CHARTER), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("the upgraded 0.3.8 fixture reaches a fixed point",
+          repeated.returncode == 0 and "0 change(s)" in repeated.stdout,
+          repeated.stdout[-400:] + repeated.stderr[-200:])
+
+
 def test_stale_session_tombstone(tmp: Path) -> None:
     """A hook referenced by a stale session must block after its implementation moves."""
     repo = tmp / "repo"
@@ -2542,6 +2681,7 @@ def main() -> int:
         # instead of requiring write access to the operator's home directory.
         previous_state = os.environ.get("AGENTKIT_STATE_DIR")
         os.environ["AGENTKIT_STATE_DIR"] = str(tmp / "agentkit-state")
+        test_cli_entrypoints(tmp / "cli-entrypoints")
         test_public_migration_skill_bootstrap(tmp / "public-bootstrap")
         test_bash_gate(tmp / "bash")
         test_write_gate(tmp / "write")
@@ -2556,6 +2696,7 @@ def main() -> int:
         test_apply(tmp / "applytest")
         test_measure(tmp / "measure")
         test_vendor_and_precommit(tmp / "vendor")
+        test_legacy_cli_upgrade(tmp / "legacy-cli-upgrade")
         test_stale_session_tombstone(tmp / "stale")
         if previous_state is None:
             os.environ.pop("AGENTKIT_STATE_DIR", None)
@@ -2563,7 +2704,7 @@ def main() -> int:
             os.environ["AGENTKIT_STATE_DIR"] = previous_state
 
     print(f"\n{'=' * 60}")
-    print(f"agentkit tests: {PASSED} passed, {FAILED} failed")
+    print(f"RepoCharter tests: {PASSED} passed, {FAILED} failed")
     return 1 if FAILED else 0
 
 

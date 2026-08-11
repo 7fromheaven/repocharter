@@ -19,13 +19,13 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.3.8** · CLI: `kit/agentkit`
+> Current version: **RepoCharter 0.4.0** · CLI: `kit/repocharter`
 >
-> **374 tests** · **zero runtime dependencies**
+> **389 tests** · **zero runtime dependencies**
 
-RepoCharter is the product name. The 0.3.x executable remains `kit/agentkit` so existing
-repositories and automation keep working. The old name is a compatibility-facing CLI identifier,
-not a second product.
+`kit/repocharter` is the canonical command. Existing repositories and automation can keep using
+`kit/agentkit`; it is a silent compatibility wrapper around the same implementation, not a second
+product.
 
 ---
 
@@ -136,7 +136,7 @@ protocol the skill executes; they are not a prompt-shuttling requirement for the
 ### 1. Measure before changing anything
 
 ```sh
-kit/agentkit census --repo ~/dev/your-repo
+kit/repocharter census --repo ~/dev/your-repo
 ```
 
 This captures the existing startup context and agent configuration so you can review the change
@@ -145,8 +145,8 @@ against a real baseline.
 ### 2. Preview and apply the mechanical layer
 
 ```sh
-kit/agentkit apply --repo ~/dev/your-repo --dry-run
-kit/agentkit apply --repo ~/dev/your-repo
+kit/repocharter apply --repo ~/dev/your-repo --dry-run
+kit/repocharter apply --repo ~/dev/your-repo
 ```
 
 `apply` refuses a dirty worktree by default, preserves unrelated Claude and Codex configuration,
@@ -156,7 +156,7 @@ Once applied, RepoCharter is vendored into the target repository:
 
 ```sh
 cd ~/dev/your-repo
-kit/agentkit verify --repo .
+kit/repocharter verify --repo .
 ```
 
 ### 3. Add your project context and policy
@@ -191,15 +191,15 @@ The `policy` portion might look like this:
 Re-run `apply` after changing policy so provider-native permissions are recompiled:
 
 ```sh
-kit/agentkit apply --repo .
+kit/repocharter apply --repo .
 ```
 
 ### 4. Prove the installation
 
 ```sh
-kit/agentkit self-test --repo .
-kit/agentkit measure --repo .
-kit/agentkit verify --repo .
+kit/repocharter self-test --repo .
+kit/repocharter measure --repo .
+kit/repocharter verify --repo .
 ```
 
 - `self-test` checks the universal safety floor with both forbidden and benign calls.
@@ -216,8 +216,8 @@ Codex requires a one-time review whenever project-hook definitions change:
 4. Run the live promotion:
 
 ```sh
-kit/agentkit self-test --repo . --promote-codex
-kit/agentkit verify --repo . --effective
+kit/repocharter self-test --repo . --promote-codex
+kit/repocharter verify --repo . --effective
 ```
 
 Promotion succeeds only after disposable deny/allow probes and an ordinary run confirm that
@@ -234,7 +234,7 @@ interactively in the checkout once, review the project, and accept its trust pro
 parent workspace also covers descendants). Then:
 
 ```sh
-kit/agentkit self-test --repo . --promote-claude
+kit/repocharter self-test --repo . --promote-claude
 ```
 
 This drives the real `claude` executable in a disposable repository and requires both directions on
@@ -288,9 +288,9 @@ replacing the instructions, project knowledge, hooks, or unrelated provider sett
 there.
 
 ```sh
-kit/agentkit census --repo ~/dev/your-repo
-kit/agentkit apply --repo ~/dev/your-repo --dry-run
-kit/agentkit apply --repo ~/dev/your-repo
+kit/repocharter census --repo ~/dev/your-repo
+kit/repocharter apply --repo ~/dev/your-repo --dry-run
+kit/repocharter apply --repo ~/dev/your-repo
 ```
 
 `census` is read-only. `apply --dry-run` previews the footprint, and `apply` reports every file it
@@ -336,7 +336,7 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter is used in production repositories today. Its 322-test suite is intentionally
+RepoCharter is used in production repositories today. Its 389-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -383,7 +383,8 @@ attribution carried by redistributed copies.
 
 ```
 README.md          this file — the design, the commands, and the honest limits
-kit/agentkit       the RepoCharter CLI (compatibility name). Python 3, no dependencies.
+kit/repocharter    the canonical RepoCharter CLI. Python 3, no dependencies.
+kit/agentkit       silent compatibility wrapper for existing automation
 kit/skills/        bundled workflow bodies; one canonical copy of each procedure
 .agents/skills/    Codex bootstrap link to the migration workflow
 .claude/skills/    Claude Code bootstrap link through the canonical skill path
@@ -392,10 +393,10 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         374 tests, no dependencies, mostly negative
+kit/tests/         389 tests, no dependencies, mostly negative
 LICENSE            Apache License 2.0
 NOTICE             contributor and upstream attribution
 ```
 
-**Ready to try RepoCharter?** Start with `kit/agentkit census --repo ~/dev/your-repo`. It is
+**Ready to try RepoCharter?** Start with `kit/repocharter census --repo ~/dev/your-repo`. It is
 read-only, takes seconds, and gives you a concrete baseline before RepoCharter changes a file.

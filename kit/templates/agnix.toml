@@ -1,8 +1,8 @@
-# agnix configuration — agentkit template.
+# agnix configuration — RepoCharter template.
 #
 # agnix carries 445 sourced rules, each with source URLs and a verified_on date. It is the
-# right tool for every check it already implements, and agentkit does not re-implement any
-# of them. What agentkit adds is the residue: the handful of checks that exist in no
+# right tool for every check it already implements, and RepoCharter does not re-implement any
+# of them. What RepoCharter adds is the residue: the handful of checks that exist in no
 # catalogue, which live in kit/verify/residue.py.
 #
 # The severity overrides promote instruction-truncation and dead-reference findings to

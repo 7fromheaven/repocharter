@@ -53,7 +53,7 @@ is the observable that proves it*. Decision records cover decisions; this covers
 failures that never became decisions, which is the class that otherwise has nowhere to go
 and quietly regrows a much larger memory system around itself.
 
-**Hard cap: 100 lines / 8 KB**, enforced by `agentkit verify`. The cap is the mechanism,
+**Hard cap: 100 lines / 8 KB**, enforced by `repocharter verify`. The cap is the mechanism,
 not a formality. When it is reached, evict in this order:
 
 1. A pitfall whose failure is **now caught by a mechanical gate** — delete it and cite the

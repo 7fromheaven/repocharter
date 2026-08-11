@@ -47,19 +47,28 @@ def load_agentkit_path(path: Path, module_name: str):
     return module
 
 
+def runtime_path(kit_root: Path) -> Path | None:
+    """Prefer the 0.4+ implementation, falling back to the 0.3.x monolith."""
+    canonical = kit_root / "repocharter"
+    if canonical.is_file():
+        return canonical
+    compatibility = kit_root / "agentkit"
+    return compatibility if compatibility.is_file() else None
+
+
 def load_agentkit(repo: Path):
-    return load_agentkit_path(repo / "kit" / "agentkit", "repocharter_checkpoint_target")
+    candidate = runtime_path(repo / "kit")
+    return load_agentkit_path(candidate, "repocharter_checkpoint_target") \
+        if candidate is not None else None
 
 
 def distribution_agentkit(repo: Path):
     """Use the source distribution's version when this script is run from `kit/skills`."""
     script = Path(__file__).resolve()
-    candidate = next(
-        (parent / "agentkit" for parent in script.parents
-         if parent.name == "kit" and (parent / "agentkit").is_file()),
-        None,
-    )
-    if candidate is None or candidate.resolve() == (repo / "kit" / "agentkit").resolve():
+    candidate = next((runtime_path(parent) for parent in script.parents
+                      if parent.name == "kit" and runtime_path(parent) is not None), None)
+    target = runtime_path(repo / "kit")
+    if candidate is None or (target is not None and candidate.resolve() == target.resolve()):
         return None
     return load_agentkit_path(candidate, "repocharter_checkpoint_distribution")
 
