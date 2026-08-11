@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.4.0** · CLI: `kit/repocharter`
+> Current version: **RepoCharter 0.4.1** · CLI: `kit/repocharter`
 >
-> **389 tests** · **zero runtime dependencies**
+> **396 tests** · **zero runtime dependencies**
 
 `kit/repocharter` is the canonical command. Existing repositories and automation can keep using
 `kit/agentkit`; it is a silent compatibility wrapper around the same implementation, not a second
@@ -336,7 +336,7 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter is used in production repositories today. Its 389-test suite is intentionally
+RepoCharter is used in production repositories today. Its 396-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -393,7 +393,7 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         389 tests, no dependencies, mostly negative
+kit/tests/         396 tests, no dependencies, mostly negative
 LICENSE            Apache License 2.0
 NOTICE             contributor and upstream attribution
 ```

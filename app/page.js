@@ -236,7 +236,7 @@ export default function Home() {
           </div>
 
           <div className="shell proof-strip reveal reveal--5" aria-label="RepoCharter facts">
-            <div><strong>389</strong><span>negative-first tests</span></div>
+            <div><strong>396</strong><span>negative-first tests</span></div>
             <div><strong>0</strong><span>CLI runtime dependencies</span></div>
             <div><strong>1</strong><span>canonical charter</span></div>
             <div><strong>5+</strong><span>agent harnesses reached</span></div>

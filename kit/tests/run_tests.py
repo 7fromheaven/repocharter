@@ -23,6 +23,7 @@ HOOKS = KIT / "hooks" / "claude"
 RESIDUE = KIT / "verify" / "residue.py"
 REPO_CHARTER = KIT / "repocharter"
 AGENTKIT_COMPAT = KIT / "agentkit"
+CI_TEMPLATE = KIT / "templates" / "ci-workflow.yml"
 
 # `repocharter` has no .py suffix, so it needs an explicit loader to import.
 sys.path.insert(0, str(KIT))
@@ -148,9 +149,9 @@ def test_cli_entrypoints(tmp: Path) -> None:
         [sys.executable, str(REPO_CHARTER), "--version"], capture_output=True, text=True)
     compatibility_version = subprocess.run(
         [sys.executable, str(AGENTKIT_COMPAT), "--version"], capture_output=True, text=True)
-    check("the canonical command identifies RepoCharter 0.4.0",
+    check("the canonical command identifies RepoCharter 0.4.1",
           canonical_version.returncode == 0
-          and canonical_version.stdout.strip() == "RepoCharter 0.4.0"
+          and canonical_version.stdout.strip() == "RepoCharter 0.4.1"
           and not canonical_version.stderr,
           canonical_version.stdout + canonical_version.stderr)
     check("the compatibility command has identical version behavior",
@@ -200,7 +201,7 @@ def test_public_migration_skill_bootstrap(tmp: Path) -> None:
     """The source distribution must expose the migration workflow before apply."""
     section("public bootstrap — migration skill is natively discoverable before apply")
     source_root = KIT.parent
-    extractor = source_root / "scripts" / "extract-agentkit.py"
+    extractor = source_root / "scripts" / "extract-repocharter.py"
     if extractor.is_file():
         distribution = tmp / "repocharter-public"
         extracted = subprocess.run(
@@ -990,8 +991,8 @@ def test_apply(tmp: Path) -> None:
 
     settings = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
     compat = json.loads((repo / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
-    check("the compatibility manifest records RepoCharter 0.4.0",
-          compat["agentkitVersion"] == "0.4.0", str(compat))
+    check("the compatibility manifest records RepoCharter 0.4.1",
+          compat["agentkitVersion"] == "0.4.1", str(compat))
     check("auto memory defaults OFF in compatibility.json", compat["autoMemory"] == "off", str(compat))
     check("apply disables Claude auto memory by default", settings["autoMemoryEnabled"] is False, str(settings))
     matchers = [g.get("matcher") for g in settings["hooks"]["PreToolUse"]]
@@ -2421,6 +2422,68 @@ def test_vendor_and_precommit(tmp: Path) -> None:
                            capture_output=True, text=True)
     check("second apply reports 0 changes", "0 change(s)" in again.stdout, again.stdout[-200:])
 
+    section("CI template — a fresh checkout activates and still verifies the commit gate")
+    template = CI_TEMPLATE.read_text(encoding="utf-8")
+    configure = "git config core.hooksPath .githooks"
+    strict_verify = "kit/repocharter verify --repo . --strict"
+    check("the checkout-local hook setup precedes strict verification",
+          template.count(configure) == 1
+          and template.count(strict_verify) == 1
+          and template.index(configure) < template.index(strict_verify),
+          template)
+
+    run("git", "config", "--unset-all", "core.hooksPath")
+    unwired = run(sys.executable, "kit/repocharter", "verify", "--repo", ".", "--strict")
+    check("a fresh checkout reproduces the missing-wiring failure",
+          unwired.returncode != 0
+          and "core.hooksPath is unset" in unwired.stdout + unwired.stderr,
+          unwired.stdout[-300:] + unwired.stderr[-300:])
+
+    configured = run("git", "config", "core.hooksPath", ".githooks")
+    wired = run(sys.executable, "kit/repocharter", "verify", "--repo", ".", "--strict")
+    check("the template setup makes the intact fresh checkout pass",
+          configured.returncode == 0 and wired.returncode == 0,
+          wired.stdout[-400:] + wired.stderr[-400:])
+
+    original_hook = hook.read_text(encoding="utf-8")
+    missing_hook = hook.with_name("pre-commit.missing")
+    hook.rename(missing_hook)
+    missing = run(sys.executable, "kit/repocharter", "verify", "--repo", ".", "--strict")
+    check("the setup cannot hide a missing hook",
+          missing.returncode != 0 and "hook is missing" in missing.stdout + missing.stderr,
+          missing.stdout[-300:] + missing.stderr[-300:])
+    missing_hook.rename(hook)
+
+    hook.chmod(0o644)
+    non_executable = run(sys.executable, "kit/repocharter", "verify", "--repo", ".", "--strict")
+    check("the setup cannot hide a non-executable hook",
+          non_executable.returncode != 0
+          and "not executable" in non_executable.stdout + non_executable.stderr,
+          non_executable.stdout[-300:] + non_executable.stderr[-300:])
+    hook.chmod(0o755)
+
+    hook.write_text(original_hook.replace(
+        "python3 kit/repocharter verify --repo .",
+        "true # fixture removed repocharter verification",
+        1,
+    ), encoding="utf-8")
+    gutted = run(sys.executable, "kit/repocharter", "verify", "--repo", ".", "--strict")
+    check("the setup cannot hide a gutted managed gate",
+          gutted.returncode != 0
+          and "does not invoke" in gutted.stdout + gutted.stderr,
+          gutted.stdout[-300:] + gutted.stderr[-300:])
+
+    hook.write_text(original_hook.replace(
+        "# >>> agentkit >>>", "exit 0\n# >>> agentkit >>>", 1,
+    ), encoding="utf-8")
+    unreachable = run(sys.executable, "kit/repocharter", "verify", "--repo", ".", "--strict")
+    check("the setup cannot hide an unreachable managed gate",
+          unreachable.returncode != 0
+          and "unreachable" in unreachable.stdout + unreachable.stderr,
+          unreachable.stdout[-300:] + unreachable.stderr[-300:])
+    hook.write_text(original_hook, encoding="utf-8")
+    hook.chmod(0o755)
+
     section("pre-commit — runs provider-neutral declared validation")
     compat_path = repo / ".agents" / "compatibility.json"
     compat = json.loads(compat_path.read_text(encoding="utf-8"))
@@ -2595,14 +2658,14 @@ def test_legacy_cli_upgrade(tmp: Path) -> None:
     section("apply — 0.3.8 command transition is backward compatible")
     check("the 0.3.8 fixture upgrades successfully", upgraded.returncode == 0,
           upgraded.stdout[-500:] + upgraded.stderr[-500:])
-    check("the upgrade records 0.4.0 and vendors both executable entrypoints",
-          upgraded_compat.get("agentkitVersion") == "0.4.0"
+    check("the upgrade records 0.4.1 and vendors both executable entrypoints",
+          upgraded_compat.get("agentkitVersion") == "0.4.1"
           and os.access(repo / "kit" / "repocharter", os.X_OK)
           and os.access(repo / "kit" / "agentkit", os.X_OK),
           str(upgraded_compat))
-    check("the old command delegates to the canonical 0.4.0 identity",
+    check("the old command delegates to the canonical 0.4.1 identity",
           compatibility_version.returncode == 0
-          and compatibility_version.stdout.strip() == "RepoCharter 0.4.0"
+          and compatibility_version.stdout.strip() == "RepoCharter 0.4.1"
           and not compatibility_version.stderr,
           compatibility_version.stdout + compatibility_version.stderr)
     check("the managed lane moves to repocharter without touching user hook content",

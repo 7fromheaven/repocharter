@@ -31,6 +31,13 @@ jobs:
         with:
           node-version: '20'
 
+      - name: activate the checked-in pre-commit gate
+        # core.hooksPath is checkout-local Git config. `repocharter apply` sets it on a
+        # developer clone, but actions/checkout cannot carry that config into CI.
+        # Strict verification still inspects the hook's bytes, mode, managed block, and
+        # reachability after this wiring is active; this step does not certify the hook.
+        run: git config core.hooksPath .githooks
+
       - name: repocharter verify
         # --strict promotes warnings to errors. It can be omitted temporarily during a
         # migration and restored after the repository is conforming.
