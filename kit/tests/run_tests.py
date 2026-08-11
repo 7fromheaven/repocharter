@@ -200,7 +200,7 @@ def test_public_migration_skill_bootstrap(tmp: Path) -> None:
     """The source distribution must expose the migration workflow before apply."""
     section("public bootstrap — migration skill is natively discoverable before apply")
     source_root = KIT.parent
-    extractor = source_root / "scripts" / "extract-agentkit.py"
+    extractor = source_root / "scripts" / "extract-repocharter.py"
     if extractor.is_file():
         distribution = tmp / "repocharter-public"
         extracted = subprocess.run(
