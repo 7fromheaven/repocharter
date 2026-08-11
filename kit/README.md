@@ -3,10 +3,10 @@
 The mechanical layer of the portable agent-context system. One vendored copy per
 repository, one version stamp, one command to install and one to check.
 
-RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
-`agentkit` name so existing repositories and automation continue to work.
+`kit/repocharter` is the canonical executable. `kit/agentkit` remains a silent compatibility
+wrapper so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 374 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 389 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -76,17 +76,17 @@ An agent should execute this sequence through `$migrate-repocharter`; the comman
 the protocol stays reviewable.
 
 ```sh
-kit/agentkit census  --repo ~/dev/foo             # measure before touching
-kit/agentkit apply   --repo ~/dev/foo --dry-run   # preview the footprint
-kit/agentkit apply   --repo ~/dev/foo             # refuses a dirty tree
-kit/agentkit self-test --repo ~/dev/foo           # prove the gates fire
-kit/agentkit measure --repo ~/dev/foo              # test repo-declared policy
-kit/agentkit verify  --repo ~/dev/foo              # check the installed system
+kit/repocharter census  --repo ~/dev/foo             # measure before touching
+kit/repocharter apply   --repo ~/dev/foo --dry-run   # preview the footprint
+kit/repocharter apply   --repo ~/dev/foo             # refuses a dirty tree
+kit/repocharter self-test --repo ~/dev/foo           # prove the gates fire
+kit/repocharter measure --repo ~/dev/foo              # test repo-declared policy
+kit/repocharter verify  --repo ~/dev/foo              # check the installed system
 # Under Codex: restart, review/trust /hooks, then:
-kit/agentkit self-test --repo ~/dev/foo --promote-codex
-kit/agentkit verify --repo ~/dev/foo --effective
+kit/repocharter self-test --repo ~/dev/foo --promote-codex
+kit/repocharter verify --repo ~/dev/foo --effective
 # Under Claude Code: restart, establish interactive workspace trust, then:
-kit/agentkit self-test --repo ~/dev/foo --promote-claude
+kit/repocharter self-test --repo ~/dev/foo --promote-claude
 ```
 
 ### Only when replacing a supported legacy system
@@ -97,13 +97,13 @@ the legacy `block` / `ask` functions with nearby `grep -qE` conditions. Other co
 memory stores, and validator shapes require manual review.
 
 ```sh
-kit/agentkit policy scaffold --repo ~/dev/foo
+kit/repocharter policy scaffold --repo ~/dev/foo
 #   ... review policyDraft ...
-kit/agentkit policy promote  --repo ~/dev/foo
-kit/agentkit apply   --repo ~/dev/foo             # recompile permissions.deny
-kit/agentkit supersede --repo ~/dev/foo           # can the old gate be retired?
-kit/agentkit supersede --repo ~/dev/foo --retire  # only if the check says yes
-kit/agentkit migrate --repo ~/dev/foo             # plan; --apply does the mechanical half
+kit/repocharter policy promote  --repo ~/dev/foo
+kit/repocharter apply   --repo ~/dev/foo             # recompile permissions.deny
+kit/repocharter supersede --repo ~/dev/foo           # can the old gate be retired?
+kit/repocharter supersede --repo ~/dev/foo --retire  # only if the check says yes
+kit/repocharter migrate --repo ~/dev/foo             # plan; --apply does the mechanical half
 ```
 
 ## Replacing a supported legacy shell gate
@@ -280,12 +280,12 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-374 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+389 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI
 
-Copy `kit/templates/ci-workflow.yml` to `.github/workflows/agentkit.yml`. The workflow blocks
+Copy `kit/templates/ci-workflow.yml` to `.github/workflows/repocharter.yml`. The workflow blocks
 merges only when branch protection or a repository ruleset requires the job to pass; otherwise
 it reports violations after a push.
 

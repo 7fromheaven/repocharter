@@ -297,5 +297,5 @@ def retire(repo: Path, old_gate: Path) -> list[str]:
 
     (quarantine / "manifest.json").write_text(
         json.dumps({"stamp": stamp, "actions": manifest}, indent=2) + "\n", encoding="utf-8")
-    log.append(f"manifest at .agents/quarantine/{stamp}/manifest.json — `agentkit revert` restores")
+    log.append(f"manifest at .agents/quarantine/{stamp}/manifest.json — `repocharter revert` restores")
     return log

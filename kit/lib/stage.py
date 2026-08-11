@@ -27,8 +27,8 @@ MIGRATED = "migrated"
 STAGE_ORDER = [NOT_STARTED, MECHANICAL, MIGRATED]
 
 STAGE_HELP = {
-    NOT_STARTED: "no agentkit layer yet — run `agentkit apply`",
-    MECHANICAL: "plumbing installed, migration incomplete — run `agentkit migrate`",
+    NOT_STARTED: "no RepoCharter layer yet — run `repocharter apply`",
+    MECHANICAL: "plumbing installed, migration incomplete — run `repocharter migrate`",
     MIGRATED: "canonical layout, no recognized legacy residue",
 }
 

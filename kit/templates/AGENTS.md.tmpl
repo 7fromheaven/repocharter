@@ -16,7 +16,7 @@
   dilutes the rules it cannot derive. Anthropic's test: for each line, ask whether removing
   it would cause a mistake. If not, cut it.
 
-  Target: under 200 lines. Hard fail: 32,768 bytes. `agentkit verify` enforces both.
+  Target: under 200 lines. Hard fail: 32,768 bytes. `repocharter verify` enforces both.
 -->
 
 ## Never
@@ -50,8 +50,8 @@ convention rather than protection:
 
 - everything in this file that is not listed above.
 
-Run `agentkit self-test --repo .` to confirm the installed gates fire. Under Codex, restart,
-review and trust `/hooks`, then run `agentkit self-test --repo . --promote-codex`; only that
+Run `repocharter self-test --repo .` to confirm the installed gates fire. Under Codex, restart,
+review and trust `/hooks`, then run `repocharter self-test --repo . --promote-codex`; only that
 provider-backed path may promote Codex to blocking.
 
 ## Where things are

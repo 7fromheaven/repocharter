@@ -267,7 +267,7 @@ def discovery_problem(repo: Path, result: CodexHookDiscovery) -> str | None:
     if result.status == "exact":
         return None
     if result.status == "not-installed":
-        return ".codex/hooks.json is not installed; run `agentkit apply` first"
+        return ".codex/hooks.json is not installed; run `repocharter apply` first"
     if result.status == "wrong-checkout":
         seen = ", ".join(result.source_paths)
         return (

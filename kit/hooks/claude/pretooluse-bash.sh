@@ -42,7 +42,7 @@ AGENTKIT_HARNESS="${AGENTKIT_HARNESS:-claude-code}"
 case "$AGENTKIT_HARNESS" in
   claude-code|codex) ;;
   *)
-    printf '%s\n' "agentkit safety gate: unknown AGENTKIT_HARNESS '$AGENTKIT_HARNESS'; refusing." >&2
+    printf '%s\n' "RepoCharter safety gate: unknown AGENTKIT_HARNESS '$AGENTKIT_HARNESS'; refusing." >&2
     exit 2 ;;
 esac
 
@@ -52,7 +52,7 @@ if [ -z "$PROJECT_DIR" ]; then
 fi
 
 die_closed() {
-  printf '%s\n' "agentkit safety gate: $1 The gate cannot evaluate this command, so it is refused rather than silently allowed. Install jq or python3, or remove the PreToolUse Bash hook deliberately." >&2
+  printf '%s\n' "RepoCharter safety gate: $1 The gate cannot evaluate this command, so it is refused rather than silently allowed. Install jq or python3, or remove the PreToolUse Bash hook deliberately." >&2
   exit 2
 }
 
@@ -315,7 +315,7 @@ GIT="${CSEP}git[[:space:]]+${GIT_GLOBAL}"
 SAFE_PATHS_EXTRA="${SAFE_PATHS_EXTRA:-}"
 
 # ─── STACK-FRAGMENT INSERTION POINT ───────────────────────────────────────────────────
-# `agentkit apply` splices the per-stack fragment (e.g. node-ts) HERE, before the
+# `repocharter apply` splices the per-stack fragment (e.g. node-ts) HERE, before the
 # universal rules, so it can add rules and extend SAFE_PATHS_EXTRA. The base is correct
 # standalone; leave this marker in place.
 # <<<AGENTKIT:STACK-FRAGMENT>>>

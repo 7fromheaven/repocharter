@@ -2,7 +2,7 @@
 """PreToolUse gate for Edit|Write path denials and before-measurements.
 
 DENIALS. `policy.denyWritePaths` names files no agent may edit. These are ALSO compiled
-into settings.json `permissions.deny` by `agentkit apply`, deliberately twice: the
+into settings.json `permissions.deny` by `repocharter apply`, deliberately twice: the
 permission system is the client-enforced layer Anthropic points at for hard path blocks
 ("use the permission system rather than a hook to enforce a hard allow or deny"), and this
 hook is what still fires when a settings layer is missing, excluded, or overridden. Two
@@ -62,20 +62,20 @@ def main() -> None:
     for file_path in paths:
         # Codex has no ConfigChange event. Protect the repo-local files that activate its
         # own hooks at the write-tool boundary; legitimate regeneration goes through
-        # `agentkit apply`, whose Bash invocation is separately gated and reviewable.
+        # `repocharter apply`, whose Bash invocation is separately gated and reviewable.
         if harness() == "codex" and any(
             path_matches(file_path, protected)
             for protected in (".codex/hooks.json", ".codex/config.toml")
         ):
             deny(
-                f"agentkit policy: Codex may not edit its own enforcement file {file_path} "
-                "through apply_patch. Change the source kit and run `agentkit apply`."
+                f"RepoCharter policy: Codex may not edit its own enforcement file {file_path} "
+                "through apply_patch. Change the source kit and run `repocharter apply`."
             )
 
         for rule in policy.get("denyWritePaths") or []:
             if path_matches(file_path, rule["glob"]):
                 deny(
-                    f"agentkit policy: writing {file_path} is forbidden. {rule['reason']} "
+                    f"RepoCharter policy: writing {file_path} is forbidden. {rule['reason']} "
                     f"(rule: denyWritePaths {rule['glob']} in .agents/compatibility.json)"
                 )
 
@@ -99,7 +99,7 @@ def main() -> None:
 
     if notes:
         add_context(
-            "[agentkit measurement — BEFORE] " + " | ".join(notes) +
+            "[RepoCharter measurement — BEFORE] " + " | ".join(notes) +
             " . The after-measurement will be reported automatically once the edit lands; "
             "if a count moves in a direction you did not intend, stop and say so."
         )

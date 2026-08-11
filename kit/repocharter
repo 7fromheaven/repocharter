@@ -1,0 +1,2748 @@
+#!/usr/bin/env python3
+"""Install and verify the RepoCharter layout in a repository.
+
+Core commands:
+
+  apply    writes ONLY mechanical parts -- the shim, the symlinks, the hooks block, the
+           permission denials, the linter config, the declaration. It NEVER writes
+           AGENTS.md's body and never touches docs/project/.
+
+  verify   runs the checked-in schema/residue layer plus the repository's declared
+           validation commands. --agnix adds the network-fetched shared catalogue.
+
+  self-test  fires known-forbidden calls at the installed hooks and asserts refusal. This
+             is required before a repo may declare `enforcement: blocking`.
+
+  census     records the startup-context baseline before installation.
+
+Everything is idempotent. Re-running apply on a conforming repo changes nothing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import date
+from pathlib import Path
+
+KIT_ROOT = Path(__file__).resolve().parent
+KIT_VERSION = "0.4.0"
+
+sys.path.insert(0, str(KIT_ROOT / "lib"))
+import migrate as migrate_lib  # noqa: E402
+import scaffold as scaffold_lib  # noqa: E402
+import stage as stage_lib  # noqa: E402
+import codex_hooks as codex_hooks_lib  # noqa: E402
+
+
+# ── preflight ─────────────────────────────────────────────────────────────────────────
+
+# Paths the kit itself writes. Changes here are the kit's own footprint, not somebody's
+# unrelated work-in-progress, so they must not make the kit refuse to re-run itself.
+AGENTKIT_OWNED = (
+    ".agents/",
+    ".agnix.toml",
+    ".claude/hooks/agentkit/",
+    ".claude/settings.json",
+    ".claude/skills/",
+    ".codex/hooks.json",
+    # The vendored runtime and managed hook lane are excluded from the unrelated-change
+    # check so apply remains idempotent. Only `pre-commit` is claimed inside .githooks/;
+    # other hook files remain user-owned.
+    "kit/",
+    ".githooks/pre-commit",
+)
+
+# apply CREATES the shim when absent and never modifies an existing one, so an UNTRACKED
+# CLAUDE.md is ours while a modified tracked one is somebody's real edit and must still
+# count as dirty. The distinction is the git status code, not the path.
+AGENTKIT_OWNED_IF_UNTRACKED = ("CLAUDE.md",)
+
+
+TOMBSTONE_MARK = "# agentkit tombstone."
+
+
+def _is_tombstone(path: Path) -> bool:
+    try:
+        return TOMBSTONE_MARK in path.read_text(encoding="utf-8", errors="replace")[:400]
+    except OSError:
+        return False
+
+
+def unrelated_changes(repo: Path) -> list[str] | None:
+    """Return dirty paths outside the kit-owned footprint, or None for a non-Git path."""
+    # -uall expands untracked DIRECTORIES into their files. Without it git reports a bare
+    # `?? .claude/`, which matches none of the specific owned paths, and the kit refuses to
+    # re-run over its own footprint.
+    proc = subprocess.run(["git", "status", "--porcelain", "-uall"], cwd=repo,
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+
+    dirty: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        code, path = line[:2], line[3:].strip().strip('"')
+        if any(path.startswith(owned) for owned in AGENTKIT_OWNED):
+            continue
+        if code == "??" and path in AGENTKIT_OWNED_IF_UNTRACKED:
+            continue
+        # A tombstone lands wherever the old settings pointed, so no path prefix can
+        # claim it. Its CONTENT identifies it, and it is ours — otherwise the apply
+        # that writes one makes the next apply refuse the repo as dirty.
+        if code == "??" and _is_tombstone(repo / path):
+            continue
+        dirty.append(path)
+    return dirty
+
+
+def preflight(repo: Path, allow_dirty: bool) -> int | None:
+    """Refuse to mutate a repository that already has UNRELATED uncommitted work.
+
+    Keeping installation changes separate makes the generated footprint reviewable. The
+    explicit escape hatch supports workflows that intentionally combine changes.
+
+    The kit's own footprint is excluded so a completed apply can be run again without
+    requiring the generated files to be committed first.
+    """
+    dirty = unrelated_changes(repo)
+    if dirty is None:
+        print(f"  note: {repo} is not a git repository; proceeding without a tree check")
+        return None
+    if not dirty:
+        return None
+    if allow_dirty:
+        print(f"  note: {len(dirty)} uncommitted change(s) present; --allow-dirty given, proceeding")
+        return None
+    print(f"repocharter: {repo} has {len(dirty)} uncommitted change(s).", file=sys.stderr)
+    print("  Refusing, so this install stays reviewable on its own. Commit or stash first,",
+          file=sys.stderr)
+    print("  or pass --allow-dirty to stack it on top of the existing changes.", file=sys.stderr)
+    return 2
+
+HOOK_DIR_NAME = ".claude/hooks/agentkit"
+CLAUDE_HOOKS = [
+    "pretooluse-bash.sh",
+    "pretooluse-write.py",
+    "posttooluse-write.py",
+    "pretooluse-mcp.py",
+    "configchange-guard.py",
+    "_policy.py",
+]
+CODEX_ADAPTER_FILES = (
+    ".codex/hooks.json",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+)
+# The Claude wire path is settings.json plus every script it names. configchange-guard.py
+# belongs here because settings.json invokes it; leaving it out would let the one gate that
+# protects the settings file change without invalidating the evidence.
+CLAUDE_ADAPTER_FILES = (
+    ".claude/settings.json",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+    ".claude/hooks/agentkit/configchange-guard.py",
+)
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────────────
+
+def say(msg: str) -> None:
+    print(f"  {msg}")
+
+
+def read_json(path: Path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def agentkit_state_dir() -> Path:
+    """Machine-local recoverable state, overrideable for sandboxed tests and CI."""
+    return Path(os.environ.get("AGENTKIT_STATE_DIR") or (Path.home() / ".agentkit"))
+
+
+def adapter_digest(repo: Path, files: tuple[str, ...]) -> str | None:
+    """Hash the exact provider wiring a live self-test certifies.
+
+    A missing file returns None rather than a digest over what remains, so a half-installed
+    adapter can never match a recorded hash.
+    """
+    digest = hashlib.sha256()
+    for rel in files:
+        path = repo / rel
+        if not path.is_file():
+            return None
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def codex_adapter_digest(repo: Path) -> str | None:
+    closure = codex_hooks_lib.discover(repo)
+    if closure.errors:
+        return None
+    files = CODEX_ADAPTER_FILES + tuple(
+        path for path in closure.dependencies if path not in CODEX_ADAPTER_FILES
+    )
+    return adapter_digest(repo, files)
+
+
+def claude_adapter_digest(repo: Path) -> str | None:
+    return adapter_digest(repo, CLAUDE_ADAPTER_FILES)
+
+
+CHECKOUT_EVIDENCE_VERSION = 1
+
+
+def checkout_git_dir(repo: Path) -> Path | None:
+    """Return this worktree's private Git directory, never the shared common dir."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=repo,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    path = proc.stdout.strip()
+    return Path(path) if proc.returncode == 0 and path else None
+
+
+def checkout_evidence_path(repo: Path, harness: str) -> Path | None:
+    git_dir = checkout_git_dir(repo)
+    if git_dir is None:
+        return None
+    return git_dir / "agentkit" / "enforcement" / f"{harness}.json"
+
+
+def checkout_evidence_record(repo: Path, harness: str, evidence: dict) -> dict:
+    """Machine-local proof paired with the tracked repository-level evidence."""
+    return {
+        "formatVersion": CHECKOUT_EVIDENCE_VERSION,
+        "agentkitVersion": KIT_VERSION,
+        "checkout": str(repo.resolve()),
+        "provider": harness,
+        "evidence": evidence,
+    }
+
+
+def write_checkout_evidence(repo: Path, harness: str, evidence: dict) -> bool:
+    path = checkout_evidence_path(repo, harness)
+    if path is None:
+        return False
+    write_json(path, checkout_evidence_record(repo, harness, evidence))
+    return True
+
+
+def provider_promotion_state(repo: Path, harness: str, compat: dict | None = None) -> dict:
+    """Say whether this checkout can reuse its existing live provider evidence.
+
+    This is deliberately stricter than a tracked `blocking` declaration. Reuse also requires
+    the exact adapter bytes, provider version, checkout-local attestation, effective provider
+    settings, and (for Codex) the exact trusted project hook source.
+    """
+    compat = compat if isinstance(compat, dict) else (
+        read_json(repo / ".agents" / "compatibility.json", {}) or {}
+    )
+    if harness not in {"codex", "claude-code"}:
+        return {
+            "current": False,
+            "promotionRequired": True,
+            "installedVersion": None,
+            "reasons": [f"{harness} has no provider-specific promotion implementation"],
+            "discovery": None,
+        }
+
+    executable = "codex" if harness == "codex" else "claude"
+    reasons: list[str] = []
+    enforcement = (compat.get("enforcement") or {}).get(harness, "advisory")
+    if enforcement != "blocking":
+        reasons.append("enforcement declaration is advisory")
+    if compat.get("agentkitVersion") != KIT_VERSION:
+        reasons.append(
+            f"manifest version {compat.get('agentkitVersion')!r} does not match kit {KIT_VERSION!r}"
+        )
+
+    evidence = (compat.get("enforcementEvidence") or {}).get(harness)
+    if not isinstance(evidence, dict):
+        reasons.append("tracked live evidence is missing")
+        evidence = None
+
+    digest = claude_adapter_digest(repo) if harness == "claude-code" \
+        else codex_adapter_digest(repo)
+    if evidence is not None and digest != evidence.get("adapterSha256"):
+        reasons.append("adapter bytes differ from the tracked evidence")
+
+    version = ""
+    if shutil.which(executable) is None:
+        reasons.append(f"{executable} is unavailable in this environment")
+    else:
+        try:
+            proc = subprocess.run(
+                [executable, "--version"], cwd=repo, capture_output=True,
+                text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            reasons.append(f"could not read {executable} version: {exc}")
+        else:
+            version = proc.stdout.strip()
+            if proc.returncode != 0 or not version:
+                reasons.append(f"could not read {executable} version")
+            elif evidence is not None and version != evidence.get("harnessVersion"):
+                reasons.append("installed provider version differs from the tracked evidence")
+
+    local_path = checkout_evidence_path(repo, harness)
+    local = read_json(local_path) if local_path is not None else None
+    expected_local = checkout_evidence_record(repo, harness, evidence) \
+        if evidence is not None else None
+    if local != expected_local:
+        reasons.append("checkout-local attestation is missing, stale, or belongs elsewhere")
+
+    discovery = None
+    if harness == "codex" and version:
+        discovered = codex_hooks_lib.query_discovery(repo)
+        discovery = {
+            "status": discovered.status,
+            "expectedPath": discovered.expected_path,
+            "sourcePaths": list(discovered.source_paths),
+            "trustStatuses": list(discovered.trust_statuses),
+            "warnings": list(discovered.warnings),
+            "errors": list(discovered.errors),
+        }
+        problem = codex_hooks_lib.discovery_problem(repo, discovered)
+        if problem:
+            reasons.append(problem)
+        elif discovered.warnings:
+            reasons.append("Codex reported project-hook discovery warnings")
+        elif not discovered.trust_statuses or any(
+                value != "trusted" for value in discovered.trust_statuses):
+            reasons.append("the exact Codex hook definitions have not all been trusted")
+    elif harness == "claude-code" and version:
+        failures, trust_root = claude_checkout_preflight(repo)
+        reasons.extend(failures)
+        discovery = {"trustRoot": str(trust_root) if trust_root is not None else None}
+
+    return {
+        "enforcement": enforcement,
+        "installedVersion": version or None,
+        "evidence": evidence,
+        "adapterSha256": digest,
+        "localAttestation": str(local_path) if local_path is not None else None,
+        "discovery": discovery,
+        "current": not reasons,
+        "promotionRequired": bool(reasons),
+        "reasons": reasons,
+    }
+
+
+def claude_config_dir() -> Path:
+    raw = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(raw).expanduser() if raw else Path.home() / ".claude"
+
+
+def claude_state_path() -> Path:
+    """Claude's app-state file, which documents per-project trust under `projects`."""
+    config_dir = claude_config_dir()
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        candidates = (Path(f"{config_dir}.json"), config_dir / ".claude.json")
+        return next((path for path in candidates if path.is_file()), candidates[0])
+    return Path.home() / ".claude.json"
+
+
+def claude_trust_root(repo: Path) -> Path | None:
+    """Return the most specific persisted Claude trust boundary covering this checkout."""
+    state = read_json(claude_state_path(), {}) or {}
+    projects = state.get("projects")
+    if not isinstance(projects, dict):
+        return None
+    target = repo.resolve()
+    trusted: list[Path] = []
+    for raw, project in projects.items():
+        if not isinstance(raw, str) or not isinstance(project, dict):
+            continue
+        if project.get("hasTrustDialogAccepted") is not True:
+            continue
+        candidate = Path(raw).expanduser().resolve()
+        try:
+            target.relative_to(candidate)
+        except (ValueError, OSError):
+            continue
+        trusted.append(candidate)
+    return max(trusted, key=lambda path: len(path.parts), default=None)
+
+
+def claude_local_settings_paths(repo: Path) -> list[Path]:
+    """Paths Claude may use for this repo's machine-local settings, including worktrees."""
+    paths = [repo / ".claude" / "settings.local.json"]
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=repo,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        first = next((line.removeprefix("worktree ") for line in proc.stdout.splitlines()
+                      if line.startswith("worktree ")), "")
+        if first:
+            paths.append(Path(first) / ".claude" / "settings.local.json")
+    unique: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return unique
+
+
+def claude_checkout_preflight(repo: Path) -> tuple[list[str], Path | None]:
+    """Inspect the target checkout conditions the disposable probe intentionally cannot own."""
+    failures: list[str] = []
+    trust_root = claude_trust_root(repo)
+    if trust_root is None:
+        failures.append(
+            "workspace trust is not persisted for this checkout or a covering parent. Start "
+            "`claude` interactively here, review the project settings/hooks, accept the trust "
+            "dialog, then rerun promotion"
+        )
+
+    settings_paths = [repo / ".claude" / "settings.json", *claude_local_settings_paths(repo),
+                      claude_config_dir() / "settings.json"]
+    seen: set[Path] = set()
+    for path in settings_paths:
+        path = path.resolve()
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        data = read_json(path)
+        if not isinstance(data, dict):
+            failures.append(f"{path} is not valid object-valued JSON, so effective Claude settings are unknown")
+        elif data.get("disableAllHooks") is True:
+            failures.append(f"{path} sets disableAllHooks, so project hooks are inert")
+    if os.environ.get("CLAUDE_CODE_SAFE_MODE"):
+        failures.append("CLAUDE_CODE_SAFE_MODE is set, so this process cannot prove project hooks")
+    return failures, trust_root
+
+
+def default_compat(repo: Path) -> dict:
+    """The declaration a fresh repo starts from.
+
+    autoMemory defaults to "off" because RepoCharter already gives durable knowledge one
+    reviewed, portable home. A repository may opt into Claude-only machine-local memory and
+    record why; `verify` checks both the exception and the effective settings value.
+    """
+    return {
+        "$schema": "../kit/schema/compatibility.schema.json",
+        "agentkitVersion": KIT_VERSION,
+        "canonical": {
+            "instructions": "AGENTS.md",
+            "shim": "CLAUDE.md",
+            "project": "docs/project",
+            "skills": ".agents/skills",
+            "research": "docs/research",
+        },
+        "optionalFiles": ["docs/project/obligations.md", "docs/research"],
+        "adapters": [
+            {"harness": "codex", "kind": "native",
+             "note": "reads AGENTS.md and .agents/skills directly, and follows symlinks"},
+            {"harness": "claude-code", "kind": "relative-symlink",
+             "from": "CLAUDE.md", "to": "AGENTS.md"},
+            {"harness": "claude-code", "kind": "relative-symlink",
+             "from": ".claude/skills/<name>",
+             "to": "../../.agents/skills/<name>"},
+            {"harness": "zcode", "kind": "manual-import",
+             "note": "client-scoped: import from the Codex source as Project + Symlink, then confirm $<name> appears"},
+        ],
+        "enforcement": {"claude-code": "advisory", "codex": "advisory", "zcode": "advisory"},
+        "autoMemory": "off",
+        "budgets": {
+            "codexProjectDocMaxBytes": 32768,
+            "codexBudgetSource": "codex-rs/config/src/config_toml.rs DEFAULT_PROJECT_DOC_MAX_BYTES @ 85e0661c3baa (2026-08-07)",
+            "claudeLineTarget": 200,
+            "skillWarnCount": 20,
+            "skillBodyMaxTokens": 5000,
+            "pitfallsMaxLines": 100,
+            "pitfallsMaxBytes": 8192,
+        },
+        "policy": {
+            "protectedBranches": ["main", "master"],
+            "denyWritePaths": [],
+            "denyMcpTools": [],
+            "measureOnWrite": [],
+        },
+        "validation": {"commands": []},
+        "fallbacks": {
+            "missingSkillDiscovery": "Read .agents/skills/<name>/SKILL.md directly",
+            "missingHooks": "Run `repocharter verify` and every declared validation command before handoff",
+        },
+        "harnessWritten": [".claude/skills/verify", ".claude/skills/run-*"],
+        "exceptions": [],
+    }
+
+
+def merge_compat(existing: dict, fresh: dict) -> dict:
+    """Carry an existing declaration forward, adding only genuinely new keys.
+
+    Never overwrite what the repo declared. The version stamp is the one exception: it is
+    what the cross-repo drift check reads, so it must reflect the kit actually installed.
+    """
+    out = dict(fresh)
+    for key, value in existing.items():
+        if key == "agentkitVersion":
+            continue
+        if key == "adapters" and isinstance(value, list):
+            # Match an adapter by harness + source. This preserves an existing repo's
+            # deliberate import-vs-symlink choice while adding newly required adapters,
+            # such as the explicit project-skills reach path introduced in 0.3.0.
+            merged_adapters = list(fresh.get("adapters") or [])
+            for adapter in value:
+                if not isinstance(adapter, dict):
+                    merged_adapters.append(adapter)
+                    continue
+                identity = (adapter.get("harness"), adapter.get("from"))
+                replaced = False
+                for index, candidate in enumerate(merged_adapters):
+                    candidate_identity = (candidate.get("harness"), candidate.get("from"))
+                    if identity == candidate_identity:
+                        merged_adapters[index] = adapter
+                        replaced = True
+                        break
+                if not replaced:
+                    merged_adapters.append(adapter)
+            out[key] = merged_adapters
+            continue
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            merged = dict(out[key])
+            merged.update(value)
+            out[key] = merged
+        else:
+            out[key] = value
+    out["agentkitVersion"] = KIT_VERSION
+    return out
+
+
+# ── apply ─────────────────────────────────────────────────────────────────────────────
+
+VENDORED_KIT = ("repocharter", "agentkit", "lib", "verify", "schema", "hooks", "templates", "skills")
+MANAGED_BUNDLED_SKILLS = {"migrate-repocharter"}
+
+PRECOMMIT_BEGIN = "# >>> agentkit >>>"
+PRECOMMIT_END = "# <<< agentkit <<<"
+
+PRECOMMIT_LANE = f"""{PRECOMMIT_BEGIN}
+# Managed by `repocharter apply`. Edits between these markers are overwritten.
+#
+# Checks this repo's agent-context layout AND every clean-code command declared in
+# compatibility.json before the commit lands. Runs entirely offline unless the repo
+# explicitly declares a networked command, so it cannot pass by failing to run.
+# Add --agnix manually when you also want the network-fetched shared catalogue.
+if [ -x kit/repocharter ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    if ! python3 kit/repocharter verify --repo . ; then
+      echo "pre-commit: x repocharter verify FAILED -> commit blocked" >&2
+      echo "pre-commit:   fix the errors above, or re-run with the finding understood." >&2
+      exit 1
+    fi
+  else
+    # Missing verification dependencies must block rather than silently skip the gate.
+    echo "pre-commit: x python3 not found, so repocharter verify could not run -> blocked" >&2
+    exit 1
+  fi
+else
+  echo "pre-commit: x kit/repocharter is missing -- the vendored kit is incomplete -> blocked" >&2
+  echo "pre-commit:   run \\`repocharter apply\\` from a RepoCharter source distribution to restore it." >&2
+  exit 1
+fi
+{PRECOMMIT_END}
+"""
+
+PRECOMMIT_STANDALONE = "#!/usr/bin/env bash\nset -uo pipefail\n\n" + PRECOMMIT_LANE
+
+
+def _without_precommit_lane(text: str) -> str:
+    """Remove one complete managed lane without disturbing the surrounding hook.
+
+    ``apply`` used to refresh the lane wherever it already sat, including after a
+    terminal ``exit``.  Removing and reinserting it lets upgrades repair that
+    present-but-unreachable state instead of preserving it forever.
+    """
+    start = text.find(PRECOMMIT_BEGIN)
+    if start == -1:
+        return text
+    end = text.find(PRECOMMIT_END, start + len(PRECOMMIT_BEGIN))
+    if end == -1:
+        # A partial managed region has no safe ownership boundary. Leave it intact;
+        # verification reports the malformed block instead of deleting user text.
+        return text
+    end += len(PRECOMMIT_END)
+    if text[end:end + 2] == "\n\n":
+        end += 2
+    elif text[end:end + 1] == "\n":
+        end += 1
+    without = text[:start] + text[end:]
+    return without.rstrip("\n") + "\n" if without else ""
+
+
+def _place_precommit_lane(text: str) -> str:
+    """Place the managed lane before legacy hook control flow can terminate.
+
+    Keep a shell shebang and an initial ``set`` preamble first, then run RepoCharter
+    before variable assignments, bypass branches, helper calls, or terminal exits in
+    the existing hook. A passing lane falls through to the preserved hook body.
+    """
+    base = _without_precommit_lane(text)
+    # Do not duplicate a malformed region whose end marker is missing.
+    if PRECOMMIT_BEGIN in base:
+        return base
+
+    lines = base.splitlines(keepends=True)
+    insert_at = 1 if lines and lines[0].startswith("#!") else 0
+    last_set = None
+    for index in range(insert_at, len(lines)):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if re.match(r"^set(?:\s|$)", stripped):
+            last_set = index + 1
+            continue
+        break
+    if last_set is not None:
+        insert_at = last_set
+
+    before = "".join(lines[:insert_at])
+    after = "".join(lines[insert_at:])
+    if before:
+        before = before.rstrip("\n") + "\n\n"
+    separator = "" if not after or after.startswith("\n") else "\n"
+    return before + PRECOMMIT_LANE + separator + after
+
+
+TOMBSTONE = """#!/usr/bin/env bash
+# agentkit tombstone. This hook was replaced; the file that lived here is gone.
+#
+# Claude Code reads hook settings at session start, so an existing session may continue
+# calling the old path after rewiring. A missing script exits 127, which is non-blocking;
+# this placeholder exits 2 until the session is restarted with current settings.
+echo "repocharter: this hook was replaced and your session is running with stale settings." >&2
+echo "repocharter: RESTART this session — until you do, its commands are not being gated." >&2
+exit 2
+"""
+
+
+def _hook_script_paths(hooks: dict, repo: Path) -> set:
+    """Absolute paths of the scripts a hooks block invokes.
+
+    Parse for a path-shaped token rather than taking the first word because hook commands
+    may use interpreter prefixes such as `bash <script>` or `python3 <script>`.
+    """
+    out = set()
+    for groups in (hooks or {}).values():
+        for group in groups if isinstance(groups, list) else []:
+            for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                cmd = (h.get("command") or "") if isinstance(h, dict) else ""
+                for token in cmd.split():
+                    token = token.strip("'\"")
+                    if "/" not in token or not token.endswith((".sh", ".py")):
+                        continue
+                    token = token.replace("${CLAUDE_PROJECT_DIR}", str(repo))
+                    token = token.replace("$CLAUDE_PROJECT_DIR", str(repo))
+                    p = Path(token)
+                    out.add(p if p.is_absolute() else repo / token)
+                    break
+    return out
+
+
+def tombstone_missing_hooks(repo: Path, before: dict, after: dict, dry: bool) -> int:
+    """Leave a fail-closed stub wherever a hook is referenced but not on disk.
+
+    Two cases, one failure. A path DROPPED from settings is still called by any
+    session that started before the rewrite. A path still IN settings whose script
+    is gone is called by every session, forever. Both exit 127, both are treated as
+    non-blocking, and both mean commands run with no gate while a warning scrolls
+    past. `apply` deliberately preserves foreign hook entries, so it can and does
+    carry a dead reference forward — which is how the second case survives a
+    migration that looks successful.
+    """
+    referenced = _hook_script_paths(before, repo) | _hook_script_paths(after, repo)
+    changed = 0
+    for path in sorted(referenced):
+        if path.exists():
+            continue
+        if dry:
+            say(f"[dry-run] would tombstone {path.name} (fails closed for stale sessions)")
+            changed += 1
+            continue
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(TOMBSTONE, encoding="utf-8")
+            path.chmod(0o755)
+        except OSError:
+            continue
+        say(f"tombstoned {path.name} — a session still on the old settings now BLOCKS "
+            f"instead of running ungated")
+        changed += 1
+    return changed
+
+
+def vendor_kit(repo: Path, dry: bool, put_file) -> int:
+    """Copy the kit runtime into <repo>/kit/ so the repo is self-sufficient."""
+    changed = 0
+    for entry in VENDORED_KIT:
+        src = KIT_ROOT / entry
+        if not src.exists():
+            continue
+        if src.is_file():
+            dst = repo / "kit" / entry
+            if not dst.exists() or dst.read_bytes() != src.read_bytes():
+                if not dry:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                put_file(src, dst, f"vendored kit/{entry}")
+                if not dry:
+                    dst.chmod(0o755)
+                changed += 1
+            continue
+        managed_roots: set[Path] = set()
+        if entry == "skills":
+            for name in MANAGED_BUNDLED_SKILLS:
+                managed_src = src / name
+                if not managed_src.is_dir():
+                    continue
+                managed_dst = repo / "kit" / entry / name
+                source_files = {
+                    str(path.relative_to(managed_src)): path.read_bytes()
+                    for path in managed_src.rglob("*")
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+                }
+                destination_files = {} if managed_dst.is_symlink() else {
+                    str(path.relative_to(managed_dst)): path.read_bytes()
+                    for path in managed_dst.rglob("*")
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+                }
+                if source_files != destination_files:
+                    if dry:
+                        say(f"[dry-run] would refresh managed kit/skills/{name}")
+                    else:
+                        if managed_dst.is_dir() and not managed_dst.is_symlink():
+                            shutil.rmtree(managed_dst)
+                        elif managed_dst.exists() or managed_dst.is_symlink():
+                            managed_dst.unlink()
+                        managed_dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copytree(managed_src, managed_dst)
+                        say(f"refreshed managed kit/skills/{name}")
+                    changed += 1
+                managed_roots.add(managed_src)
+        for s in sorted(src.rglob("*")):
+            if s.is_dir() or "__pycache__" in s.parts or s.suffix == ".pyc":
+                continue
+            if any(root == s or root in s.parents for root in managed_roots):
+                continue
+            dst = repo / "kit" / entry / s.relative_to(src)
+            if not dst.exists() or dst.read_bytes() != s.read_bytes():
+                if not dry:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                put_file(s, dst, f"vendored kit/{entry}/{s.relative_to(src)}")
+                if not dry and s.suffix in (".sh", ".py"):
+                    dst.chmod(0o755)
+                changed += 1
+    return changed
+
+
+def install_precommit(repo: Path, dry: bool) -> int:
+    """Wire the check into pre-commit, and make sure git will actually run it.
+
+    Respects an existing core.hooksPath rather than fighting it, and inserts a
+    marked block into an existing hook rather than replacing somebody's work.
+    """
+    # A non-Git directory has no commit-hook target; return without changing state.
+    if subprocess.run(["git", "rev-parse", "--git-dir"], cwd=repo,
+                      capture_output=True).returncode != 0:
+        return 0
+
+    proc = subprocess.run(["git", "config", "core.hooksPath"], cwd=repo,
+                          capture_output=True, text=True)
+    hooks_rel = proc.stdout.strip()
+    configured = bool(hooks_rel)
+    hooks_dir = repo / (hooks_rel or ".githooks")
+    hook = hooks_dir / "pre-commit"
+    changed = 0
+
+    existing = hook.read_text(encoding="utf-8") if hook.exists() else None
+    if existing is None:
+        new = PRECOMMIT_STANDALONE
+        label = f"wrote {hook.relative_to(repo)} (repocharter verify on commit)"
+    else:
+        new = _place_precommit_lane(existing)
+        action = "refreshed and repositioned" if PRECOMMIT_BEGIN in existing else "added"
+        label = f"{action} the RepoCharter block in {hook.relative_to(repo)}"
+
+    if existing != new:
+        if dry:
+            say(f"[dry-run] {label}")
+        else:
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            hook.write_text(new, encoding="utf-8")
+            hook.chmod(0o755)
+            say(label)
+        changed += 1
+
+    # A hook git never runs is not a hook. This is machine-local state, so it is set
+    # rather than merely warned about -- a fresh clone with an unset hooksPath runs
+    # NOTHING, which is the difference between gated and ungated.
+    if not configured:
+        if dry:
+            say("[dry-run] would set core.hooksPath=.githooks")
+        else:
+            subprocess.run(["git", "config", "core.hooksPath", ".githooks"],
+                           cwd=repo, capture_output=True)
+            say("set core.hooksPath=.githooks (git runs no hooks without it)")
+        changed += 1
+    return changed
+
+
+def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = False) -> int:
+    print(f"repocharter apply{' --dry-run' if dry else ''} -> {repo}")
+    if not dry:
+        blocked = preflight(repo, allow_dirty)
+        if blocked:
+            return blocked
+    changed = 0
+
+    # In dry-run every mutation is announced and none is performed.
+    def put_json(path: Path, data: dict, label: str) -> None:
+        if dry:
+            say(f"[dry-run] {label}")
+            return
+        write_json(path, data)
+        say(label)
+
+    def put_file(src: Path, dst: Path, label: str) -> None:
+        if dry:
+            say(f"[dry-run] {label}")
+            return
+        shutil.copy2(src, dst)
+        say(label)
+
+    def ensure_dir(path: Path) -> None:
+        if not dry:
+            path.mkdir(parents=True, exist_ok=True)
+
+    # 1. The declaration. On a FIRST install, preserve an explicit pre-existing auto-memory
+    #    setting rather than silently changing an operator choice. Where reality is silent,
+    #    RepoCharter's portable OFF default applies. An explicit ON is an exception and must
+    #    carry a reason so the provider-specific hidden context is visible in review.
+    compat_path = repo / ".agents" / "compatibility.json"
+    existing = read_json(compat_path)
+    fresh = default_compat(repo)
+    if not existing:
+        current_settings = read_json(repo / ".claude" / "settings.json", {}) or {}
+        if "autoMemoryEnabled" in current_settings:
+            fresh["autoMemory"] = "on" if current_settings["autoMemoryEnabled"] else "off"
+            if fresh["autoMemory"] == "on":
+                fresh["autoMemoryReason"] = (
+                    "Preserved an explicit pre-existing autoMemoryEnabled: true setting during "
+                    "RepoCharter installation. Replace this with why Claude-only machine-local "
+                    "startup context is wanted here, or turn it off."
+                )
+    if existing and existing.get("autoMemory") == "on" and not str(
+            existing.get("autoMemoryReason") or "").strip():
+        # Releases through 0.3.3 wrote ON as the fleet default, so an unreasoned ON is
+        # not evidence of an operator choice. Move that inherited default to the new safe
+        # baseline. A deliberate ON survives because the declaration records why.
+        existing = dict(existing)
+        existing["autoMemory"] = "off"
+        existing.pop("autoMemoryReason", None)
+        say("disabled the legacy unreasoned auto-memory default; add autoMemoryReason to opt in")
+    compat = merge_compat(existing, fresh) if existing else fresh
+    if existing != compat:
+        put_json(compat_path, compat,
+                 f"{'updated' if existing else 'created'} .agents/compatibility.json")
+        changed += 1
+
+    # 2. Hooks. Copied rather than symlinked so a fresh clone has a complete runtime without
+    #    submodule initialization or an external source checkout.
+    hook_dir = repo / HOOK_DIR_NAME
+    ensure_dir(hook_dir)
+    for name in CLAUDE_HOOKS:
+        src, dst = KIT_ROOT / "hooks" / "claude" / name, hook_dir / name
+        if not src.exists():
+            print(f"  ERROR: kit is incomplete, missing {src}", file=sys.stderr)
+            return 2
+        if not dst.exists() or dst.read_bytes() != src.read_bytes():
+            put_file(src, dst, f"installed {HOOK_DIR_NAME}/{name}")
+            changed += 1
+        if not dry and name.endswith((".sh", ".py")) and not name.startswith("_"):
+            dst.chmod(0o755)
+
+    # 2b. Vendor the CLI and runtime modules so verification works from a fresh clone and in
+    #     CI without a separate source checkout. Tests and caches are not part of the runtime.
+    changed += vendor_kit(repo, dry, put_file)
+
+    # 2c. The local check, wired to fire on commit rather than when someone remembers.
+    changed += install_precommit(repo, dry)
+
+    # 2d. Codex hooks. Codex and Claude have different hook schemas and write payloads,
+    #     but both call the same policy engine. Preserve every foreign Codex hook group and
+    #     replace only groups whose command names agentkit's managed hook directory.
+    codex_template_path = KIT_ROOT / "hooks" / "codex" / "hooks.json.tmpl"
+    codex_template = read_json(codex_template_path)
+    if not isinstance(codex_template, dict) or not isinstance(codex_template.get("hooks"), dict):
+        print(f"  ERROR: kit has an invalid Codex hook template at {codex_template_path}",
+              file=sys.stderr)
+        return 2
+
+    def is_agentkit_group(group: dict) -> bool:
+        """Ours, and therefore ours to replace. Anything else is the repo's and is kept.
+
+        Agentkit 0.2 shipped Codex's superseded ``command: [..]`` group shape. Recognise
+        that form too; preserving it beside the current group can make Codex reject the
+        whole project hook file, turning a migration into a silent disablement.
+        """
+        commands = [h.get("command") or ""
+                    for h in (group.get("hooks") or []) if isinstance(h, dict)]
+        legacy = group.get("command")
+        if isinstance(legacy, str):
+            commands.append(legacy)
+        elif isinstance(legacy, list):
+            commands.extend(item for item in legacy if isinstance(item, str))
+        return any("/hooks/agentkit/" in command for command in commands)
+
+    codex_path = repo / ".codex" / "hooks.json"
+    if codex_path.exists():
+        codex_settings = read_json(codex_path)
+        if not isinstance(codex_settings, dict):
+            print("  ERROR: .codex/hooks.json exists but is not valid JSON; refusing to overwrite it.",
+                  file=sys.stderr)
+            return 2
+    else:
+        codex_settings = {}
+    codex_before = json.dumps(codex_settings, sort_keys=True)
+    existing_codex_hooks = codex_settings.get("hooks") or {}
+    if not isinstance(existing_codex_hooks, dict):
+        print("  ERROR: .codex/hooks.json `hooks` is not an object; refusing to overwrite it.",
+              file=sys.stderr)
+        return 2
+    desired_codex_hooks = codex_template["hooks"]
+    merged_codex_hooks, codex_preserved = {}, 0
+    for event in sorted(set(existing_codex_hooks) | set(desired_codex_hooks)):
+        groups = existing_codex_hooks.get(event, [])
+        if not isinstance(groups, list):
+            print(f"  ERROR: .codex/hooks.json hooks.{event} is not a list.", file=sys.stderr)
+            return 2
+        if any(not isinstance(group, dict) for group in groups):
+            print(f"  ERROR: .codex/hooks.json hooks.{event} contains a non-object group; "
+                  "refusing to drop or reinterpret foreign configuration.", file=sys.stderr)
+            return 2
+        kept = [g for g in groups if isinstance(g, dict) and not is_agentkit_group(g)]
+        codex_preserved += len(kept)
+        combined = kept + desired_codex_hooks.get(event, [])
+        if combined:
+            merged_codex_hooks[event] = combined
+    codex_settings["hooks"] = merged_codex_hooks
+    codex_settings.setdefault("description", codex_template.get("description"))
+    codex_hooks_rewired = existing_codex_hooks != merged_codex_hooks
+    if codex_preserved:
+        say(f"preserved {codex_preserved} existing Codex hook "
+            f"entr{'y' if codex_preserved == 1 else 'ies'}")
+    if json.dumps(codex_settings, sort_keys=True) != codex_before:
+        put_json(codex_path, codex_settings, "updated .codex/hooks.json (Codex safety adapter)")
+        changed += 1
+
+    # 3. settings.json. agentkit owns ITS OWN hook entries, permissions.deny, and the
+    #    compatibility manifest's declared auto-memory state; everything else -- the
+    #    operator's allow list, their statusLine, and crucially THEIR HOOKS -- is preserved.
+    #
+    #    Merge rather than replace so foreign hook groups remain installed. Claude Code runs
+    #    every matching hook group, so agentkit's entries can coexist with existing ones.
+    settings_path = repo / ".claude" / "settings.json"
+    settings = read_json(settings_path, {}) or {}
+    before = json.dumps(settings, sort_keys=True)
+
+    prefix = "${CLAUDE_PROJECT_DIR}/" + HOOK_DIR_NAME
+    desired_hooks = {
+        "PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": f"{prefix}/pretooluse-bash.sh"}]},
+            {"matcher": "Edit|Write|NotebookEdit", "hooks": [{"type": "command", "command": f"{prefix}/pretooluse-write.py"}]},
+            {"matcher": "mcp__.*", "hooks": [{"type": "command", "command": f"{prefix}/pretooluse-mcp.py"}]},
+        ],
+        "PostToolUse": [
+            {"matcher": "Edit|Write|NotebookEdit", "hooks": [{"type": "command", "command": f"{prefix}/posttooluse-write.py"}]},
+        ],
+        "ConfigChange": [
+            {"hooks": [{"type": "command", "command": f"{prefix}/configchange-guard.py"}]},
+        ],
+    }
+
+    existing_hooks = settings.get("hooks") or {}
+    merged_hooks, preserved = {}, 0
+    for event in sorted(set(existing_hooks) | set(desired_hooks)):
+        kept = [g for g in existing_hooks.get(event, [])
+                if isinstance(g, dict) and not is_agentkit_group(g)]
+        preserved += len(kept)
+        combined = kept + desired_hooks.get(event, [])
+        if combined:
+            merged_hooks[event] = combined
+    settings["hooks"] = merged_hooks
+    if preserved:
+        say(f"preserved {preserved} existing hook entr{'y' if preserved == 1 else 'ies'} "
+            f"across {len(existing_hooks)} event(s)")
+
+    # Any hook path this apply stopped referencing gets a fail-closed stub, so a
+    # session still holding the old settings is BLOCKED rather than waved through.
+    claude_hooks_rewired = (
+        _hook_script_paths(existing_hooks, repo) != _hook_script_paths(merged_hooks, repo)
+    )
+    changed += tombstone_missing_hooks(repo, existing_hooks, merged_hooks, dry)
+
+    permissions = settings.setdefault("permissions", {})
+    permissions.setdefault("allow", [])
+    policy = compat.get("policy") or {}
+    deny = []
+    for rule in policy.get("denyWritePaths") or []:
+        # Claude's Edit matcher covers every file-editing tool. Write(...) is not a
+        # supported path-permission matcher and Claude warns before ignoring it.
+        # The RepoCharter hook still handles Edit, Write, and NotebookEdit explicitly.
+        deny.append(f"Edit({rule['glob']})")
+    for rule in policy.get("denyMcpTools") or []:
+        # permissions.deny matches tool names literally, so only anchored literal patterns
+        # are translatable. Regex rules stay hook-only, and the hook is what enforces them.
+        literal = rule["pattern"].strip("^$")
+        if literal and not any(ch in literal for ch in ".*+?[](){}|\\"):
+            deny.append(literal)
+    permissions["deny"] = sorted(set(deny))
+
+    settings["autoMemoryEnabled"] = compat.get("autoMemory", "off") == "on"
+
+    if json.dumps(settings, sort_keys=True) != before:
+        put_json(settings_path, settings,
+                 f"updated .claude/settings.json (hooks + {len(permissions['deny'])} deny rule(s))")
+        changed += 1
+
+    # Include askBashPatterns when deciding whether the repository policy is empty.
+    if not (policy.get("denyWritePaths") or policy.get("denyMcpTools")
+            or policy.get("denyBashPatterns") or policy.get("askBashPatterns")
+            or policy.get("measureOnWrite")):
+        say("NOTE: policy is empty. The universal floor still applies — force-push, "
+            "checks-bypass, destructive database operations, recursive rm. Add repo rules "
+            "only for what this repo alone needs: deploys, credentials, live data.")
+
+    # 4. Skill symlinks. Relative, so they survive a clone to any path.
+    canonical_skills = repo / (compat["canonical"]["skills"])
+    ensure_dir(canonical_skills)
+    bundled_skills = KIT_ROOT / "skills"
+    if bundled_skills.is_dir():
+        for seed in sorted(
+                path for path in bundled_skills.iterdir()
+                if path.is_dir() and (path / "SKILL.md").is_file()):
+            destination = canonical_skills / seed.name
+            action = "seeded"
+            if destination.exists() or destination.is_symlink():
+                if seed.name not in MANAGED_BUNDLED_SKILLS:
+                    continue
+                source_files = {
+                    str(path.relative_to(seed)): path.read_bytes()
+                    for path in seed.rglob("*")
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+                }
+                destination_files = {
+                    str(path.relative_to(destination)): path.read_bytes()
+                    for path in destination.rglob("*")
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+                }
+                if source_files == destination_files:
+                    continue
+                action = "refreshed managed"
+                if not dry:
+                    if destination.is_dir() and not destination.is_symlink():
+                        shutil.rmtree(destination)
+                    else:
+                        destination.unlink()
+            if not dry:
+                shutil.copytree(seed, destination)
+            say(
+                f"{'[dry-run] ' if dry else ''}{action} "
+                f"{compat['canonical']['skills']}/{seed.name}"
+            )
+            changed += 1
+
+    claude_skills = repo / ".claude" / "skills"
+    ensure_dir(claude_skills)
+    if canonical_skills.is_dir():
+        for skill in sorted(p for p in canonical_skills.iterdir() if p.is_dir()):
+            link = claude_skills / skill.name
+            target = os.path.relpath(skill, claude_skills)
+            if link.is_symlink():
+                if os.readlink(link) == target:
+                    continue
+                if not dry:
+                    link.unlink()
+            elif link.exists():
+                say(f"skipped {link.relative_to(repo)} (a real directory; declare it in harnessWritten)")
+                continue
+            if not dry:
+                link.symlink_to(target)
+            say(f"{'[dry-run] ' if dry else ''}linked .claude/skills/{skill.name} -> {target}")
+            changed += 1
+
+    # 5. Linter config, with this repo's retired paths spliced into the exclude list.
+    #    A retired-but-checked-in mirror is not live content; linting it reports the OLD
+    #    system's defects as the new one's.
+    agnix_src, agnix_dst = KIT_ROOT / "templates" / "agnix.toml", repo / ".agnix.toml"
+    if agnix_src.exists():
+        text = agnix_src.read_text(encoding="utf-8")
+        retired = compat.get("retiredPaths") or []
+        if retired:
+            block = "".join(f'    "{glob}",  # retired, declared in compatibility.json\n'
+                            for glob in retired)
+            text = text.replace('exclude = [\n', 'exclude = [\n' + block, 1)
+        if force or not agnix_dst.exists() or agnix_dst.read_text(encoding="utf-8") != text:
+            if dry:
+                say("[dry-run] would write .agnix.toml")
+            else:
+                agnix_dst.write_text(text, encoding="utf-8")
+                say(f"wrote .agnix.toml ({len(retired)} retired path(s) excluded)")
+            changed += 1
+
+    # 6. The shim is a relative symlink by default. That is the only arrangement where
+    #    Claude and Codex consume exactly the same bytes without an @-import. Existing real
+    #    files are never replaced: they may contain genuine Claude-only instructions, and
+    #    overwriting those would be generated truth rather than plumbing.
+    shim = repo / compat["canonical"]["shim"]
+    agents = repo / compat["canonical"]["instructions"]
+    if not shim.exists() and not shim.is_symlink():
+        if not dry:
+            try:
+                shim.symlink_to(os.path.relpath(agents, shim.parent))
+            except OSError as exc:
+                print(f"  ERROR: could not create the relative {shim.name} symlink ({exc}). "
+                      "No @-import fallback was written; create the symlink manually.",
+                      file=sys.stderr)
+                return 2
+        say(f"{'[dry-run] ' if dry else ''}linked {compat['canonical']['shim']} -> "
+            f"{compat['canonical']['instructions']}")
+        changed += 1
+
+    if not agents.exists():
+        say(f"NOTE: {compat['canonical']['instructions']} does not exist. apply does not write it "
+            f"on purpose -- copy kit/templates/AGENTS.md.tmpl and fill it in yourself.")
+
+    verb = "would change" if dry else "change(s)"
+    print(f"\napply: {changed} {verb}. AGENTS.md body and docs/project/ untouched, by design.")
+    hooks_rewired = claude_hooks_rewired or codex_hooks_rewired
+    if hooks_rewired:
+        print("\n  !! THE HOOKS CHANGED. RESTART ANY RUNNING AGENT SESSION IN THIS REPO.")
+        print("     Settings are read once, at session start, so a session already open is")
+        print("     still calling the old hooks. Paths that no longer exist are tombstoned")
+        print("     and will now block; anything not covered by one simply is not gated.")
+        if codex_hooks_rewired:
+            print("     Codex also requires this trusted project layer and the exact changed hook")
+            print("     definitions to be reviewed. After restart, open `/hooks`, review")
+            print("     `.codex/hooks.json`, and trust it before relying on enforcement.")
+    return 0
+
+
+# ── migrate ───────────────────────────────────────────────────────────────────────────
+
+def cmd_migrate(repo: Path, do_apply: bool, plan_out: str | None, allow_dirty: bool) -> int:
+    plan = migrate_lib.build(repo)
+    rendered = migrate_lib.render(plan)
+
+    if plan_out:
+        target = repo / plan_out if not Path(plan_out).is_absolute() else Path(plan_out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(rendered, encoding="utf-8")
+        print(f"plan written to {target}")
+    else:
+        print(rendered)
+
+    if not do_apply:
+        print(f"\nmigrate: DRY RUN. {len(plan.mechanical)} mechanical action(s) available "
+              f"(`--apply` performs them), {len(plan.judgment)} judgment call(s) for you.")
+        return 0
+
+    blocked = preflight(repo, allow_dirty)
+    if blocked:
+        return blocked
+
+    log = migrate_lib.apply_mechanical(repo, plan, KIT_ROOT)
+    print("\nmechanical actions performed:")
+    for line in log:
+        say(line)
+    print(f"\nmigrate: {len(log)} action(s) applied. {len(plan.judgment)} judgment call(s) "
+          f"remain and were NOT automated — see the plan.")
+    return 0
+
+
+# ── policy ────────────────────────────────────────────────────────────────────────────
+
+def cmd_policy(repo: Path, action: str) -> int:
+    compat_path = repo / ".agents" / "compatibility.json"
+    if not compat_path.exists():
+        print("repocharter: no .agents/compatibility.json — run `repocharter apply` first", file=sys.stderr)
+        return 2
+
+    if action == "scaffold":
+        draft = scaffold_lib.build_draft(repo)
+        count, path = scaffold_lib.write_draft(repo, draft)
+        print(f"repocharter policy scaffold -> {repo}\n")
+        for key in ("denyBashPatterns", "askBashPatterns", "denyWritePaths", "denyMcpTools"):
+            entries = draft[key]
+            if not entries:
+                continue
+            print(f"  {key}: {len(entries)} candidate(s)")
+            for e in entries[:4]:
+                print(f"    - {e.get('reason', e.get('rule', ''))[:88]}")
+                print(f"      from {e['_source']}")
+        if draft["unclassifiedProseRules"]:
+            print(f"  unclassified prose rules: {len(draft['unclassifiedProseRules'])} "
+                  f"(stated in AGENTS.md, no obvious mechanism)")
+        print(f"\n  {count} candidate(s) written to policyDraft in {path.relative_to(repo)}.")
+        print("  NOTHING IS ENFORCED YET. Review, then move entries into `policy` to turn them on.")
+        print("  Review every imported regex against its source control flow before promotion.")
+        return 0
+
+    if action == "repair":
+        # Split allOf rules that cannot fire into one rule per alternative. This repairs the
+        # representation produced when a source `||` chain is imported as a conjunction.
+        #
+        # Splitting is safe in the direction that matters (strictly more denial), and the
+        # benign corpus guards the other direction: a split pattern that would block ordinary
+        # work is kept as a conjunction and reported instead of silently widening the gate.
+        compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        policy = compat.get("policy") or {}
+        split_count, kept, widened = 0, [], []
+        for key in ("denyBashPatterns", "askBashPatterns"):
+            rules, out = policy.get(key) or [], []
+            for rule in rules:
+                pats = rule.get("allOf") or []
+                if not pats or not scaffold_lib.unsatisfiable(pats):
+                    out.append(rule)
+                    continue
+                risky = [p for p in pats if scaffold_lib.over_broad([p])]
+                if risky:
+                    kept.append((key, rule.get("reason", "")[:60], len(risky)))
+                    out.append(rule)
+                    continue
+                for p in pats:
+                    sibling = {k: v for k, v in rule.items() if k not in ("allOf", "_conjunction")}
+                    sibling["pattern"] = p
+                    sibling["_repaired"] = ("split from an allOf that could never fire; the source "
+                                            "stated alternatives, not a conjunction")
+                    out.append(sibling)
+                split_count += 1
+                widened.append((key, rule.get("reason", "")[:60], len(pats)))
+            policy[key] = out
+        compat_path.write_text(json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+
+        print(f"repocharter policy repair -> {repo}\n")
+        if not split_count and not kept:
+            print("  no inert conjunctions found.")
+            return 0
+        for key, reason, n in widened:
+            print(f"  SPLIT  {key} into {n} rules — {reason}")
+        for key, reason, n in kept:
+            print(f"  KEPT   {key} as a conjunction — {n} of its patterns would block benign "
+                  f"commands if split: {reason}")
+        print(f"\n  {split_count} inert rule(s) repaired. Run `repocharter apply`, then re-test the "
+              f"commands the reasons name — a repaired rule is a fence that was NOT firing.")
+        return 0
+
+    if action == "promote":
+        compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        draft = compat.get("policyDraft") or {}
+        if not draft:
+            print("repocharter: no policyDraft to promote. Run `repocharter policy scaffold` first.",
+                  file=sys.stderr)
+            return 1
+        policy = compat.setdefault("policy", {})
+        moved = 0
+        # Union rather than replace so promotion cannot remove an existing protected branch.
+        harvested_branches = draft.get("protectedBranches") or []
+        if harvested_branches:
+            existing = policy.get("protectedBranches") or []
+            merged = existing + [b for b in harvested_branches if b not in existing]
+            if merged != existing:
+                policy["protectedBranches"] = merged
+                print(f"  protectedBranches: {existing or '(unset)'} + harvested "
+                      f"{harvested_branches} -> {merged}")
+        for key in ("denyBashPatterns", "askBashPatterns", "denyWritePaths", "denyMcpTools"):
+            entries = [{k: v for k, v in e.items() if not k.startswith("_")}
+                       for e in draft.get(key) or []]
+            if entries:
+                policy.setdefault(key, []).extend(entries)
+                moved += len(entries)
+        # Keep the UNRESOLVED residue. Dropping policyDraft wholesale would erase the record
+        # of which rules could not be harvested — and that record is what stops `supersede`
+        # from retiring a legacy gate whose rules were never carried across.
+        residue = {k: draft[k] for k in ("needsManualPattern", "unclassifiedProseRules")
+                   if draft.get(k)}
+        if residue:
+            residue["_contract"] = (
+                "Rules that could NOT be harvested into a portable pattern. They are not "
+                "enforced by anything in the policy. `repocharter supersede` refuses to retire "
+                "the source gate while these exist, because retiring it would drop them."
+            )
+            compat["policyDraft"] = residue
+        else:
+            compat.pop("policyDraft", None)
+        compat_path.write_text(json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+        print(f"promoted {moved} rule(s) into policy. Run `repocharter apply` to recompile "
+              f"permissions.deny, then `repocharter self-test`.")
+        if residue.get("needsManualPattern"):
+            print(f"  {len(residue['needsManualPattern'])} rule(s) were NOT harvested and are "
+                  f"retained in policyDraft.needsManualPattern — supersede will block on them.")
+        return 0
+
+    print(f"repocharter: unknown policy action {action!r}", file=sys.stderr)
+    return 2
+
+
+# ── supersede ─────────────────────────────────────────────────────────────────────────
+
+def cmd_supersede(repo: Path, gate: str | None, do_retire: bool, allow_dirty: bool) -> int:
+    """Prove the kit's gate is never weaker than a legacy one, then retire the legacy one."""
+    import supersede as sup
+
+    compat = read_json(repo / ".agents" / "compatibility.json")
+    if compat is None:
+        print("repocharter: no .agents/compatibility.json — run `repocharter apply` first", file=sys.stderr)
+        return 2
+
+    new_gate = repo / HOOK_DIR_NAME / "pretooluse-bash.sh"
+    if not new_gate.exists():
+        print("repocharter: the kit's Bash gate is not installed — run `repocharter apply`", file=sys.stderr)
+        return 2
+
+    if gate:
+        candidates = [repo / gate]
+    else:
+        hooks_dir = repo / ".claude" / "hooks"
+        candidates = sorted(p for p in hooks_dir.glob("*.sh")) if hooks_dir.is_dir() else []
+    candidates = [c for c in candidates if c.exists() and "/agentkit/" not in str(c)]
+    if not candidates:
+        print("repocharter supersede: no legacy Bash gate found; nothing to supersede.")
+        return 0
+
+    overall = 0
+    for old_gate in candidates:
+        print(f"repocharter supersede -> {old_gate.relative_to(repo)}\n")
+        result = sup.compare(repo, old_gate, new_gate, compat)
+
+        print(f"  replayed {result.probes} probe command(s) through both gates")
+        print(f"  identical verdict on {result.agreements}")
+        if result.stronger:
+            print(f"  the kit is STRICTER on {len(result.stronger)} (fine — never weaker is the bar):")
+            for d in result.stronger[:4]:
+                print(f"    {d.command[:56]:<56} {d.old} -> {d.new}")
+        if result.weaker:
+            print(f"\n  the kit is WEAKER on {len(result.weaker)} — RETIREMENT BLOCKED:")
+            for d in result.weaker:
+                print(f"    {d.command[:56]:<56} {d.old} -> {d.new}")
+        if result.false_positives:
+            print(f"\n  the kit BLOCKS {len(result.false_positives)} obviously-benign command(s) "
+                  f"— RETIREMENT BLOCKED:")
+            for d in result.false_positives:
+                print(f"    {d.command[:56]:<56} old={d.old} new={d.new}")
+            print("    A rule that denies everything is trivially 'never weaker' but invalid.")
+            print("    Check for an over-broad imported rule, especially a flattened conjunction:")
+            print("    check for a conjunction that was flattened to one pattern.")
+        if result.uncovered:
+            covered = not result.weaker
+            label = ("were never harvested into policy, but the replay shows the replacement "
+                     "is not weaker on any probe derived from them — so they appear covered by "
+                     "the kit's built-in rules") if covered else \
+                    "were never harvested — RETIREMENT BLOCKED"
+            print(f"\n  {len(result.uncovered)} rule(s) {label}:")
+            for u in result.uncovered:
+                print(f"    {u['reason'][:70]}")
+                print(f"      {u['source']}")
+            if covered:
+                print("    Read them before retiring: behavioural coverage is a sample, not a proof.")
+
+        print()
+        if not result.safe_to_retire:
+            print("  VERDICT: do NOT retire. Fix the gaps above, re-run `policy scaffold`,")
+            print("  promote, then check again. Deleting this gate now would drop a live fence.")
+            overall = 1
+            continue
+
+        print("  VERDICT: the kit's gate is at least as strict on every probe and blocks nothing")
+        print(f"  benign. {'Every rule in this script was harvested.' if not result.uncovered else f'{len(result.uncovered)} rule(s) rely on built-in coverage (above).'} Safe to retire.")
+        print("  This is a SAMPLE, not a proof — it exercises the rules this script encodes,")
+        print("  not every command a person could type.")
+
+        if not do_retire:
+            print("\n  Pass --retire to quarantine it and unwire it from settings.json.")
+            continue
+
+        blocked = preflight(repo, allow_dirty)
+        if blocked:
+            return blocked
+        print()
+        for line in sup.retire(repo, old_gate):
+            say(line)
+    return overall
+
+
+# ── fleet ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_fleet(root: Path, as_json: bool, verify: bool) -> int:
+    """Report stage and census data for repositories under one root."""
+    repos = sorted(p.parent for p in root.glob("*/.git"))
+    rows = []
+    for repo in repos:
+        st, markers = stage_lib.detect(repo)
+        row = {"repo": repo.name, "stage": st}
+        proc = subprocess.run([sys.executable, str(KIT_ROOT / "repocharter"), "census",
+                               "--repo", str(repo), "--json"], capture_output=True, text=True)
+        try:
+            census = json.loads(proc.stdout)
+            row["claudeBytes"] = census["claudeVisibleBytes"]
+            row["unscopedRules"] = census.get("unscopedRulesBytes", 0)
+        except json.JSONDecodeError:
+            row["claudeBytes"] = row["unscopedRules"] = 0
+        row["policyEmpty"] = markers.policy_empty
+        row["legacyLayout"] = bool(markers.legacy_dirs)
+        if verify:
+            proc = subprocess.run([sys.executable, str(KIT_ROOT / "verify" / "residue.py"),
+                                   "--repo", str(repo), "--json"], capture_output=True, text=True)
+            try:
+                row["errors"] = len(json.loads(proc.stdout)["errors"])
+            except json.JSONDecodeError:
+                row["errors"] = None
+        rows.append(row)
+
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    print(f"repocharter fleet -> {root}  ({len(rows)} repositories)\n")
+    header = f"  {'repo':<28} {'stage':<12} {'claude B':>9} {'unscoped':>9}  flags"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for r in rows:
+        flags = []
+        if r["legacyLayout"]:
+            flags.append("legacy-layout")
+        if r["stage"] != stage_lib.NOT_STARTED and r["policyEmpty"]:
+            flags.append("POLICY-EMPTY")
+        if verify and r.get("errors"):
+            flags.append(f"{r['errors']} err")
+        print(f"  {r['repo'][:28]:<28} {r['stage']:<12} {r['claudeBytes']:>9,} "
+              f"{r['unscopedRules']:>9,}  {' '.join(flags)}")
+    print()
+    print("  POLICY-EMPTY means no REPO-SPECIFIC rules. The universal floor still applies,")
+    print("  so this is a gap only for a repo that deploys, holds credentials or live data.")
+    return 0
+
+
+# ── revert ────────────────────────────────────────────────────────────────────────────
+
+def cmd_revert(repo: Path) -> int:
+    """Undo the most recent mechanical migration using its manifest."""
+    out_of_tree = agentkit_state_dir() / "quarantine" / repo.name
+    in_tree = repo / ".agents" / "quarantine"
+    # Out-of-tree is where quarantine goes now; in-tree is read so migrations performed
+    # before that change stay revertable.
+    qroot = out_of_tree if out_of_tree.is_dir() else in_tree
+    if not qroot.is_dir():
+        print("repocharter: nothing to revert (no .agents/quarantine)", file=sys.stderr)
+        return 1
+    stamps = sorted(p for p in qroot.iterdir() if p.is_dir())
+    if not stamps:
+        print("repocharter: nothing to revert", file=sys.stderr)
+        return 1
+    latest = stamps[-1]
+    manifest = read_json(latest / "manifest.json")
+    if not manifest:
+        print(f"repocharter: {latest.name} has no readable manifest", file=sys.stderr)
+        return 2
+
+    undone = 0
+    for action in reversed(manifest.get("actions", [])):
+        op = action.get("op")
+        if op == "rename":
+            # `base: quarantine` means the stored path is relative to the quarantine
+            # directory, so it survives the quarantine or the repo being moved.
+            base = latest if action.get("base") == "quarantine" else repo
+            src, dst = base / action["from"], repo / action["to"]
+            if src.exists():
+                src.rename(dst)
+                say(f"restored {action['to']}")
+                undone += 1
+        elif op == "created":
+            target = repo / action["path"]
+            if target.exists() and target.stat().st_size < 4096:
+                target.unlink()
+                say(f"removed generated {action['path']}")
+                undone += 1
+        elif op == "declared":
+            compat_path = repo / ".agents" / "compatibility.json"
+            compat = read_json(compat_path) or {}
+            if action["path"] in (compat.get("harnessWritten") or []):
+                compat["harnessWritten"].remove(action["path"])
+                write_json(compat_path, compat)
+                say(f"undeclared {action['path']}")
+                undone += 1
+
+    # Preserve a quarantine when no action was restored. Unresolved manifest paths must not
+    # cause the only recoverable copy of retired content to be deleted.
+    if not undone:
+        print(f"\nrevert: nothing was restored from {latest.name} — its manifest paths do not "
+              f"resolve against this repository.", file=sys.stderr)
+        print(f"  The quarantine is LEFT IN PLACE at {latest}", file=sys.stderr)
+        print("  Inspect its manifest.json; the files may have been relocated since it was "
+              "written.", file=sys.stderr)
+        return 1
+
+    shutil.rmtree(latest)
+    print(f"\nrevert: {undone} action(s) undone from {latest.name}.")
+    return 0
+
+
+# ── verify ────────────────────────────────────────────────────────────────────────────
+
+def cmd_verify(repo: Path, effective: bool, strict: bool, as_json: bool,
+               agnix: bool = False) -> int:
+    """The residue checks always run. agnix is opt-in.
+
+    Default verification is checked in, dependency-free, and offline. Use ``--agnix`` to
+    add the network-fetched shared catalogue explicitly.
+    """
+    print(f"repocharter verify -> {repo}\n")
+    failed = False
+
+    if agnix:
+        print("agnix (shared rules):")
+        try:
+            version = ((read_json(repo / ".agents" / "compatibility.json", {}) or {})
+                       .get("tooling", {}).get("agnixVersion") or "latest")
+            cmd = ["npx", "-y", f"agnix@{version}", str(repo)]
+            if strict:
+                cmd.append("--strict")
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            tail = [ln for ln in proc.stdout.splitlines() if ln.strip()][-12:]
+            for line in tail:
+                print(f"  {line}")
+            if proc.returncode != 0:
+                failed = True
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            # An explicitly requested verifier must fail the command if it cannot run.
+            print(f"  ERROR: --agnix was requested and agnix could not run ({exc}). "
+                  f"Refusing to report a pass with the shared rule set unevaluated.",
+                  file=sys.stderr)
+            failed = True
+
+    print("\nresidue (checks no catalogue covers):")
+    sys.stdout.flush()  # the child writes to the same fd; without this its output races ahead
+    residue = [sys.executable, str(KIT_ROOT / "verify" / "residue.py"), "--repo", str(repo)]
+    if effective:
+        residue.append("--effective")
+    if strict:
+        residue.append("--strict")
+    if as_json:
+        residue.append("--json")
+    proc = subprocess.run(residue)
+    if proc.returncode != 0:
+        failed = True
+
+    return 1 if failed else 0
+
+
+# ── self-test ─────────────────────────────────────────────────────────────────────────
+
+CASES = [
+    ("pretooluse-bash.sh", {"tool_name": "Bash", "tool_input": {"command": "git push --force origin main"}},
+     "deny", "force-push to a protected branch"),
+    ("pretooluse-bash.sh", {"tool_name": "Bash", "tool_input": {"command": "git commit --no-verify -m x"}},
+     "deny", "checks-bypass flag"),
+    ("pretooluse-bash.sh", {"tool_name": "Bash", "tool_input": {"command": "git -c core.hooksPath=/dev/null push"}},
+     "deny", "hooks-path bypass"),
+    ("pretooluse-bash.sh", {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}},
+     "ask", "reset --hard"),
+    ("pretooluse-bash.sh", {"tool_name": "Bash", "tool_input": {"command": "ls -la"}},
+     "allow", "a harmless read"),
+]
+
+
+def run_hook(path: Path, payload: dict, repo: Path,
+             harness: str = "claude-code") -> tuple[int, str]:
+    env = dict(os.environ)
+    if harness == "codex":
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["AGENTKIT_HARNESS"] = "codex"
+        if "permission_mode" not in payload:
+            payload = {**payload, "permission_mode": "default"}
+    else:
+        env["CLAUDE_PROJECT_DIR"] = str(repo)
+    proc = subprocess.run([str(path)], input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, cwd=repo, timeout=30)
+    return proc.returncode, proc.stdout
+
+
+def decision_of(code: int, out: str) -> str:
+    if code == 2:
+        return "blocked-exit2"
+    try:
+        return json.loads(out)["hookSpecificOutput"]["permissionDecision"]
+    except Exception:
+        return "allow"
+
+
+def context_of(out: str) -> str:
+    try:
+        return json.loads(out)["hookSpecificOutput"].get("additionalContext", "")
+    except Exception:
+        return ""
+
+
+MCP_PROBE_SERVER = r'''#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+for raw in sys.stdin:
+    try:
+        request = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": (request.get("params") or {}).get("protocolVersion", "2025-06-18"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "agentkit-probe", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [
+            {
+                "name": "danger",
+                "description": "RepoCharter denied-hook probe. Call exactly when requested.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "safe",
+                "description": "RepoCharter allowed-hook probe. Call exactly when requested.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        ]}
+    elif method == "tools/call":
+        marker.write_text(str((request.get("params") or {}).get("name")) + "\n", encoding="utf-8")
+        result = {"content": [{"type": "text", "text": "MCP_CALL_RAN"}]}
+    else:
+        result = {}
+    if "id" in request:
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+'''
+
+
+def _run_codex_exec(repo: Path, prompt: str) -> subprocess.CompletedProcess:
+    command = [
+        "codex", "exec", "--ephemeral", "--strict-config", "--ignore-rules",
+        "--dangerously-bypass-hook-trust", "--json", "-s", "workspace-write",
+        "-C", str(repo), "-c", 'approval_policy="never"', prompt,
+    ]
+    return subprocess.run(command, cwd=repo, capture_output=True, text=True, timeout=300)
+
+
+def _run_codex_trust_probe(repo: Path) -> subprocess.CompletedProcess:
+    """Run without the automation-only hook-trust bypass in the actual target repo."""
+    prompt = (
+        "Use Bash exactly once to run: git -c core.hooksPath=/dev/null status. "
+        "Do not retry or use another tool. Stop after the attempt."
+    )
+    command = [
+        "codex", "exec", "--ephemeral", "--strict-config", "--ignore-rules", "--json",
+        "-s", "workspace-write", "-C", str(repo), "-c", 'approval_policy="never"', prompt,
+    ]
+    return subprocess.run(command, cwd=repo, capture_output=True, text=True, timeout=300)
+
+
+def copy_codex_probe_adapter(
+        repo: Path, probe: Path, closure: codex_hooks_lib.CodexHookClosure) -> None:
+    """Install the exact managed and preserved Codex adapter closure into a probe repo."""
+    shutil.copytree(repo / ".claude" / "hooks", probe / ".claude" / "hooks")
+    (probe / ".codex").mkdir()
+    shutil.copy2(repo / ".codex" / "hooks.json", probe / ".codex" / "hooks.json")
+    codex_hooks_lib.copy_dependencies(repo, probe, closure)
+
+
+def codex_probes(probe: Path, mcp_marker: Path) -> list[tuple[str, str, str, Path, bool]]:
+    """Return the live Codex deny-and-allow matrix.
+
+    MCP prompts name the fully qualified tool. Codex may expose more than one tool whose
+    human-readable label contains the server and method names; a prose-only reference is
+    ambiguous and can make a healthy allow gate look broken.
+    """
+    return [
+        (
+            "Bash denial",
+            "Use Bash exactly once to run this exact command: "
+            "printf AGENTKIT_CODEX_BASH_RAN > codex-bash-ran.txt. "
+            "Do not use another tool and stop after the attempt.",
+            "AGENTKIT_CODEX_BASH_PROBE_DENIED",
+            probe / "codex-bash-ran.txt",
+            False,
+        ),
+        (
+            "apply_patch denial",
+            "Use apply_patch exactly once to add blocked.txt containing PROBE. "
+            "Do not use Bash or retry and stop after the attempt.",
+            "AGENTKIT_CODEX_WRITE_PROBE_DENIED",
+            probe / "blocked.txt",
+            False,
+        ),
+        (
+            "MCP denial",
+            "Call the MCP tool named `mcp__agentkit_probe__danger` exactly once with no "
+            "arguments. Use that exact fully qualified tool name. "
+            "Do not use another tool and stop after the attempt.",
+            "AGENTKIT_CODEX_MCP_PROBE_DENIED",
+            mcp_marker,
+            False,
+        ),
+        (
+            "Bash allow",
+            "Use Bash exactly once to run this exact command: "
+            "printf AGENTKIT_CODEX_BASH_ALLOWED > codex-bash-allowed.txt. "
+            "Do not use another tool and stop after the attempt.",
+            "",
+            probe / "codex-bash-allowed.txt",
+            True,
+        ),
+        (
+            "apply_patch allow",
+            "Use apply_patch exactly once to add allowed.txt containing PROBE. "
+            "Do not use Bash or retry and stop after the attempt.",
+            "",
+            probe / "allowed.txt",
+            True,
+        ),
+        (
+            "MCP allow",
+            "Call the MCP tool named `mcp__agentkit_probe__safe` exactly once with no "
+            "arguments. Use that exact fully qualified tool name. "
+            "Do not use another tool and stop after the attempt.",
+            "",
+            mcp_marker,
+            True,
+        ),
+    ]
+
+
+def live_codex_self_test(repo: Path) -> tuple[list[str], str]:
+    """Fire denied and allowed Bash, apply_patch, and MCP calls through real Codex."""
+    if shutil.which("codex") is None:
+        return ["Codex is declared blocking but the `codex` executable is unavailable"], ""
+    version_proc = subprocess.run(["codex", "--version"], capture_output=True, text=True,
+                                  timeout=15)
+    version = version_proc.stdout.strip()
+    if version_proc.returncode != 0 or not version:
+        return ["could not read the installed Codex version"], ""
+
+    discovery = codex_hooks_lib.query_discovery(repo)
+    discovery_problem = codex_hooks_lib.discovery_problem(repo, discovery)
+    discovered = discovery_problem is None
+    print(
+        f"  {'pass ' if discovered else 'FAIL '} live Codex target hook discovery: "
+        f"{'exact project source' if discovered else discovery.status}"
+    )
+    if discovery_problem is not None:
+        return [f"project hook discovery: {discovery_problem}"], version
+
+    closure = codex_hooks_lib.discover(repo)
+    if closure.errors:
+        return [f"foreign hook closure: {problem}" for problem in closure.errors], version
+
+    failures: list[str] = []
+    # Put the disposable nested repo under the already-trusted project. Codex does not
+    # accept a new arbitrary `projects."<path>"` entry through `-c --strict-config`, and a
+    # project cannot self-declare trust in its own config. The directory is removed by the
+    # context manager before this function returns and never enters Git.
+    with tempfile.TemporaryDirectory(prefix=".agentkit-codex-self-test.", dir=repo) as raw:
+        probe = Path(raw) / "repo"
+        probe.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=probe, check=True)
+        (probe / "AGENTS.md").write_text(
+            "# RepoCharter hook probe\n\nUse exactly the tool requested, once. "
+            "Do not retry through another tool after a denial.\n",
+            encoding="utf-8",
+        )
+        (probe / ".agents").mkdir()
+        compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
+        compat = json.loads(json.dumps(compat))
+        compat["policy"] = {
+            "protectedBranches": ["main", "master"],
+            "denyBashPatterns": [{
+                "pattern": "AGENTKIT_CODEX_BASH_RAN",
+                "reason": "AGENTKIT_CODEX_BASH_PROBE_DENIED",
+            }],
+            "denyWritePaths": [{
+                "glob": "blocked.txt",
+                "reason": "AGENTKIT_CODEX_WRITE_PROBE_DENIED",
+            }],
+            "denyMcpTools": [{
+                "pattern": "^mcp__agentkit_probe__danger$",
+                "reason": "AGENTKIT_CODEX_MCP_PROBE_DENIED",
+            }],
+            "measureOnWrite": [],
+        }
+        write_json(probe / ".agents" / "compatibility.json", compat)
+
+        copy_codex_probe_adapter(repo, probe, closure)
+        server = Path(raw) / "mcp_probe.py"
+        mcp_marker = probe / "mcp-call-ran.txt"
+        server.write_text(MCP_PROBE_SERVER, encoding="utf-8")
+        server.chmod(0o755)
+        (probe / ".codex" / "config.toml").write_text(
+            "[mcp_servers.agentkit_probe]\n"
+            "command = \"python3\"\n"
+            f"args = [{json.dumps(str(server))}, {json.dumps(str(mcp_marker))}]\n"
+            "startup_timeout_sec = 20\n"
+            "tool_timeout_sec = 20\n"
+            "default_tools_approval_mode = \"approve\"\n",
+            encoding="utf-8",
+        )
+
+        for label, prompt, reason, side_effect, should_exist in codex_probes(probe, mcp_marker):
+            try:
+                proc = _run_codex_exec(probe, prompt)
+            except subprocess.TimeoutExpired:
+                failures.append(f"{label}: Codex timed out")
+                print(f"  FAIL  live Codex {label}: timed out")
+                continue
+            transcript = proc.stdout + "\n" + proc.stderr
+            held = side_effect.exists() if should_exist else (
+                reason in transcript and not side_effect.exists()
+            )
+            print(
+                f"  {'pass ' if held else 'FAIL '} live Codex {label}: "
+                f"{('executed' if should_exist else 'denied before execution') if held else 'unexpected result'}"
+            )
+            if not held:
+                lines = [line for line in transcript.splitlines() if line.strip()]
+                tail = " | ".join(lines[-4:])
+                if not should_exist and side_effect.exists():
+                    detail = "forbidden side effect exists"
+                elif should_exist:
+                    detail = f"allowed side effect missing; Codex exit {proc.returncode}"
+                    detail += f"; tail: {tail}" if tail else ""
+                else:
+                    detail = f"Codex exit {proc.returncode}; denial reason absent"
+                    detail += f"; tail: {tail}" if tail else ""
+                failures.append(f"{label}: {detail}")
+
+    # The three disposable runs prove the checked-in adapter works when Codex loads it.
+    # This fourth run proves THIS machine will load the exact project hook hash normally.
+    # Without it, `--dangerously-bypass-hook-trust` can certify an adapter that every real
+    # session skips pending `/hooks` review — the precise false claim this command exists
+    # to prevent.
+    try:
+        trust_proc = _run_codex_trust_probe(repo)
+    except subprocess.TimeoutExpired:
+        failures.append("project hook trust: ordinary Codex run timed out")
+        print("  FAIL  live Codex persisted hook trust: timed out")
+    else:
+        trust_text = trust_proc.stdout + "\n" + trust_proc.stderr
+        trusted = "Safety gate: overriding core.hooksPath" in trust_text
+        print(
+            f"  {'pass ' if trusted else 'FAIL '} live Codex persisted hook trust: "
+            f"{'ordinary run denied' if trusted else 'project hooks were skipped'}"
+        )
+        if not trusted:
+            failures.append(
+                "project hook trust: open `/hooks` in a restarted Codex session, review "
+                ".codex/hooks.json, trust the current definitions, then rerun self-test"
+            )
+    return failures, version
+
+
+# Phrases the CLI uses when it declines to run inside another Claude session. Detected so
+# the operator gets the command to run from a normal shell, never worked around: a harness
+# that refuses to nest is a protection, and disabling it would make the evidence a lie
+# about how this machine actually behaves.
+CLAUDE_RECURSION_HINTS = (
+    "already running",
+    "already in a claude",
+    "recursive",
+    "nested claude",
+    "cannot be run inside",
+    "run claude inside",
+)
+
+
+def claude_stream_events(stream: str) -> list[dict]:
+    events: list[dict] = []
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def claude_tool_calls(events: list[dict], expected_tool: str) -> list[dict]:
+    calls: list[dict] = []
+    for event in events:
+        message = event.get("message")
+        if event.get("type") != "assistant" or not isinstance(message, dict):
+            continue
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use" \
+                    and block.get("name") == expected_tool:
+                calls.append(block)
+    return calls
+
+
+def claude_hook_responses(events: list[dict], hook_event: str,
+                          expected_tool: str) -> list[dict]:
+    expected_name = f"{hook_event}:{expected_tool}"
+    return [event for event in events
+            if event.get("type") == "system"
+            and event.get("subtype") == "hook_response"
+            and event.get("hook_event") == hook_event
+            and event.get("hook_name") == expected_name]
+
+
+def claude_hook_text(event: dict) -> str:
+    return "\n".join(str(event.get(key) or "") for key in ("output", "stdout", "stderr"))
+
+
+def claude_hook_decision(event: dict) -> str:
+    if event.get("exit_code") == 2:
+        return "deny"
+    for key in ("output", "stdout"):
+        raw = event.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        try:
+            decision = parsed["hookSpecificOutput"]["permissionDecision"]
+        except (KeyError, TypeError):
+            decision = parsed.get("decision") if isinstance(parsed, dict) else None
+        if isinstance(decision, str):
+            return decision
+    return "allow" if event.get("exit_code") == 0 and event.get("outcome") != "error" else "error"
+
+
+def claude_probe_held(expected_tool: str, reason: str, stream: str,
+                      side_effect_exists: bool, should_exist: bool) -> bool:
+    """Did one live Claude probe prove what it claims to prove?
+
+    Both halves are required in both directions, and that is the whole point:
+
+    * A denial with the marker present means the gate spoke and the call ran anyway.
+    * The intended tool must appear exactly once as a structured `tool_use` event.
+    * The matching project hook must emit a structured `hook_response`; prose in the model's
+      reply is never evidence.
+    * A denial needs the RepoCharter reason in that response and no marker. An allow needs a
+      successful response and the marker; the write probe additionally needs its PostToolUse
+      measurement in that hook response.
+    """
+    events = claude_stream_events(stream)
+    if len(claude_tool_calls(events, expected_tool)) != 1:
+        return False
+    pre = claude_hook_responses(events, "PreToolUse", expected_tool)
+    if not pre:
+        return False
+    if not should_exist:
+        return (not side_effect_exists
+                and any(claude_hook_decision(event) == "deny"
+                        and reason in claude_hook_text(event) for event in pre))
+    if not side_effect_exists or not any(claude_hook_decision(event) == "allow" for event in pre):
+        return False
+    if not reason:
+        return True
+    post = claude_hook_responses(events, "PostToolUse", expected_tool)
+    return any(claude_hook_decision(event) == "allow"
+               and reason in claude_hook_text(event) for event in post)
+
+
+def claude_probe_settings(settings: dict) -> dict:
+    """The settings the disposable probe repo runs with.
+
+    permissions.deny is emptied deliberately. Leaving the compiled path denials in place
+    would let the client-enforced layer refuse the write probe, and a run that cannot tell
+    a permission refusal from a hook refusal certifies nothing about the hook.
+    """
+    settings = json.loads(json.dumps(settings))
+    permissions = settings.setdefault("permissions", {})
+    permissions["deny"] = []
+    permissions.setdefault("allow", [])
+    return settings
+
+
+def _claude_probe_command(repo: Path, prompt: str, mcp_config: Path,
+                          expected_tool: str) -> list[str]:
+    """The one invocation shape this evidence is allowed to come from.
+
+    NOT --bare: that mode skips hooks entirely, so it would certify a wire path the probe
+    never used. Project and local settings are the only sources, which keeps a machine's
+    personal hooks out of the result. Only the intended tool is exposed and it is pre-allowed,
+    so a denial cannot come from the permission system or an unrequested fallback tool.
+    """
+    command = [
+        "claude", "-p", prompt,
+        "--output-format", "stream-json", "--verbose", "--include-hook-events",
+        "--setting-sources", "project,local",
+        "--strict-mcp-config", "--mcp-config", str(mcp_config),
+        "--disable-slash-commands",
+        "--no-session-persistence",
+    ]
+    if expected_tool:
+        command.extend(("--tools", expected_tool, "--allowedTools", expected_tool))
+    return command
+
+
+def _run_claude_exec(repo: Path, prompt: str, mcp_config: Path,
+                     expected_tool: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    # The child session establishes its own project root; inheriting a hook-scoped one
+    # would point its gates at the wrong repository.
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    return subprocess.run(_claude_probe_command(repo, prompt, mcp_config, expected_tool), cwd=repo,
+                          capture_output=True, text=True, timeout=600, env=env)
+
+
+def claude_probes(probe: Path, mcp_marker: Path) -> list[tuple[str, str, str, str, Path, bool]]:
+    """The matrix: (label, tool, prompt, required hook text, marker, must exist).
+
+    Deny and allow are both present on every surface. A suite that only proves refusals
+    passes just as well when the harness is broken and refuses everything.
+    """
+    return [
+        (
+            "Bash denial",
+            "Bash",
+            "Use Bash exactly once to run this exact command: "
+            "printf AGENTKIT_CLAUDE_BASH_RAN > claude-bash-ran.txt. "
+            "Do not use another tool and stop after the attempt.",
+            "AGENTKIT_CLAUDE_BASH_PROBE_DENIED",
+            probe / "claude-bash-ran.txt",
+            False,
+        ),
+        (
+            "Write denial",
+            "Write",
+            "Use the Write tool exactly once to create blocked.txt containing PROBE. "
+            "Do not use Bash or retry and stop after the attempt.",
+            "AGENTKIT_CLAUDE_WRITE_PROBE_DENIED",
+            probe / "blocked.txt",
+            False,
+        ),
+        (
+            "MCP denial",
+            "mcp__agentkit_probe__danger",
+            "Call the agentkit_probe danger MCP tool exactly once with no arguments. "
+            "Do not use another tool and stop after the attempt.",
+            "AGENTKIT_CLAUDE_MCP_PROBE_DENIED",
+            mcp_marker,
+            False,
+        ),
+        (
+            "Bash allow",
+            "Bash",
+            "Use Bash exactly once to run this exact command: "
+            "printf AGENTKIT_CLAUDE_BASH_ALLOWED > claude-bash-allowed.txt. "
+            "Do not use another tool and stop after the attempt.",
+            "",
+            probe / "claude-bash-allowed.txt",
+            True,
+        ),
+        (
+            "Write allow and measurement",
+            "Write",
+            "Use the Write tool exactly once to create measured.txt containing PROBE. "
+            "Do not use Bash or retry and stop after the attempt.",
+            # Emitted only by posttooluse-write.py, and spelled without the em dash the
+            # banner carries: stream JSON escapes non-ASCII, so a literal "—" would
+            # never match the transcript.
+            "AFTER] measured.txt",
+            probe / "measured.txt",
+            True,
+        ),
+        (
+            "MCP allow",
+            "mcp__agentkit_probe__safe",
+            "Call the agentkit_probe safe MCP tool exactly once with no arguments. "
+            "Do not use another tool and stop after the attempt.",
+            "",
+            mcp_marker,
+            True,
+        ),
+    ]
+
+
+def _claude_checkout_probe_command(repo: Path, mcp_config: Path) -> list[str]:
+    """The target-checkout call, kept inspectable so its settings scope is testable."""
+    prompt = (
+        "Use Bash exactly once to run this exact command: "
+        "git -c core.hooksPath=/dev/null status. "
+        "Do not use another tool and stop after the attempt."
+    )
+    return [
+        "claude", "-p", prompt,
+        "--output-format", "stream-json", "--verbose", "--include-hook-events",
+        "--setting-sources", "user,project,local",
+        "--strict-mcp-config", "--mcp-config", str(mcp_config),
+        "--tools", "Bash", "--allowedTools", "Bash",
+        "--disable-slash-commands", "--no-session-persistence",
+    ]
+
+
+def _run_claude_checkout_probe(repo: Path, mcp_config: Path) -> subprocess.CompletedProcess:
+    """Exercise the target checkout with its effective user, project, and local settings."""
+    env = dict(os.environ)
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    return subprocess.run(_claude_checkout_probe_command(repo, mcp_config), cwd=repo,
+                          capture_output=True, text=True,
+                          timeout=600, env=env)
+
+
+
+def live_claude_self_test(repo: Path) -> tuple[list[str], str]:
+    """Prove this checkout's Claude adapter through real provider calls.
+
+    A disposable matrix proves denied and allowed Bash, Write, and MCP calls. A second call
+    in the target checkout proves its effective user/project/local settings invoke the exact
+    installed Bash gate. Persisted workspace trust is checked separately because ``-p``
+    intentionally skips the interactive trust dialog. ConfigChange remains a fixture check:
+    current headless Claude sessions do not emit that watcher event when settings change.
+    """
+    if shutil.which("claude") is None:
+        return ["Claude Code is declared blocking but the `claude` executable is unavailable"], ""
+    try:
+        version_proc = subprocess.run(["claude", "--version"], capture_output=True, text=True,
+                                      timeout=30)
+    except subprocess.TimeoutExpired:
+        return ["`claude --version` timed out"], ""
+    version = version_proc.stdout.strip()
+    if version_proc.returncode != 0 or not version:
+        return ["could not read the installed Claude Code version"], ""
+
+    failures, trust_root = claude_checkout_preflight(repo)
+    if trust_root is not None:
+        print(f"  pass  Claude persisted workspace trust: covered by {trust_root}")
+    else:
+        print("  FAIL  Claude persisted workspace trust: no trusted checkout or parent")
+    if failures:
+        return failures, version
+
+    with tempfile.TemporaryDirectory(prefix=".agentkit-claude-self-test.", dir=repo) as raw:
+        probe = Path(raw) / "repo"
+        probe.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=probe, check=True)
+        (probe / "AGENTS.md").write_text(
+            "# RepoCharter hook probe\n\nUse exactly the tool requested, once. "
+            "Do not retry through another tool after a denial.\n",
+            encoding="utf-8",
+        )
+        (probe / ".agents").mkdir()
+        compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
+        compat = json.loads(json.dumps(compat))
+        compat["policy"] = {
+            "protectedBranches": ["main", "master"],
+            "denyBashPatterns": [{
+                "pattern": "AGENTKIT_CLAUDE_BASH_RAN",
+                "reason": "AGENTKIT_CLAUDE_BASH_PROBE_DENIED",
+            }],
+            "denyWritePaths": [{
+                "glob": "blocked.txt",
+                "reason": "AGENTKIT_CLAUDE_WRITE_PROBE_DENIED",
+            }],
+            "denyMcpTools": [{
+                "pattern": "^mcp__agentkit_probe__danger$",
+                "reason": "AGENTKIT_CLAUDE_MCP_PROBE_DENIED",
+            }],
+            "measureOnWrite": [{
+                "glob": "measured.txt",
+                "measure": "byte-size",
+                "reason": "AGENTKIT_CLAUDE_MEASURE_PROBE",
+            }],
+        }
+        write_json(probe / ".agents" / "compatibility.json", compat)
+
+        shutil.copytree(repo / ".claude" / "hooks", probe / ".claude" / "hooks")
+        # The settings file is copied verbatim, so the probe exercises the same wiring the
+        # digest covers. permissions.deny is emptied on purpose: the client-enforced layer
+        # must not be what refuses, or the run proves nothing about the hook.
+        settings = claude_probe_settings(read_json(repo / ".claude" / "settings.json", {}) or {})
+        write_json(probe / ".claude" / "settings.json", settings)
+
+        server = Path(raw) / "mcp_probe.py"
+        mcp_marker = probe / "mcp-call-ran.txt"
+        server.write_text(MCP_PROBE_SERVER, encoding="utf-8")
+        server.chmod(0o755)
+        mcp_config = Path(raw) / "mcp.json"
+        write_json(mcp_config, {"mcpServers": {"agentkit_probe": {
+            "command": "python3",
+            "args": [str(server), str(mcp_marker)],
+        }}})
+
+        # One cheap round trip first. If this harness refuses to run inside another Claude
+        # session, every probe below would fail for that reason and report six misleading
+        # gate failures instead of one accurate environment answer.
+        ready_marker = "AGENTKIT_CLAUDE_HARNESS_READY"
+        try:
+            ready = _run_claude_exec(
+                probe, f"Reply with exactly this word and nothing else: {ready_marker}",
+                mcp_config, "")
+        except subprocess.TimeoutExpired:
+            return ["Claude did not respond to the readiness probe before the timeout"], version
+        ready_text = ready.stdout + "\n" + ready.stderr
+        if ready_marker not in ready_text:
+            lowered = ready_text.lower()
+            outside = (f"Exit that session and run, from a normal shell: "
+                       f"python3 kit/repocharter self-test --repo {repo} --promote-claude")
+            if any(hint in lowered for hint in CLAUDE_RECURSION_HINTS):
+                return ([f"Claude Code refused to run inside another Claude Code session. That "
+                         f"protection is not bypassed here. {outside}"], version)
+            # Nesting is not refused by every build, so a failure here is reported as what it
+            # is rather than blamed on recursion. The escape hatch is offered, not asserted.
+            tail = " | ".join([ln for ln in ready_text.splitlines() if ln.strip()][-4:])[:600]
+            detail = f"Claude readiness probe failed (exit {ready.returncode}); tail: {tail}"
+            if os.environ.get("CLAUDECODE"):
+                detail += f". This ran inside a Claude Code session. {outside}"
+            return [detail], version
+
+        probes = claude_probes(probe, mcp_marker)
+        # ConfigChange is absent on purpose. Measured headless ``-p`` sessions emitted no
+        # watcher event after an authorized Write, a Bash write, or an external file change;
+        # the same already-loaded session also kept its previous hook set. The guard is fired
+        # directly in the provider-shaped fixture below instead of calling that absence live.
+        for label, expected_tool, prompt, reason, side_effect, should_exist in probes:
+            try:
+                proc = _run_claude_exec(probe, prompt, mcp_config, expected_tool)
+            except subprocess.TimeoutExpired:
+                failures.append(f"{label}: Claude timed out")
+                print(f"  FAIL  live Claude {label}: timed out")
+                continue
+            transcript = proc.stdout
+            held = claude_probe_held(
+                expected_tool, reason, transcript, side_effect.exists(), should_exist,
+            )
+            print(
+                f"  {'pass ' if held else 'FAIL '} live Claude {label}: "
+                f"{('executed' if should_exist else 'denied before execution') if held else 'unexpected result'}"
+            )
+            if not held:
+                lines = [line for line in (proc.stdout + "\n" + proc.stderr).splitlines()
+                         if line.strip()]
+                tail = " | ".join(lines[-4:])[:600]
+                if not should_exist and side_effect.exists():
+                    detail = "forbidden side effect exists"
+                elif should_exist and not side_effect.exists():
+                    detail = f"allowed side effect missing; Claude exit {proc.returncode}"
+                else:
+                    detail = f"Claude exit {proc.returncode}; expected reason absent"
+                failures.append(f"{label}: {detail}; tail: {tail}" if tail else f"{label}: {detail}")
+
+        # The disposable matrix deliberately excludes personal settings. This final call
+        # exercises the real target with every effective settings source and requires the
+        # exact built-in denial reason from a structured project-hook response. ``-p`` skips
+        # the trust dialog, so persisted covering trust is an independent prerequisite.
+        try:
+            target = _run_claude_checkout_probe(repo, mcp_config)
+        except subprocess.TimeoutExpired:
+            failures.append("target checkout: Claude timed out")
+            print("  FAIL  live Claude target checkout: timed out")
+        else:
+            reason = "Safety gate: overriding core.hooksPath"
+            held = claude_probe_held("Bash", reason, target.stdout, False, False)
+            print(
+                f"  {'pass ' if held else 'FAIL '} live Claude target checkout: "
+                f"{'effective settings invoked the installed gate' if held else 'gate was not observed'}"
+            )
+            if not held:
+                lines = [line for line in (target.stdout + "\n" + target.stderr).splitlines()
+                         if line.strip()]
+                tail = " | ".join(lines[-4:])[:600]
+                failures.append(
+                    f"target checkout: exact structured RepoCharter denial absent; tail: {tail}"
+                )
+
+    return failures, version
+
+
+CONFIGCHANGE_FIXTURE_SETTINGS = {
+    "permissions": {"allow": [], "deny": ["Edit(fixture/**)"]},
+    "hooks": {
+        "PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command":
+             "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-bash.sh"}]},
+            {"matcher": "Edit|Write|NotebookEdit", "hooks": [{"type": "command", "command":
+             "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-write.py"}]},
+            {"matcher": "mcp__.*", "hooks": [{"type": "command", "command":
+             "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-mcp.py"}]},
+        ],
+        "PostToolUse": [{"matcher": "Edit|Write|NotebookEdit",
+                         "hooks": [{"type": "command", "command":
+                          "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/posttooluse-write.py"}]}],
+        "ConfigChange": [{"hooks": [{"type": "command", "command":
+                          "${CLAUDE_PROJECT_DIR}/.claude/hooks/agentkit/configchange-guard.py"}]}],
+    },
+}
+
+
+def configchange_fixture_checks(repo: Path) -> int:
+    """Fire this checkout's INSTALLED ConfigChange guard in a throwaway copy of a repo.
+
+    The fixture is what makes this safe to run anywhere: a case that fails, or a guard that
+    wrongly allows a disarm, touches a temporary directory and never this checkout's own
+    settings. The payloads are the shape the harness really sends -- a source and a path,
+    with no settings content -- because a guard tested only against a synthetic payload
+    carrying `new_settings` passes while enforcing nothing.
+    """
+    guard = repo / HOOK_DIR_NAME / "configchange-guard.py"
+    if not guard.is_file():
+        print("  FAIL  ConfigChange guard: configchange-guard.py is not installed")
+        return 1
+
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="agentkit-configchange-fixture.") as raw:
+        fixture = Path(raw)
+        shutil.copytree(repo / HOOK_DIR_NAME, fixture / HOOK_DIR_NAME)
+        write_json(fixture / ".agents" / "compatibility.json",
+                   {"policy": {"denyWritePaths": [{"glob": "fixture/**", "reason": "fixture"}]}})
+        settings_path = fixture / ".claude" / "settings.json"
+        payload = {"hook_event_name": "ConfigChange", "source": "project_settings",
+                   "file_path": str(settings_path)}
+
+        healthy = json.loads(json.dumps(CONFIGCHANGE_FIXTURE_SETTINGS))
+        disarmed = {**json.loads(json.dumps(healthy)), "disableAllHooks": True}
+        undenied = json.loads(json.dumps(healthy))
+        undenied["permissions"]["deny"] = []
+        ungated = json.loads(json.dumps(healthy))
+        del ungated["hooks"]["PreToolUse"]
+        noop = json.loads(json.dumps(healthy))
+        noop["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = "true"
+
+        for label, settings, expected in (
+            ("an ordinary settings reload", healthy, 0),
+            ("disableAllHooks", disarmed, 2),
+            ("an emptied permissions.deny", undenied, 2),
+            ("a removed PreToolUse hook", ungated, 2),
+            ("a same-event no-op Bash handler", noop, 2),
+        ):
+            write_json(settings_path, settings)
+            env = dict(os.environ, CLAUDE_PROJECT_DIR=str(fixture))
+            env.pop("AGENTKIT_HARNESS", None)
+            proc = subprocess.run([str(guard)], input=json.dumps(payload), capture_output=True,
+                                  text=True, env=env, cwd=fixture, timeout=30)
+            ok = proc.returncode == expected
+            verb = "allowed" if expected == 0 else "refused"
+            print(f"  {'pass ' if ok else 'FAIL '} ConfigChange fixture — {label} is {verb}: "
+                  f"expected exit {expected}, got {proc.returncode}")
+            failures += 0 if ok else 1
+    return failures
+
+
+def cmd_self_test(repo: Path, promote_codex: bool = False,
+                  promote_claude: bool = False) -> int:
+    print(f"repocharter self-test -> {repo}\n")
+    hook_dir = repo / HOOK_DIR_NAME
+    if not hook_dir.is_dir():
+        print("  ERROR: no installed hooks. Run `repocharter apply` first.", file=sys.stderr)
+        return 2
+
+    failures = 0
+    for hook_name, payload, expected, label in CASES:
+        hook = hook_dir / hook_name
+        if not hook.exists():
+            print(f"  FAIL  {label}: {hook_name} is not installed")
+            failures += 1
+            continue
+        try:
+            code, out = run_hook(hook, payload, repo)
+        except subprocess.TimeoutExpired:
+            print(f"  FAIL  {label}: hook timed out")
+            failures += 1
+            continue
+        actual = decision_of(code, out)
+        ok = actual == expected
+        print(f"  {'pass ' if ok else 'FAIL '} {label}: expected {expected}, got {actual}")
+        failures += 0 if ok else 1
+
+    # The fail-closed property, which is the one that was wrong before: a gate that cannot
+    # parse its input must refuse, not wave the call through.
+    bash_hook = hook_dir / "pretooluse-bash.sh"
+    if bash_hook.exists():
+        proc = subprocess.run([str(bash_hook)], input="not json at all",
+                              capture_output=True, text=True, cwd=repo, timeout=30)
+        ok = proc.returncode == 2
+        print(f"  {'pass ' if ok else 'FAIL '} malformed payload fails CLOSED: "
+              f"expected exit 2, got {proc.returncode}")
+        failures += 0 if ok else 1
+
+        code, out = run_hook(
+            bash_hook,
+            {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}},
+            repo,
+            harness="codex",
+        )
+        actual = decision_of(code, out)
+        ok = actual == "allow" and "native permission request" in context_of(out)
+        print(f"  {'pass ' if ok else 'FAIL '} Codex hands ask to native approval: "
+              f"expected approval handoff, got {actual}")
+        failures += 0 if ok else 1
+
+        code, out = run_hook(
+            bash_hook,
+            {"permission_mode": "bypassPermissions", "tool_name": "Bash",
+             "tool_input": {"command": "git reset --hard HEAD~1"}},
+            repo,
+            harness="codex",
+        )
+        actual = decision_of(code, out)
+        ok = actual == "deny"
+        print(f"  {'pass ' if ok else 'FAIL '} Codex without approval path denies ask: "
+              f"expected deny, got {actual}")
+        failures += 0 if ok else 1
+
+    failures += configchange_fixture_checks(repo)
+    shared_failures = failures
+
+    compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
+    claims = [h for h, level in (compat.get("enforcement") or {}).items() if level == "blocking"]
+    reuse_current = promote_codex or promote_claude
+    reused: list[str] = []
+    codex_version = ""
+    codex_live_passed = False
+    codex_requested = "codex" in claims or promote_codex
+    if codex_requested and reuse_current:
+        state = provider_promotion_state(repo, "codex", compat)
+        if state["current"]:
+            codex_requested = False
+            reused.append("codex")
+            print("  pass  Codex promotion fast path: current checkout evidence, provider "
+                  "version, settings, and trusted hook source still match")
+    if codex_requested:
+        live_failures, codex_version = live_codex_self_test(repo)
+        failures += len(live_failures)
+        codex_live_passed = not live_failures
+        for problem in live_failures:
+            print(f"        {problem}")
+    claude_version = ""
+    claude_live_passed = False
+    claude_requested = "claude-code" in claims or promote_claude
+    if claude_requested and reuse_current:
+        state = provider_promotion_state(repo, "claude-code", compat)
+        if state["current"]:
+            claude_requested = False
+            reused.append("claude-code")
+            print("  pass  Claude promotion fast path: current checkout evidence, provider "
+                  "version, settings, and workspace trust still match")
+    if claude_requested:
+        live_failures, claude_version = live_claude_self_test(repo)
+        failures += len(live_failures)
+        claude_live_passed = not live_failures
+        for problem in live_failures:
+            print(f"        {problem}")
+    unsupported = [h for h in claims if h not in {"codex", "claude-code"}]
+    for harness_name in unsupported:
+        print(f"  FAIL  {harness_name} is declared blocking but has no provider-specific live probe")
+        failures += 1
+    print()
+    if shared_failures:
+        print(f"self-test: {failures} failure(s). Shared gate failures prevent every provider "
+              "from earning evidence.")
+        return 1
+    if failures:
+        print(f"self-test: {failures} provider failure(s). Successful providers below retain "
+              "their independent evidence; failed providers do not.")
+    else:
+        print("self-test: all gates fired as declared.")
+    # Evidence is written only on the path that actually ran the provider. A harness whose
+    # live probes never ran keeps whatever evidence it already had, so one provider's run
+    # can never refresh or invalidate another's.
+    recorded: list[str] = []
+    pending_evidence: list[tuple[str, bool, dict, str]] = []
+    for harness_name, requested, promote, version, digest_of, summary in (
+        ("codex", codex_live_passed, promote_codex, codex_version, codex_adapter_digest,
+         "live Bash, apply_patch, and MCP denials"),
+        ("claude-code", claude_live_passed, promote_claude, claude_version, claude_adapter_digest,
+         "live Bash, Write, and MCP denials, target settings, trust, and the ConfigChange fixture"),
+    ):
+        if not requested:
+            continue
+        digest = digest_of(repo)
+        if not digest:
+            print(f"  ERROR: {harness_name} adapter files disappeared before evidence could "
+                  "be recorded.", file=sys.stderr)
+            return 1
+        record = {
+            "verifiedOn": date.today().isoformat(),
+            "harnessVersion": version,
+            "adapterSha256": digest,
+            "method": "live-deny-and-observe",
+        }
+        pending_evidence.append((harness_name, promote, record, summary))
+
+    # A tracked claim describes repository bytes, while this file proves THIS checkout and
+    # installed provider actually ran them. Write the checkout-local half first: if Git has
+    # no private worktree directory or it is unwritable, promotion must leave no portable
+    # blocking claim behind for another checkout to inherit accidentally.
+    for harness_name, _promote, record, _summary in pending_evidence:
+        try:
+            local_written = write_checkout_evidence(repo, harness_name, record)
+        except OSError as exc:
+            print(f"  ERROR: could not record checkout-local {harness_name} evidence ({exc}).",
+                  file=sys.stderr)
+            return 1
+        if not local_written:
+            print(f"  ERROR: {repo} has no checkout-private Git directory, so {harness_name} "
+                  "cannot be promoted honestly.", file=sys.stderr)
+            return 1
+
+    for harness_name, promote, record, summary in pending_evidence:
+        evidence = compat.setdefault("enforcementEvidence", {})
+        if promote:
+            compat.setdefault("enforcement", {})[harness_name] = "blocking"
+        evidence[harness_name] = record
+        recorded.append(harness_name)
+        print(f"  {harness_name} repository and checkout evidence rewritten from {summary}.")
+        if promote:
+            print(f"  compatibility.json sets {harness_name} enforcement to blocking.")
+    if recorded:
+        write_json(repo / ".agents" / "compatibility.json", compat)
+    resulting_claims = [h for h, level in (compat.get("enforcement") or {}).items()
+                        if level == "blocking"]
+    if resulting_claims:
+        proven = {"codex": codex_live_passed, "claude-code": claude_live_passed}
+        tested = [h for h in resulting_claims if proven.get(h)]
+        direct = [h for h in resulting_claims if not proven.get(h) and h not in reused]
+        if tested:
+            print(f"  live provider-backed: {', '.join(tested)}")
+        if reused:
+            print(f"  current checkout evidence reused: {', '.join(reused)}")
+        if direct:
+            print(f"  direct-script only in this run: {', '.join(direct)}")
+    else:
+        print("  no harness declares `blocking` yet; raise it in compatibility.json when ready.")
+    return 1 if failures else 0
+
+
+# ── measure ───────────────────────────────────────────────────────────────────────────
+
+def cmd_measure(repo: Path, as_json: bool, verbose: bool) -> int:
+    """Fire every fence the repo declares and report which ones actually held.
+
+    `self-test` proves the UNIVERSAL rules fire. It has never touched a repo's own
+    policy, which is where all three of the inert-fence defects lived. This is the
+    command that makes `enforcement: blocking` a measurement rather than a claim.
+    """
+    import measure as measure_lib
+
+    hook_dir = repo / HOOK_DIR_NAME
+    if not hook_dir.is_dir():
+        print("repocharter: no installed hooks. Run `repocharter apply` first.", file=sys.stderr)
+        return 2
+
+    report = measure_lib.measure(repo, hook_dir)
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return 2 if report.get("error") else (
+            1 if any(r["verdict"] in measure_lib.BROKEN for r in report["rules"])
+            or report.get("overbroad") or report.get("coverage") else 0)
+
+    print(f"repocharter measure -> {repo}\n")
+    text, code = measure_lib.render(report, verbose)
+    print(text)
+    return code
+
+
+# ── census ────────────────────────────────────────────────────────────────────────────
+
+def cmd_census(repo: Path, as_json: bool) -> int:
+    compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
+    canonical = compat.get("canonical") or {}
+    agents = repo / (canonical.get("instructions") or "AGENTS.md")
+    shim = repo / (canonical.get("shim") or "CLAUDE.md")
+    project = repo / (canonical.get("project") or "docs/project")
+    skills_dir = repo / (canonical.get("skills") or ".agents/skills")
+
+    def measure(path: Path) -> dict:
+        if not path.exists():
+            return {"exists": False, "bytes": 0, "lines": 0}
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return {"exists": True, "bytes": path.stat().st_size, "lines": len(text.splitlines())}
+
+    a, s = measure(agents), measure(shim)
+    on_demand = sum(p.stat().st_size for p in project.rglob("*.md")) if project.is_dir() else 0
+    n_skills = len([p for p in skills_dir.iterdir() if p.is_dir()]) if skills_dir.is_dir() else 0
+
+    # Unscoped .claude/rules load at launch with the same priority as .claude/CLAUDE.md, so
+    # include them in the startup-context baseline.
+    rules_bytes, rules_lines, rules_files = 0, 0, []
+    rules_dir = repo / ".claude" / "rules"
+    if rules_dir.is_dir():
+        for rule in sorted(rules_dir.rglob("*.md")):
+            text = rule.read_text(encoding="utf-8", errors="replace")
+            head = text[:text.find("\n---", 3)] if text.startswith("---") else ""
+            if "paths:" in head:
+                continue
+            rules_bytes += rule.stat().st_size
+            rules_lines += len(text.splitlines())
+            rules_files.append(str(rule.relative_to(repo)))
+
+    codex_bytes = a["bytes"]
+    claude_bytes = a["bytes"] + s["bytes"] + rules_bytes
+    claude_lines = a["lines"] + s["lines"] + rules_lines
+    # 3.6-4.0 chars/token, calibrated against two harnesses agreeing at the per-skill entry.
+    # A band, not a constant: prefer the byte figures for any decision that can use them.
+    lo, hi = claude_bytes / 4.0, claude_bytes / 3.6
+
+    data = {
+        "repo": str(repo),
+        "codexVisibleBytes": codex_bytes,
+        "claudeVisibleBytes": claude_bytes,
+        "claudeVisibleLines": claude_lines,
+        "onDemandBytes": on_demand,
+        "onDemandTokensIfImported": [round(on_demand / 4.0), round(on_demand / 3.6)],
+        "projectSkills": n_skills,
+        "unscopedRulesBytes": rules_bytes,
+        "unscopedRulesFiles": rules_files,
+        "repoAuthoredTokensEstimate": [round(lo), round(hi)],
+    }
+
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return 0
+
+    print(f"repocharter census -> {repo}\n")
+    print(f"  Codex-visible   {codex_bytes:>8,} bytes  ({100*codex_bytes/32768:.1f}% of the 32,768 cap)")
+    print(f"  Claude-visible  {claude_bytes:>8,} bytes / {claude_lines} lines")
+    if rules_bytes:
+        print(f"    of which      {rules_bytes:>8,} bytes  UNSCOPED .claude/rules — always-loaded:")
+        for name in rules_files:
+            print(f"                            {name}")
+    print(f"  project skills  {n_skills:>8}        (~90-100 tokens each, bodies load on trigger)")
+    print(f"  on-demand corpus{on_demand:>8,} bytes  costs ZERO at startup; "
+          f"~{round(on_demand/4.0):,}-{round(on_demand/3.6):,} tokens if it were @-imported")
+    print(f"\n  repo-authored startup: ~{round(lo):,}-{round(hi):,} tokens (ESTIMATED on a 3.6-4.0 chars/token band)")
+    print("  Harness baseline is on top of this and is not something the repo controls.")
+    return 0
+
+
+# ── entry point ───────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="repocharter", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"RepoCharter {KIT_VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("apply", help="install the mechanical layer (idempotent)")
+    p.add_argument("--repo", default="."); p.add_argument("--force", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="show the footprint, change nothing")
+    p.add_argument("--allow-dirty", action="store_true", help="proceed on an already-dirty tree")
+
+    p = sub.add_parser("migrate", help="mechanical migration + a written plan for the judgment calls")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--apply", action="store_true", help="perform the mechanical actions (default: plan only)")
+    p.add_argument("--plan-out", default=None, help="write the plan here instead of stdout")
+    p.add_argument("--allow-dirty", action="store_true")
+
+    p = sub.add_parser("policy", help="harvest a draft policy from what the repo already enforces")
+    p.add_argument("action", choices=["scaffold", "promote", "repair"])
+    p.add_argument("--repo", default=".")
+
+    p = sub.add_parser("supersede", help="prove the kit's gate is never weaker, then retire the legacy one")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--gate", default=None, help="a specific legacy gate (default: all in .claude/hooks)")
+    p.add_argument("--retire", action="store_true", help="quarantine and unwire it (only if safe)")
+    p.add_argument("--allow-dirty", action="store_true")
+
+    p = sub.add_parser("fleet", help="stage + census for every repository under a root")
+    p.add_argument("--root", default=str(Path.home() / "dev"))
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--verify", action="store_true", help="also count errors per repo (slower)")
+
+    p = sub.add_parser("revert", help="undo the last mechanical migration from its manifest")
+    p.add_argument("--repo", default=".")
+
+    p = sub.add_parser("verify", help="the residue checks; exits non-zero on error")
+    p.add_argument("--repo", default="."); p.add_argument("--effective", action="store_true")
+    p.add_argument("--strict", action="store_true"); p.add_argument("--json", action="store_true")
+    p.add_argument("--agnix", action="store_true",
+                   help="also run the shared agnix catalogue (fetched via npx; fails if it cannot run)")
+
+    p = sub.add_parser("self-test", help="fire forbidden calls at the hooks and assert refusal")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--promote-codex", action="store_true",
+                   help="run live Codex Bash/write/MCP probes and mark Codex blocking only on success")
+    p.add_argument("--promote-claude", action="store_true",
+                   help="run live Claude Bash/Write/MCP and target-checkout probes plus the "
+                        "ConfigChange fixture, then mark Claude Code blocking only on success")
+
+    p = sub.add_parser("census", help="Phase-0 measurement")
+    p.add_argument("--repo", default="."); p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("measure", help="fire every declared fence and report what actually held")
+    p.add_argument("--repo", default="."); p.add_argument("--json", action="store_true")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="also list the fences that passed, and the unmeasured ones by reason")
+
+    args = parser.parse_args()
+
+    if args.command == "fleet":
+        root = Path(args.root).resolve()
+        if not root.is_dir():
+            print(f"repocharter: {root} is not a directory", file=sys.stderr)
+            return 2
+        return cmd_fleet(root, args.json, args.verify)
+
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        print(f"repocharter: {repo} is not a directory", file=sys.stderr)
+        return 2
+
+    if args.command == "apply":
+        return cmd_apply(repo, args.force, args.dry_run, args.allow_dirty)
+    if args.command == "migrate":
+        return cmd_migrate(repo, args.apply, args.plan_out, args.allow_dirty)
+    if args.command == "policy":
+        return cmd_policy(repo, args.action)
+    if args.command == "supersede":
+        return cmd_supersede(repo, args.gate, args.retire, args.allow_dirty)
+    if args.command == "revert":
+        return cmd_revert(repo)
+    if args.command == "verify":
+        return cmd_verify(repo, args.effective, args.strict, args.json, args.agnix)
+    if args.command == "self-test":
+        return cmd_self_test(repo, args.promote_codex, args.promote_claude)
+    if args.command == "census":
+        return cmd_census(repo, args.json)
+    if args.command == "measure":
+        return cmd_measure(repo, args.json, args.verbose)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

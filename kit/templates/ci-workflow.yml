@@ -1,4 +1,4 @@
-# agentkit conformance. Copy to .github/workflows/agentkit.yml
+# RepoCharter conformance. Copy to .github/workflows/repocharter.yml
 #
 # This workflow detects violations after a push. It blocks merges only when the repository's
 # branch-protection or ruleset configuration requires this job to pass.
@@ -6,10 +6,10 @@
 # Note also that CI cannot see the machine-local half of the Claude-visible startup set:
 # ~/.claude/CLAUDE.md, ancestor CLAUDE.md files, and — where explicitly enabled — MEMORY.md.
 # Those
-# are reported by `agentkit verify --effective` on a developer machine and are deliberately
+# are reported by `repocharter verify --effective` on a developer machine and are deliberately
 # not gated here, because gating what CI cannot observe makes the budget a fiction.
 
-name: agentkit
+name: repocharter
 
 on:
   push:
@@ -31,28 +31,28 @@ jobs:
         with:
           node-version: '20'
 
-      - name: agentkit verify
+      - name: repocharter verify
         # --strict promotes warnings to errors. It can be omitted temporarily during a
         # migration and restored after the repository is conforming.
         run: |
-          if [ ! -x kit/agentkit ]; then
-            echo "::error::kit/agentkit is missing or not executable — the vendored kit is incomplete"
+          if [ ! -x kit/repocharter ]; then
+            echo "::error::kit/repocharter is missing or not executable — the vendored kit is incomplete"
             exit 1
           fi
-          kit/agentkit verify --repo . --strict
+          kit/repocharter verify --repo . --strict
 
-      - name: agentkit self-test
+      - name: repocharter self-test
         # Proves the declared gates actually refuse. Without this, `enforcement: blocking`
         # in compatibility.json is a claim rather than a fact.
-        run: kit/agentkit self-test --repo .
+        run: kit/repocharter self-test --repo .
 
       - name: census (recorded, never gated)
         # Record context measurements without changing the job's pass/fail result.
         if: always()
-        run: kit/agentkit census --repo . --json | tee census.json
+        run: kit/repocharter census --repo . --json | tee census.json
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: agentkit-census
+          name: repocharter-census
           path: census.json

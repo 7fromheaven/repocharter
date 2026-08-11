@@ -49,7 +49,7 @@ def main() -> None:
             continue
         detail = f" (matched {conditions})" if conditions else ""
         deny(
-            f"agentkit policy: {tool_name} is forbidden{detail}. {rule['reason']} "
+            f"RepoCharter policy: {tool_name} is forbidden{detail}. {rule['reason']} "
             f"(rule: denyMcpTools {rule['pattern']} in .agents/compatibility.json)"
         )
 
