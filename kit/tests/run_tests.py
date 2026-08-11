@@ -134,6 +134,61 @@ def make_repo(tmp: Path, policy: dict | None = None, compat_extra: dict | None =
     return repo
 
 
+def test_public_migration_skill_bootstrap(tmp: Path) -> None:
+    """The source distribution must expose the migration workflow before apply."""
+    section("public bootstrap — migration skill is natively discoverable before apply")
+    source_root = KIT.parent
+    extractor = source_root / "scripts" / "extract-agentkit.py"
+    if extractor.is_file():
+        distribution = tmp / "repocharter-public"
+        extracted = subprocess.run(
+            [sys.executable, str(extractor), "--dest", str(distribution)],
+            capture_output=True, text=True, timeout=120,
+        )
+        check("the public distribution extracts cleanly", extracted.returncode == 0,
+              extracted.stdout[-500:] + extracted.stderr[-500:])
+    else:
+        distribution = source_root
+        check("the checked-out public distribution contains its runtime",
+              (distribution / "kit" / "agentkit").is_file())
+
+    bundled = distribution / "kit" / "skills" / "migrate-repocharter"
+    codex = distribution / ".agents" / "skills" / "migrate-repocharter"
+    claude = distribution / ".claude" / "skills" / "migrate-repocharter"
+
+    check("Codex gets a relative bootstrap adapter to the bundled workflow",
+          codex.is_symlink()
+          and os.readlink(codex) == "../../kit/skills/migrate-repocharter"
+          and (codex / "SKILL.md").is_file(),
+          os.readlink(codex) if codex.is_symlink() else "missing or not a symlink")
+    check("Claude gets a relative bootstrap adapter through the canonical skill path",
+          claude.is_symlink()
+          and os.readlink(claude) == "../../.agents/skills/migrate-repocharter"
+          and (claude / "SKILL.md").is_file(),
+          os.readlink(claude) if claude.is_symlink() else "missing or not a symlink")
+    check("both provider adapters resolve to the one bundled skill body",
+          codex.exists() and claude.exists()
+          and codex.resolve() == bundled.resolve()
+          and claude.resolve() == bundled.resolve())
+    body = (bundled / "SKILL.md").read_text(encoding="utf-8")
+    check("the bootstrap workflow resolves the target before checkpointing",
+          "Resolve the target repository before running the checkpoint" in body)
+
+    if extractor.is_file() and codex.is_symlink():
+        codex.unlink()
+        checked = subprocess.run(
+            [sys.executable, str(extractor), "--dest", str(distribution), "--check"],
+            capture_output=True, text=True, timeout=120,
+        )
+        check("extraction fixed-point checking detects a missing bootstrap adapter",
+              checked.returncode == 1
+              and "missing in output: .agents/skills/migrate-repocharter" in checked.stdout,
+              checked.stdout[-500:] + checked.stderr[-500:])
+    elif not extractor.is_file():
+        check("the public distribution excludes private project state",
+              not (distribution / "docs" / "project").exists())
+
+
 # ── the Bash gate ─────────────────────────────────────────────────────────────────────
 
 def test_bash_gate(tmp: Path) -> None:
@@ -853,12 +908,12 @@ def test_apply(tmp: Path) -> None:
           and (migration_skill / "scripts" / "checkpoint.py").is_file()
           and (migration_skill / "scripts" / "prepare_standalone.py").is_file())
     migration_metadata = (migration_skill / "agents" / "openai.yaml").read_text(encoding="utf-8")
-    check("the migration skill metadata uses portable plain-style YAML",
+    check("the migration skill metadata uses portable quoted YAML",
           migration_metadata.splitlines() == [
               "interface:",
-              "  display_name: RepoCharter Migration",
-              "  short_description: Run a safe, resumable RepoCharter migration",
-              "  default_prompt: Use $migrate-repocharter to migrate this repository end to end and stop before external actions.",
+              '  display_name: "RepoCharter Migration"',
+              '  short_description: "Run a safe, resumable RepoCharter migration"',
+              '  default_prompt: "Use $migrate-repocharter to migrate the requested repository end to end and stop before external actions."',
           ], migration_metadata)
     migration_link = repo / ".claude" / "skills" / "migrate-repocharter"
     check("the migration skill reaches Claude through a relative symlink",
@@ -2487,6 +2542,7 @@ def main() -> int:
         # instead of requiring write access to the operator's home directory.
         previous_state = os.environ.get("AGENTKIT_STATE_DIR")
         os.environ["AGENTKIT_STATE_DIR"] = str(tmp / "agentkit-state")
+        test_public_migration_skill_bootstrap(tmp / "public-bootstrap")
         test_bash_gate(tmp / "bash")
         test_write_gate(tmp / "write")
         test_mcp_gate(tmp)

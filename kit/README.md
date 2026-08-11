@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 RepoCharter is the product name. The 0.3.x executable and compatibility-facing paths retain the
 `agentkit` name so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 368 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 374 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -14,9 +14,11 @@ For most repositories, the complete path is `census` → `apply` → `self-test`
 legacy layouts; they are not required for normal adoption.
 
 For an agent-owned adoption, upgrade, provider promotion, or integration, use
-`kit/skills/migrate-repocharter/SKILL.md`. `apply` installs that workflow through the existing
-project-skills adapter. Its checkpoint distinguishes current evidence from stale evidence, so a
-branch switch or documentation-only commit does not rerun the full provider matrix. If Codex
+`kit/skills/migrate-repocharter/SKILL.md`. The public distribution exposes that one bundled body as
+`$migrate-repocharter` in Codex and `/migrate-repocharter` in Claude Code before target installation;
+name the target repository in the invocation. `apply` installs the same workflow through the
+existing project-skills adapter. Its checkpoint distinguishes current evidence from stale evidence,
+so a branch switch or documentation-only commit does not rerun the full provider matrix. If Codex
 silently substitutes the primary checkout's hooks for a linked worktree, the workflow preserves the
 current state in an independent normal clone instead of bypassing hook trust.
 
@@ -278,7 +280,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-368 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+374 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI

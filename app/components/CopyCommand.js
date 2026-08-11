@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-export default function CopyCommand({ command, compact = false }) {
+export default function CopyCommand({ command, compact = false, label = null }) {
   const [copied, setCopied] = useState(false);
   const resetTimer = useRef(null);
 
@@ -25,11 +25,19 @@ export default function CopyCommand({ command, compact = false }) {
 
   return (
     <div className={`command ${compact ? "command--compact" : ""}`}>
-      <span className="command__prompt" aria-hidden="true">
-        $
+      <span
+        className={`command__prompt ${label ? "command__prompt--label" : ""}`}
+        aria-hidden="true"
+      >
+        {label || "$"}
       </span>
       <code>{command}</code>
-      <button className="command__copy" type="button" onClick={copy} aria-label="Copy command">
+      <button
+        className="command__copy"
+        type="button"
+        onClick={copy}
+        aria-label={`Copy ${label ? `${label} ` : ""}command`}
+      >
         {copied ? (
           <>
             <CheckIcon />

@@ -9,17 +9,31 @@ Own the migration end to end. Measure the checkout first, resume from the first 
 state, and return one compact handoff. Do not make the operator shuttle prompts or reconstruct
 provider state.
 
+## Resolve the target
+
+Resolve the target repository before running the checkpoint.
+
+- An explicit repository path in the request is the target.
+- Without an explicit path, use the current checkout only when the skill is installed in that
+  consumer repository.
+- When invoked from a RepoCharter source distribution, do not treat the distribution checkout as
+  the migration target. If the request does not name a target, ask for its path before writing.
+
+Resolve the target to its absolute Git toplevel and use that exact path for every command until a
+standalone route replaces it. Use the workflow under `kit/skills/migrate-repocharter/` when running
+from a RepoCharter distribution; use `.agents/skills/migrate-repocharter/` when running an installed
+consumer's own copy.
+
 ## Start or resume
 
 Run the checkpoint from this skill before choosing an action:
 
 ```sh
-python3 .agents/skills/migrate-repocharter/scripts/checkpoint.py --repo . --effective
+python3 <workflow-path>/scripts/checkpoint.py --repo <target-repo> --effective
 ```
 
-If this skill is being run from the RepoCharter source tree rather than an installed consumer,
-use its path under `kit/skills/migrate-repocharter/scripts/` instead. Treat the JSON-compatible
-checkpoint as current truth; do not infer state from an earlier transcript.
+Treat the JSON-compatible checkpoint as current truth; do not infer state from an earlier
+transcript.
 
 Follow its route:
 
@@ -27,8 +41,8 @@ Follow its route:
 - `standalone-clone`: create an independent normal clone with the mode named by the checkpoint:
 
   ```sh
-  python3 .agents/skills/migrate-repocharter/scripts/prepare_standalone.py \
-    --repo . --dest <private-absolute-path> --mode <checkpoint-mode>
+  python3 <workflow-path>/scripts/prepare_standalone.py \
+    --repo <target-repo> --dest <private-absolute-path> --mode <checkpoint-mode>
   ```
 
   `clean-head` leaves unrelated staged, unstaged, and untracked work only in the untouched source
@@ -41,8 +55,9 @@ Follow its route:
 
 1. Read the repository's own `AGENTS.md`, current project status, plan, relevant decisions, and
    pitfalls. Inspect legacy hooks and policy before changing either.
-2. On a clean starting tree, run the installed RepoCharter `apply`. If unrelated work exists, use
-   the standalone helper in `clean-head` mode; do not stack migration plumbing over it.
+2. On a clean starting tree, run the selected distribution's RepoCharter `apply` against the
+   target. If unrelated work exists, use the standalone helper in `clean-head` mode; do not stack
+   migration plumbing over it.
 3. Scaffold repository policy while legacy gates are still active. Fire every declared fence with
    `agentkit measure`; retire a legacy safety gate only after the replacement is proven no weaker.
 4. Reach the mechanical fixed point: `apply --dry-run` reports zero changes, strict verification

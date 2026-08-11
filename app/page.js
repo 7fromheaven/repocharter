@@ -140,9 +140,21 @@ export default function Home() {
                   <ArrowDown />
                 </a>
               </div>
-              <div className="reveal reveal--5">
-                <CopyCommand command="kit/agentkit census --repo ~/dev/your-repo" />
-                <p className="command-note">Read-only. No dependencies. No files changed.</p>
+              <div className="skill-launcher reveal reveal--5">
+                <p className="skill-launcher__intro">
+                  Clone RepoCharter, open that checkout in your agent, then name the target:
+                </p>
+                <CopyCommand
+                  label="Codex"
+                  command="$migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions."
+                />
+                <CopyCommand
+                  label="Claude"
+                  command="/migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions."
+                />
+                <p className="command-note">
+                  Available before target installation. No global skill setup or prompt shuttling.
+                </p>
               </div>
             </div>
 
@@ -433,13 +445,13 @@ export default function Home() {
           <div className="final-cta__glow" />
           <div className="shell final-cta__inner">
             <LogoMark />
-            <p className="kicker">Start with a read-only baseline</p>
-            <h2>Give your agents one map.</h2>
+            <p className="kicker">Agent-operated migration</p>
+            <h2>Bring a repository under one charter.</h2>
             <p>
-              See what loads today before RepoCharter changes a file. Then preview the mechanical
-              layer and adopt it on your terms.
+              Clone RepoCharter, open the checkout in Codex or Claude Code, and invoke the bundled
+              migration skill. It measures first, owns the upgrade, and stops before external
+              actions.
             </p>
-            <CopyCommand command="kit/agentkit census --repo ~/dev/your-repo" compact />
             <div className="final-cta__actions">
               <a className="button button--primary" href={githubUrl} target="_blank" rel="noreferrer">
                 Get RepoCharter on GitHub <ArrowUpRight />

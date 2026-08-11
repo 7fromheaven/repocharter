@@ -396,6 +396,16 @@ svg {
   font-size: 13px;
 }
 
+.command__prompt--label {
+  min-width: 68px;
+  color: var(--blue-bright);
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 760;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
 .command code {
   min-width: 0;
   padding: 0 12px 0 9px;
@@ -443,6 +453,25 @@ svg {
   color: #69788d;
   font-size: 11px;
   letter-spacing: 0.01em;
+}
+
+.skill-launcher {
+  display: grid;
+  gap: 8px;
+}
+
+.skill-launcher__intro {
+  margin: 0 0 2px 3px;
+  color: #8492a6;
+  font-size: 11px;
+}
+
+.skill-launcher .command {
+  width: min(100%, 590px);
+}
+
+.skill-launcher .command-note {
+  margin-top: 0;
 }
 
 .context-map {
