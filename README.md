@@ -19,7 +19,7 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.3.7** · CLI: `kit/agentkit`
+> Current version: **RepoCharter 0.3.8** · CLI: `kit/agentkit`
 >
 > **374 tests** · **zero runtime dependencies**
 
