@@ -82,8 +82,8 @@ authoritative project state.
 
 | Harness | Shared context | Safety integration | Enforcement status |
 |---|---|---|---|
-| **Codex** | Native `AGENTS.md` and `.agents/skills/` discovery | Project hooks for Bash, `apply_patch`, MCP, and post-write measurement | Eligible for **verified enforcement** after exact-hook trust and live deny/allow proof |
-| **Claude Code** | `CLAUDE.md` and skill symlinks reach the same canonical files | Hooks for Bash, writes, MCP, config changes, and post-write measurement | Eligible for **verified enforcement** after live deny/allow proof in the checkout |
+| **Codex** | Native `AGENTS.md` and `.agents/skills/` discovery | Project hooks for Bash, `apply_patch`, MCP, and post-write measurement | **Checkout-verified enforcement** — exact-hook trust and live deny/allow proof required per checkout |
+| **Claude Code** | `CLAUDE.md` and skill symlinks reach the same canonical files | Hooks for Bash, writes, MCP, config changes, and post-write measurement | **Checkout-verified enforcement** — live deny/allow proof required per checkout |
 | **OpenCode** | Native `AGENTS.md` and `.agents/skills/` discovery | No RepoCharter tool-call adapter yet; pre-commit verification still applies | **Advisory** |
 | **Hermes Agent** | Native `AGENTS.md`; canonical skills require an external-directory setting | No RepoCharter tool-call adapter yet; pre-commit verification still applies | **Advisory** |
 | **ZCode** | Native `AGENTS.md`; project skill imported as a symlink | No live-tested safety adapter yet | **Advisory** |
