@@ -40,13 +40,17 @@ set -euo pipefail
 PAYLOAD=$(cat)
 AGENTKIT_HARNESS="${AGENTKIT_HARNESS:-claude-code}"
 case "$AGENTKIT_HARNESS" in
-  claude-code|codex) ;;
+  claude-code|codex|cursor) ;;
   *)
     printf '%s\n' "RepoCharter safety gate: unknown AGENTKIT_HARNESS '$AGENTKIT_HARNESS'; refusing." >&2
     exit 2 ;;
 esac
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-${CODEX_PROJECT_DIR:-}}"
+case "$AGENTKIT_HARNESS" in
+  claude-code) PROJECT_DIR="${CLAUDE_PROJECT_DIR:-${CODEX_PROJECT_DIR:-${CURSOR_PROJECT_DIR:-}}}" ;;
+  codex) PROJECT_DIR="${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-${CURSOR_PROJECT_DIR:-}}}" ;;
+  cursor) PROJECT_DIR="${CURSOR_PROJECT_DIR:-${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}" ;;
+esac
 if [ -z "$PROJECT_DIR" ]; then
   PROJECT_DIR=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 fi
@@ -58,30 +62,47 @@ die_closed() {
 
 # ── Payload parsing + JSON emission, via whichever tool exists ────────────────────────
 if command -v jq >/dev/null 2>&1; then
-  CMD=$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.command // ""' 2>/dev/null) ||
+  CMD=$(printf '%s' "$PAYLOAD" | jq -r '.command // .tool_input.command // ""' 2>/dev/null) ||
     die_closed "the hook payload could not be parsed as JSON."
   PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | jq -r '.permission_mode // ""' 2>/dev/null) ||
     die_closed "the hook permission mode could not be parsed as JSON."
   decide() {
-    jq -nc --arg d "$1" --arg r "$2" \
-      '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,permissionDecisionReason:$r}}'
+    if [ "$AGENTKIT_HARNESS" = "cursor" ]; then
+      jq -nc --arg d "$1" --arg r "$2" \
+        'if $d == "allow" then {permission:$d} else {permission:$d,user_message:$r,agent_message:$r} end'
+    else
+      jq -nc --arg d "$1" --arg r "$2" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,permissionDecisionReason:$r}}'
+    fi
   }
   context() {
-    jq -nc --arg c "$1" \
-      '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$c}}'
+    if [ "$AGENTKIT_HARNESS" = "cursor" ]; then
+      jq -nc --arg c "$1" '{permission:"allow",agent_message:$c}'
+    else
+      jq -nc --arg c "$1" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$c}}'
+    fi
   }
 elif command -v python3 >/dev/null 2>&1; then
   CMD=$(printf '%s' "$PAYLOAD" | python3 -c \
-    'import json,sys;sys.stdout.write(str(json.load(sys.stdin).get("tool_input",{}).get("command","")))' 2>/dev/null) ||
+    'import json,sys; p=json.load(sys.stdin); t=p.get("tool_input"); sys.stdout.write(str(p.get("command") or (t.get("command","") if isinstance(t,dict) else "")))' 2>/dev/null) ||
     die_closed "the hook payload could not be parsed as JSON."
   PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | python3 -c \
     'import json,sys;sys.stdout.write(str(json.load(sys.stdin).get("permission_mode", "")))' 2>/dev/null) ||
     die_closed "the hook permission mode could not be parsed as JSON."
   decide() {
-    python3 -c 'import json,sys;print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":sys.argv[1],"permissionDecisionReason":sys.argv[2]}}))' "$1" "$2"
+    if [ "$AGENTKIT_HARNESS" = "cursor" ]; then
+      python3 -c 'import json,sys; d=sys.argv[1]; print(json.dumps({"permission":d} if d == "allow" else {"permission":d,"user_message":sys.argv[2],"agent_message":sys.argv[2]}))' "$1" "$2"
+    else
+      python3 -c 'import json,sys;print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":sys.argv[1],"permissionDecisionReason":sys.argv[2]}}))' "$1" "$2"
+    fi
   }
   context() {
-    python3 -c 'import json,sys;print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":sys.argv[1]}}))' "$1"
+    if [ "$AGENTKIT_HARNESS" = "cursor" ]; then
+      python3 -c 'import json,sys;print(json.dumps({"permission":"allow","agent_message":sys.argv[1]}))' "$1"
+    else
+      python3 -c 'import json,sys;print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":sys.argv[1]}}))' "$1"
+    fi
   }
 else
   die_closed "neither jq nor python3 is available."
@@ -552,5 +573,8 @@ if echo "$CMD_MATCH" | grep -qE "${GIT}${GIT_MUTATIVE}|${CSEP}(rm +|mv +)"; then
   exit 0
 fi
 
-# No match -> allow (no output = no action, per the hook spec).
+# No match -> allow. Cursor requires an explicit decision; the other providers treat silence as allow.
+if [ "$AGENTKIT_HARNESS" = "cursor" ]; then
+  decide allow ""
+fi
 exit 0

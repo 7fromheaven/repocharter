@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 `kit/repocharter` is the canonical executable. `kit/agentkit` remains a silent compatibility
 wrapper so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 413 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 467 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -15,7 +15,7 @@ legacy layouts; they are not required for normal adoption.
 
 For an agent-owned adoption, upgrade, provider promotion, or integration, use
 `kit/skills/migrate-repocharter/SKILL.md`. The public distribution exposes that one bundled body as
-`$migrate-repocharter` in Codex and `/migrate-repocharter` in Claude Code before target installation;
+`$migrate-repocharter` in Codex and `/migrate-repocharter` in Claude Code or Cursor before target installation;
 name the target repository in the invocation. `apply` installs the same workflow through the
 existing project-skills adapter. Its checkpoint distinguishes current evidence, proven stale
 evidence, deterministic provider recovery, and an unavailable provider runtime, so a branch switch
@@ -39,6 +39,7 @@ conforming repo reports `0 change(s)`.
 - `.claude/settings.json` — the managed `hooks`, `permissions.deny`, and declared auto-memory
   state; every other key, including your allow-list, is preserved untouched
 - `.codex/hooks.json` — current project-hook schema, merged with foreign hook groups and keys
+- `.cursor/hooks.json` — Cursor project hooks, merged with foreign hook entries and keys
 - `.claude/skills/<name>` — relative symlinks into `.agents/skills/`
 - `.agnix.toml` — linter config with severities raised on the six rules that matter
 - `CLAUDE.md` — a relative symlink to `AGENTS.md`, **only if absent**
@@ -90,6 +91,8 @@ kit/repocharter self-test --repo ~/dev/foo --promote-codex
 kit/repocharter verify --repo ~/dev/foo --effective
 # Under Claude Code: restart, establish interactive workspace trust, then:
 kit/repocharter self-test --repo ~/dev/foo --promote-claude
+# Under Cursor Agent/CLI: review and trust the exact workspace, then:
+kit/repocharter self-test --repo ~/dev/foo --promote-cursor
 ```
 
 ### Only when replacing a supported legacy system
@@ -225,6 +228,21 @@ sessions emitted no watcher event after authorized Write, Bash, or external sett
 guard is fired directly in a throwaway fixture against the provider-shaped source/path payload and
 the exact five handler mappings. Effective settings are inspected separately for disarm switches.
 
+For Cursor Agent/CLI, `--promote-cursor` first requires the exact checkout's persisted Cursor
+workspace-trust marker. It then drives the real CLI in a disposable repository and proves Shell,
+Write/Delete, and MCP in both directions, including the allowed write's post-write measurement. The
+MCP stream includes a schema-discovery tool start before the effectful `mcpToolCall`; promotion counts
+exactly one effectful call and rejects unrelated tool families. A final ordinary target-checkout
+turn must load that checkout's trusted `.cursor/hooks.json` and deny the hooks-bypass signature.
+
+Cursor prevention events set `failClosed: true`. Shell uses `beforeShellExecution`, which can hand
+an `ask` to Cursor's native confirmation UI. Write/Delete use `preToolUse`. MCP uses local
+`beforeMCPExecution` because it exposes the server identity needed to reconstruct the canonical
+`mcp__server__tool` policy name; generic MCP `preToolUse` does not. Cursor Cloud does not expose
+`beforeMCPExecution`, and Cursor Tab has a separate hook surface, so neither is included in the
+verified local Agent/CLI claim. The adapter is model-neutral; no named Grok proof was scored for
+0.5.0 because the measured Free plan accepted only Auto turns.
+
 `verify` re-derives each recorded adapter hash and re-reads the installed provider version. When a
 provider CLI is present, it also requires an exact checkout-local record under the worktree's
 absolute Git directory. A clone, sibling worktree, edited gate, upgraded CLI, or changed RepoCharter
@@ -232,28 +250,30 @@ version therefore cannot inherit yesterday's machine claim. Provider-neutral CI 
 still performs portable byte checks and reports the unavailable provider check as a note.
 
 An explicit promotion request reuses current checkout evidence when all of those bindings still
-match, Claude workspace trust/effective settings remain valid, and Codex reports the exact trusted
-hook source. Otherwise it runs the live provider probes and fails closed. This makes integration of
+match, Claude workspace trust/effective settings remain valid, Codex reports the exact trusted
+hook source, and Cursor retains exact-workspace trust. Otherwise it runs the live provider probes and fails closed. This makes integration of
 an unchanged migration commit cheap without making tracked `blocking` text self-certifying.
 
 ## The gates
 
-| Policy surface | Claude Code | Codex | Enforces |
-|---|---|---|---|
-| Shell | `Bash` | `Bash` | force-push, checks-bypass, `core.hooksPath` override, destructive git, recursive rm, repo policy |
-| Writes | `Edit\|Write\|NotebookEdit` | `apply_patch` | `denyWritePaths`; Codex parses every path in a multi-file patch |
-| MCP | `mcp__.*` | `mcp__.*` | `denyMcpTools`, narrowable by argument |
-| Post-write | `Edit\|Write` | `apply_patch` | takes the after-measurement and reports the delta |
-| Config | `ConfigChange` | write guard on `.codex/hooks.json` and `.codex/config.toml` | refuses a settings reload that sets `disableAllHooks`, changes any exact kit handler mapping, or empties a declared `permissions.deny` |
+| Policy surface | Claude Code | Codex | Cursor Agent/CLI | Enforces |
+|---|---|---|---|---|
+| Shell | `Bash` | `Bash` | `beforeShellExecution` | force-push, checks-bypass, `core.hooksPath` override, destructive git, recursive rm, repo policy |
+| Writes | `Edit\|Write\|NotebookEdit` | `apply_patch` | `preToolUse` `Write\|Delete` | `denyWritePaths`; Codex parses every path in a multi-file patch |
+| MCP | `mcp__.*` | `mcp__.*` | local `beforeMCPExecution` | `denyMcpTools`, narrowable by argument |
+| Post-write | `Edit\|Write` | `apply_patch` | `postToolUse` `Write\|Delete` | takes the after-measurement and reports the delta |
+| Config | `ConfigChange` | write guard on `.codex/hooks.json` and `.codex/config.toml` | write guard on `.cursor/hooks.json` | refuses provider-specific disarm paths |
 
 Codex does not support an interactive `ask` decision in `PreToolUse`. In an approval-capable turn,
 the adapter labels the call as confirmation-required and hands it to Codex's native permission
 flow; with approvals disabled, it denies the call. Because `PreToolUse` cannot itself open the
 prompt, the agent must submit confirmation-class calls for native approval. Unconditional `deny`
-rules remain blocking in either mode.
+rules remain blocking in either mode. Cursor's `beforeShellExecution` supports native `ask`
+directly; the release proof observed that confirmation UI before the command ran.
 
 **Everything fails closed.** A gate that cannot parse its input, read its policy, or compile
-a pattern exits 2. Claude Code treats exit 1 as non-blocking and proceeds; exit 2 blocks.
+a pattern exits 2. Claude Code treats exit 1 as non-blocking and proceeds; exit 2 blocks. Cursor's
+security-critical entries also set `failClosed: true`, so a broken handler cannot silently allow.
 The missing-parser path is covered directly by the test suite.
 
 ## Policy lives in one file
@@ -295,7 +315,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-413 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+467 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI

@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _policy import (  # noqa: E402
-    ALLOW, load_policy, path_matches, read_payload, script_lengths, write_paths,
+    ALLOW, harness, load_policy, path_matches, read_payload, script_lengths, write_paths,
 )
 
 STASH = Path(tempfile.gettempdir()) / "agentkit-measure"
@@ -82,15 +82,21 @@ def main() -> None:
             lines.append(f"{Path(file_path).name}: {describe_delta(before, after)}")
 
     if lines:
-        print(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": (
-                    "[RepoCharter measurement — AFTER] " + " | ".join(lines) +
-                    " . Report these numbers with the change and review unexpected deltas."
-                ),
-            }
-        }))
+        context = (
+            "[RepoCharter measurement — AFTER] " + " | ".join(lines) +
+            " . Report these numbers with the change and review unexpected deltas."
+        )
+        if harness() == "cursor":
+            print(json.dumps({"additional_context": context}))
+        else:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": context,
+                }
+            }))
+    elif harness() == "cursor":
+        print("{}")
     sys.exit(ALLOW)
 
 

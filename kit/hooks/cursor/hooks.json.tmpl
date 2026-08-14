@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "AGENTKIT_HARNESS=cursor \"${CURSOR_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-bash.sh\"",
+        "failClosed": true
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "AGENTKIT_HARNESS=cursor \"${CURSOR_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-write.py\"",
+        "matcher": "Write|Delete",
+        "failClosed": true
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "AGENTKIT_HARNESS=cursor \"${CURSOR_PROJECT_DIR}/.claude/hooks/agentkit/posttooluse-write.py\"",
+        "matcher": "Write|Delete"
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "AGENTKIT_HARNESS=cursor \"${CURSOR_PROJECT_DIR}/.claude/hooks/agentkit/pretooluse-mcp.py\"",
+        "failClosed": true
+      }
+    ]
+  }
+}

@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -78,6 +79,21 @@ CLAUDE_ADAPTER_FILES = (
     ".claude/hooks/agentkit/posttooluse-write.py",
     ".claude/hooks/agentkit/pretooluse-mcp.py",
     ".claude/hooks/agentkit/configchange-guard.py",
+)
+CURSOR_ADAPTER_FILES = (
+    ".cursor/hooks.json",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+)
+
+CURSOR_HOOK_WIRING = (
+    ("beforeShellExecution", None, "pretooluse-bash.sh", True),
+    ("preToolUse", "Write|Delete", "pretooluse-write.py", True),
+    ("postToolUse", "Write|Delete", "posttooluse-write.py", False),
+    ("beforeMCPExecution", None, "pretooluse-mcp.py", True),
 )
 
 # (event, matcher, script) triples `repocharter apply` installs into .claude/settings.json.
@@ -288,6 +304,33 @@ def codex_adapter_digest(root: Path) -> str | None:
 
 def claude_adapter_digest(root: Path) -> str | None:
     return adapter_digest(root, CLAUDE_ADAPTER_FILES)
+
+
+def cursor_adapter_digest(root: Path) -> str | None:
+    return adapter_digest(root, CURSOR_ADAPTER_FILES)
+
+
+def cursor_executable() -> str | None:
+    return shutil.which("cursor-agent") or shutil.which("agent")
+
+
+def cursor_data_dir() -> Path:
+    raw = os.environ.get("CURSOR_DATA_DIR")
+    return Path(raw).expanduser() if raw else Path.home() / ".cursor"
+
+
+def cursor_project_state_dir(root: Path) -> Path:
+    slug = re.sub(r"-+", "-", re.sub(r"[^A-Za-z0-9]", "-", str(root.resolve()))).strip("-")
+    return cursor_data_dir() / "projects" / slug
+
+
+def cursor_trust_marker(root: Path) -> Path:
+    return cursor_project_state_dir(root) / ".workspace-trusted"
+
+
+def cursor_trust_is_exact(root: Path) -> bool:
+    marker = read_json(cursor_trust_marker(root))
+    return isinstance(marker, dict) and marker.get("workspacePath") == str(root.resolve())
 
 
 def checkout_git_dir(root: Path) -> Path | None:
@@ -565,12 +608,18 @@ def check_declaration(root: Path, compat: dict, rep: Report) -> None:
         declared_reach.add((str(harness_name), source if isinstance(source, str) else None))
 
         if kind == "native":
-            if harness_name == "codex":
+            if harness_name in {"codex", "cursor"}:
                 canonical = compat.get("canonical") or {}
                 if canonical.get("instructions") != "AGENTS.md":
-                    rep.error("Codex native adapter requires canonical.instructions = AGENTS.md")
+                    rep.error(
+                        f"{harness_name} native adapter requires "
+                        "canonical.instructions = AGENTS.md"
+                    )
                 if canonical.get("skills") != ".agents/skills":
-                    rep.error("Codex native adapter requires canonical.skills = .agents/skills")
+                    rep.error(
+                        f"{harness_name} native adapter requires "
+                        "canonical.skills = .agents/skills"
+                    )
             continue
 
         if kind == "manual-import":
@@ -631,6 +680,8 @@ def check_declaration(root: Path, compat: dict, rep: Report) -> None:
             rep.error(f"compatibility.json lacks a Claude adapter for {shim}")
         if ("claude-code", ".claude/skills/<name>") not in declared_reach:
             rep.error("compatibility.json lacks the Claude project-skills symlink adapter")
+    if _version_at_least(compat, (0, 5, 0)) and ("cursor", None) not in declared_reach:
+        rep.error("compatibility.json lacks the Cursor native adapter declaration")
 
     for exc in compat.get("exceptions") or []:
         rep.note(f"declared exception: {exc.get('rule')} — {exc.get('reason')} (approved {exc.get('approvedBy')}, {exc.get('date')})")
@@ -747,6 +798,139 @@ def check_codex_hooks(root: Path, compat: dict, rep: Report) -> None:
             "Codex project hooks are blocking only after the workspace and current hook hash "
             "are trusted on this machine; inspect or approve them with `/hooks`."
         )
+
+
+def check_cursor_hooks(root: Path, compat: dict, rep: Report) -> None:
+    """Assert Cursor's exact project wiring and invalidate stale blocking evidence."""
+    path = root / ".cursor" / "hooks.json"
+    enforcement = (compat.get("enforcement") or {}).get("cursor", "none")
+    native_declared = any(
+        isinstance(adapter, dict)
+        and adapter.get("harness") == "cursor"
+        and adapter.get("kind") == "native"
+        for adapter in (compat.get("adapters") or [])
+    )
+    required = _version_at_least(compat, (0, 5, 0)) and (
+        native_declared or enforcement != "none"
+    )
+    if not path.exists():
+        if required:
+            rep.error(
+                ".cursor/hooks.json is missing; run `repocharter apply` to install the "
+                "Cursor adapter"
+            )
+        return
+
+    config = read_json(path)
+    if not isinstance(config, dict):
+        rep.error(".cursor/hooks.json is not valid object-valued JSON")
+        return
+    if config.get("version") != 1:
+        rep.error(".cursor/hooks.json must declare version 1")
+    hooks = config.get("hooks")
+    if not isinstance(hooks, dict):
+        rep.error(".cursor/hooks.json has no object-valued `hooks` block")
+        return
+
+    hook_dir = root / ".claude" / "hooks" / "agentkit"
+    for event, matcher, script, must_fail_closed in CURSOR_HOOK_WIRING:
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            rep.error(f".cursor/hooks.json lacks hooks.{event}")
+            continue
+        matching = [
+            entry for entry in entries
+            if isinstance(entry, dict)
+            and (matcher is None or entry.get("matcher") == matcher)
+            and isinstance(entry.get("command"), str)
+            and script in entry["command"]
+        ]
+        if not matching:
+            rep.error(
+                f".cursor/hooks.json {event} matcher {matcher or '(any)'!r} "
+                f"does not invoke {script}"
+            )
+            continue
+        entry = matching[0]
+        command = entry["command"]
+        if "AGENTKIT_HARNESS=cursor" not in command:
+            rep.error(
+                f".cursor/hooks.json command for {script} lacks "
+                "AGENTKIT_HARNESS=cursor"
+            )
+        if "${CURSOR_PROJECT_DIR}/.claude/hooks/agentkit/" not in command:
+            rep.error(
+                f".cursor/hooks.json command for {script} is not rooted through the exact "
+                "Cursor project directory"
+            )
+        if must_fail_closed and entry.get("failClosed") is not True:
+            rep.error(
+                f".cursor/hooks.json {event} entry for {script} is security-critical but "
+                "does not set failClosed: true"
+            )
+        installed = hook_dir / script
+        if not installed.is_file():
+            rep.error(f".cursor/hooks.json references missing installed hook {script}")
+        elif not os.access(installed, os.X_OK):
+            rep.error(f"Cursor hook .claude/hooks/agentkit/{script} is not executable")
+
+    if enforcement != "blocking":
+        return
+
+    evidence = (compat.get("enforcementEvidence") or {}).get("cursor")
+    if not isinstance(evidence, dict):
+        rep.error(
+            "Cursor is declared blocking but has no live enforcementEvidence. Run "
+            "`repocharter self-test --repo . --promote-cursor` with Cursor CLI installed."
+        )
+        return
+    actual_digest = cursor_adapter_digest(root)
+    if actual_digest is None or evidence.get("adapterSha256") != actual_digest:
+        rep.error(
+            "Cursor blocking evidence is stale: installed hook/config bytes changed. "
+            "Re-run `repocharter self-test --repo . --promote-cursor`."
+        )
+
+    executable = cursor_executable()
+    if executable is None:
+        rep.note(
+            "Cursor CLI unavailable here; recorded live evidence could not be version-checked"
+        )
+    else:
+        try:
+            proc = subprocess.run(
+                [executable, "--version"], capture_output=True, text=True, timeout=30
+            )
+        except subprocess.TimeoutExpired:
+            rep.error(
+                "Cursor CLI is installed but `--version` timed out; blocking evidence "
+                "cannot be checked"
+            )
+        else:
+            version = proc.stdout.strip()
+            if proc.returncode != 0 or not version:
+                rep.error(
+                    "Cursor CLI is installed but its version could not be read; blocking "
+                    "evidence cannot be checked"
+                )
+            elif version != evidence.get("harnessVersion"):
+                rep.error(
+                    f"Cursor blocking evidence was measured on "
+                    f"{evidence.get('harnessVersion')!r}, but this machine runs {version!r}. "
+                    "Re-run the live self-test."
+                )
+            else:
+                check_checkout_evidence(root, "cursor", evidence, compat, rep)
+                if not cursor_trust_is_exact(root):
+                    rep.error(
+                        "Cursor is declared blocking but this exact checkout has no persisted "
+                        "workspace trust. Open Cursor or run Cursor CLI here, review the project, "
+                        "trust this path, then rerun the live self-test."
+                    )
+    rep.note(
+        "Cursor evidence covers local Agent/CLI Shell, Write/Delete, and MCP calls. Cursor "
+        "Tab and Cloud MCP are separate surfaces and are not claimed by this adapter."
+    )
 
 
 def check_claude_hooks(root: Path, compat: dict, rep: Report) -> None:
@@ -1308,6 +1492,7 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
     check_skills(root, compat, rep)
     check_dead_references(root, rep)
     check_codex_hooks(root, compat, rep)
+    check_cursor_hooks(root, compat, rep)
     check_claude_hooks(root, compat, rep)
     check_precommit(root, rep)
     check_codex_config(root, rep)

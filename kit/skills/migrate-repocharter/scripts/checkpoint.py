@@ -122,7 +122,18 @@ def checkpoint(repo: Path, effective: bool) -> dict:
 
     providers = {}
     if operating_agentkit is not None:
-        for harness in ("codex", "claude-code"):
+        harnesses = ["codex", "claude-code"]
+        cursor_installed = (
+            hasattr(operating_agentkit, "cursor_executable")
+            and operating_agentkit.cursor_executable() is not None
+        )
+        cursor_claimed = (
+            (compat.get("enforcement") or {}).get("cursor") == "blocking"
+            or isinstance((compat.get("enforcementEvidence") or {}).get("cursor"), dict)
+        )
+        if cursor_installed or cursor_claimed:
+            harnesses.append("cursor")
+        for harness in harnesses:
             providers[harness] = provider_state(
                 repo, harness, compat, operating_agentkit,
             )
