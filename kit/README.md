@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 `kit/repocharter` is the canonical executable. `kit/agentkit` remains a silent compatibility
 wrapper so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 396 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 413 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -17,10 +17,13 @@ For an agent-owned adoption, upgrade, provider promotion, or integration, use
 `kit/skills/migrate-repocharter/SKILL.md`. The public distribution exposes that one bundled body as
 `$migrate-repocharter` in Codex and `/migrate-repocharter` in Claude Code before target installation;
 name the target repository in the invocation. `apply` installs the same workflow through the
-existing project-skills adapter. Its checkpoint distinguishes current evidence from stale evidence,
-so a branch switch or documentation-only commit does not rerun the full provider matrix. If Codex
-silently substitutes the primary checkout's hooks for a linked worktree, the workflow preserves the
-current state in an independent normal clone instead of bypassing hook trust.
+existing project-skills adapter. Its checkpoint distinguishes current evidence, proven stale
+evidence, deterministic provider recovery, and an unavailable provider runtime, so a branch switch
+or documentation-only commit does not rerun the full provider matrix and a failed `hooks/list`
+query is not mislabeled as a promotion. When Codex state is inaccessible, the checkpoint stops with
+`provider-access-blocked` and preserves the underlying diagnostic. Missing or wrong-checkout
+discovery is `provider-recovery-required`; in a linked worktree, the workflow preserves the current
+state in an independent normal clone instead of bypassing hook trust.
 
 ## Install into a repository
 
@@ -188,6 +191,18 @@ from another checkout fails before live probes. Codex 0.147 currently resolves l
 project hooks from the primary checkout; after one exact persisted-trust retry reproduces that
 result, continue from an independent clone with a normal `.git/` directory.
 
+An unavailable Codex executable, a failed `hooks/list` subprocess, or an unreadable/unwritable
+Codex state directory (normally `~/.codex`) is a provider-access blocker, not proof that promotion
+is required. The checkpoint retains the provider's diagnostic and must be rerun with provider-state
+access before any promotion decision. The same classification applies in normal checkouts, linked
+worktrees, and the normal checkout produced by standalone recovery.
+
+A successful query that returns no project hooks or resolves another checkout is a deterministic
+provider-recovery condition, also not promotion evidence. Linked worktrees keep the standalone
+recovery route. Only independently proved drift—such as missing evidence, changed adapter bytes,
+provider-version mismatch, stale checkout attestation, or an exact but untrusted hook—sets
+`promotionRequired`.
+
 When `apply` preserves a foreign Codex hook, promotion derives a conservative closure from its
 command. Static checkout-relative scripts, including the exact
 `$(git rev-parse --show-toplevel)/...` form, are copied into the disposable probe and hashed into
@@ -280,7 +295,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-396 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+413 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI

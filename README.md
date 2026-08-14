@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.4.1** · CLI: `kit/repocharter`
+> Current version: **RepoCharter 0.4.2** · CLI: `kit/repocharter`
 >
-> **396 tests** · **zero runtime dependencies**
+> **413 tests** · **zero runtime dependencies**
 
 `kit/repocharter` is the canonical command. Existing repositories and automation can keep using
 `kit/agentkit`; it is a silent compatibility wrapper around the same implementation, not a second
@@ -127,11 +127,15 @@ form:
 > preserve existing safety gates until their replacements are proved, and stop before push, merge,
 > deploy, publish, or bug submission unless I authorize those separately.
 
-The workflow checkpoints the exact target checkout, resumes interrupted work, detects Codex's
-current linked-worktree hook-discovery defect before promotion, preserves dirty migration state in
-an independent clone when needed, and promotes only stale providers. `apply` installs the same
-workflow in the target for future resumes and upgrades. The manual steps below remain the auditable
-protocol the skill executes; they are not a prompt-shuttling requirement for the operator.
+The workflow checkpoints the exact target checkout, resumes interrupted work, distinguishes an
+unavailable provider runtime and deterministic discovery recovery from proven stale promotion
+state, detects Codex's current linked-worktree hook-discovery defect before promotion, preserves
+dirty migration state in an independent clone when needed, and promotes only stale providers. A
+failed Codex `hooks/list` query stops with its original diagnostic and asks for provider-state
+access (normally read/write access to `~/.codex`) instead of recommending promotion; missing or
+wrong-checkout discovery selects recovery without fabricating promotion drift. `apply` installs the
+same workflow in the target for future resumes and upgrades. The manual steps below remain the
+auditable protocol the skill executes; they are not a prompt-shuttling requirement for the operator.
 
 ### 1. Measure before changing anything
 
@@ -336,7 +340,7 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter is used in production repositories today. Its 396-test suite is intentionally
+RepoCharter is used in production repositories today. Its 413-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -393,7 +397,7 @@ kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         396 tests, no dependencies, mostly negative
+kit/tests/         413 tests, no dependencies, mostly negative
 LICENSE            Apache License 2.0
 NOTICE             contributor and upstream attribution
 ```

@@ -149,9 +149,9 @@ def test_cli_entrypoints(tmp: Path) -> None:
         [sys.executable, str(REPO_CHARTER), "--version"], capture_output=True, text=True)
     compatibility_version = subprocess.run(
         [sys.executable, str(AGENTKIT_COMPAT), "--version"], capture_output=True, text=True)
-    check("the canonical command identifies RepoCharter 0.4.1",
+    check("the canonical command identifies RepoCharter 0.4.2",
           canonical_version.returncode == 0
-          and canonical_version.stdout.strip() == "RepoCharter 0.4.1"
+          and canonical_version.stdout.strip() == "RepoCharter 0.4.2"
           and not canonical_version.stderr,
           canonical_version.stdout + canonical_version.stderr)
     check("the compatibility command has identical version behavior",
@@ -991,8 +991,8 @@ def test_apply(tmp: Path) -> None:
 
     settings = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
     compat = json.loads((repo / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
-    check("the compatibility manifest records RepoCharter 0.4.1",
-          compat["agentkitVersion"] == "0.4.1", str(compat))
+    check("the compatibility manifest records RepoCharter 0.4.2",
+          compat["agentkitVersion"] == "0.4.2", str(compat))
     check("auto memory defaults OFF in compatibility.json", compat["autoMemory"] == "off", str(compat))
     check("apply disables Claude auto memory by default", settings["autoMemoryEnabled"] is False, str(settings))
     matchers = [g.get("matcher") for g in settings["hooks"]["PreToolUse"]]
@@ -1280,6 +1280,11 @@ import sys
 import threading
 import time
 
+mode = os.environ.get("CODEX_HOOK_MODE", "normal")
+if sys.argv[1:] == ["--version"]:
+    print(os.environ.get("CODEX_HOOK_VERSION", "codex-fixture 1"))
+    raise SystemExit
+
 def emit(request_id, result):
     print(json.dumps({"id": request_id, "result": result}), flush=True)
 
@@ -1290,12 +1295,24 @@ def delayed_emit(request_id, result):
 for raw in sys.stdin:
     request = json.loads(raw)
     request_id = request.get("id")
+    if request_id == 1 and mode in {"no-response", "subprocess-failure", "sqlite-error"}:
+        if mode == "subprocess-failure":
+            print("fixture app-server subprocess failed with exit 9", file=sys.stderr)
+            raise SystemExit(9)
+        if mode == "sqlite-error":
+            print("Error: failed to initialize sqlite state runtime under /fixture/.codex",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit
     if request_id == 1:
         result = {"userAgent": "codex-hook-discovery-fixture"}
     elif request_id == 2:
         cwd = request["params"]["cwds"][0]
         source = os.environ.get("CODEX_HOOK_SOURCE", "")
-        mode = os.environ.get("CODEX_HOOK_MODE", "normal")
+        if mode == "exact" and not source:
+            source = cwd + "/.codex/hooks.json"
+        elif mode == "missing":
+            source = ""
         hooks = [] if not source else [{
             "eventName": "PreToolUse",
             "matcher": "Bash",
@@ -1303,7 +1320,8 @@ for raw in sys.stdin:
             "sourcePath": source,
         }]
         if hooks and mode != "missing-trust":
-            hooks[0]["trustStatus"] = os.environ.get("CODEX_HOOK_TRUST", "untrusted")
+            default_trust = "trusted" if mode == "exact" else "untrusted"
+            hooks[0]["trustStatus"] = os.environ.get("CODEX_HOOK_TRUST", default_trust)
         if hooks and mode == "mixed":
             hooks.append({
                 "eventName": "PreToolUse",
@@ -1396,6 +1414,34 @@ def test_codex_hook_discovery(tmp: Path) -> None:
     check("a reported discovery error cannot be hidden by one exact source",
           errored.status == "error" and "fixture parse failure" in " ".join(errored.errors),
           str(errored))
+
+    no_response = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**base_env, "CODEX_HOOK_MODE": "no-response"},
+    )
+    check("a hooks/list process that returns no response stays an explicit discovery error",
+          no_response.status == "error"
+          and "returned no response" in " ".join(no_response.errors),
+          str(no_response))
+
+    subprocess_failure = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**base_env, "CODEX_HOOK_MODE": "subprocess-failure"},
+    )
+    check("an app-server subprocess failure preserves its stderr diagnostic",
+          subprocess_failure.status == "error"
+          and "subprocess exit 9" in " ".join(subprocess_failure.errors)
+          and "subprocess failed with exit 9" in " ".join(subprocess_failure.errors),
+          str(subprocess_failure))
+
+    sqlite_failure = agentkit_mod.codex_hooks_lib.query_discovery(
+        repo, executable=str(stub),
+        env={**base_env, "CODEX_HOOK_MODE": "sqlite-error"},
+    )
+    check("a SQLite state-runtime initialization failure survives hooks/list classification",
+          sqlite_failure.status == "error"
+          and "failed to initialize sqlite state runtime" in " ".join(sqlite_failure.errors),
+          str(sqlite_failure))
 
     mixed = agentkit_mod.codex_hooks_lib.query_discovery(
         repo, executable=str(stub),
@@ -1570,52 +1616,8 @@ def test_migration_workflow(tmp: Path) -> None:
     )
     bin_dir = tmp / "bin"
     bin_dir.mkdir()
-    codex_stub = bin_dir / "codex"
-    codex_stub.write_text(
-        """#!/usr/bin/env python3
-import json
-import os
-import sys
-if sys.argv[1:] == ["--version"]:
-    print("codex-fixture 1")
-    raise SystemExit
-for raw in sys.stdin:
-    request = json.loads(raw)
-    if request.get("id") == 1:
-        result = {"userAgent": "fixture"}
-    else:
-        cwd = request["params"]["cwds"][0]
-        hooks = []
-        if os.environ.get("CODEX_HOOK_MODE") == "exact":
-            hooks = [{"eventName": "PreToolUse", "matcher": "Bash", "source": "project",
-                      "sourcePath": cwd + "/.codex/hooks.json", "trustStatus": "trusted"}]
-        result = {"data": [{"cwd": cwd, "hooks": hooks, "warnings": [], "errors": []}]}
-    print(json.dumps({"id": request.get("id"), "result": result}), flush=True)
-""",
-        encoding="utf-8",
-    )
-    codex_stub.chmod(0o755)
+    _stub_codex_hooks_server(bin_dir / "codex")
     _stub_claude(bin_dir, "claude-fixture 1")
-    checkpoint_script = (
-        linked / ".agents" / "skills" / "migrate-repocharter" / "scripts" / "checkpoint.py"
-    )
-    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", "")}
-    checkpoint = subprocess.run(
-        [sys.executable, str(checkpoint_script), "--repo", str(linked), "--json"],
-        capture_output=True, text=True, timeout=120, env=env,
-    )
-    try:
-        report = json.loads(checkpoint.stdout)
-    except json.JSONDecodeError:
-        report = {}
-    check("the checkpoint fixture starts from a complete apply",
-          installed.returncode == 0 and checkpoint.returncode == 0,
-          installed.stderr[-200:] + checkpoint.stderr[-300:])
-    check("zero Codex hooks in a linked worktree select standalone recovery",
-          report.get("route") == "standalone-clone", str(report)[:600])
-    check("the checkpoint names Codex promotion as still required",
-          report.get("providers", {}).get("codex", {}).get("promotionRequired") is True,
-          str(report)[:600])
 
     compat_path = source / ".agents" / "compatibility.json"
     compat = json.loads(compat_path.read_text(encoding="utf-8"))
@@ -1637,22 +1639,195 @@ for raw in sys.stdin:
         "claude-code": claude_evidence,
     }
     compat_path.write_text(json.dumps(compat, indent=2) + "\n", encoding="utf-8")
-    agentkit_mod.write_checkout_evidence(source, "codex", codex_evidence)
-    agentkit_mod.write_checkout_evidence(source, "claude-code", claude_evidence)
+    (linked / ".agents" / "compatibility.json").write_text(
+        json.dumps(compat, indent=2) + "\n", encoding="utf-8",
+    )
+    for checkout in (source, linked):
+        agentkit_mod.write_checkout_evidence(checkout, "codex", codex_evidence)
+        agentkit_mod.write_checkout_evidence(checkout, "claude-code", claude_evidence)
+    provider_recovery = tmp / "checkpoint-standalone"
+    provider_recovery_proc = subprocess.run(
+        [sys.executable, str(script), "--repo", str(source), "--dest", str(provider_recovery),
+         "--branch", "checkpoint-standalone", "--mode", "preserve-state"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if provider_recovery.is_dir():
+        agentkit_mod.write_checkout_evidence(provider_recovery, "codex", codex_evidence)
+        agentkit_mod.write_checkout_evidence(provider_recovery, "claude-code", claude_evidence)
     claude_config = tmp / "claude-config"
     Path(f"{claude_config}.json").write_text(json.dumps({
-        "projects": {str(source.resolve()): {"hasTrustDialogAccepted": True}}
+        "projects": {
+            str(source.resolve()): {"hasTrustDialogAccepted": True},
+            str(linked.resolve()): {"hasTrustDialogAccepted": True},
+            str(provider_recovery.resolve()): {"hasTrustDialogAccepted": True},
+        }
     }), encoding="utf-8")
+
+    def run_checkpoint(checkout: Path, mode: str, hook_source: Path | None = None,
+                       human: bool = False) -> tuple[subprocess.CompletedProcess, dict]:
+        checkpoint_script = (
+            checkout / ".agents" / "skills" / "migrate-repocharter" / "scripts"
+            / "checkpoint.py"
+        )
+        checkpoint_env = {
+            **os.environ,
+            "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+            "CLAUDE_CONFIG_DIR": str(claude_config),
+            "CODEX_HOOK_MODE": mode,
+            "CODEX_HOOK_TRUST": "trusted",
+        }
+        checkpoint_env.pop("CODEX_HOOK_SOURCE", None)
+        if hook_source is not None:
+            checkpoint_env["CODEX_HOOK_SOURCE"] = str(hook_source)
+        command = [sys.executable, str(checkpoint_script), "--repo", str(checkout)]
+        if not human:
+            command.append("--json")
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=120, env=checkpoint_env,
+        )
+        if human:
+            return proc, {}
+        try:
+            return proc, json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return proc, {}
+
+    normal_exact_proc, normal_exact = run_checkpoint(source, "exact")
+    linked_exact_proc, linked_exact = run_checkpoint(linked, "exact")
+    linked_missing_proc, linked_missing = run_checkpoint(linked, "missing")
+    linked_missing_human, _ = run_checkpoint(linked, "missing", human=True)
+    linked_wrong_proc, linked_wrong = run_checkpoint(
+        linked, "normal", source / ".codex" / "hooks.json",
+    )
+    normal_error_proc, normal_error = run_checkpoint(source, "sqlite-error")
+    no_response_proc, no_response_error = run_checkpoint(source, "no-response")
+    subprocess_failure_proc, subprocess_failure_error = run_checkpoint(
+        source, "subprocess-failure",
+    )
+    linked_error_proc, linked_error = run_checkpoint(linked, "sqlite-error")
+    recovery_error_proc, recovery_error = run_checkpoint(provider_recovery, "sqlite-error")
+    normal_error_human, _ = run_checkpoint(source, "sqlite-error", human=True)
+
+    section("migration skill — provider discovery checkpoint routing")
+    checkpoint_processes = (
+        normal_exact_proc, linked_exact_proc, linked_missing_proc, linked_wrong_proc,
+        linked_missing_human, normal_error_proc, no_response_proc, subprocess_failure_proc,
+        linked_error_proc, recovery_error_proc, normal_error_human,
+    )
+    check("the checkpoint matrix starts from a complete apply and returns readable reports",
+          installed.returncode == 0 and provider_recovery_proc.returncode == 0
+          and all(proc.returncode == 0 for proc in checkpoint_processes)
+          and all(report for report in (
+              normal_exact, linked_exact, linked_missing, linked_wrong,
+              normal_error, no_response_error, subprocess_failure_error,
+              linked_error, recovery_error,
+          )),
+          installed.stderr[-200:] + provider_recovery_proc.stderr[-300:]
+          + normal_error_proc.stderr[-300:])
+    check("exact discovery stays in-place in a normal checkout",
+          normal_exact.get("route") == "in-place"
+          and normal_exact.get("providers", {}).get("codex", {}).get("current") is True,
+          str(normal_exact)[:800])
+    check("exact discovery stays in-place in a linked worktree fixture",
+          linked_exact.get("route") == "in-place"
+          and linked_exact.get("providers", {}).get("codex", {}).get("current") is True,
+          str(linked_exact)[:800])
+    check("missing linked-worktree discovery selects standalone recovery",
+          linked_missing.get("route") == "standalone-clone"
+          and linked_missing.get("providers", {}).get("codex", {})
+              .get("providerRecoveryRequired") is True
+          and linked_missing.get("providers", {}).get("codex", {})
+              .get("promotionRequired") is False
+          and "provider recovery required; promotion not established"
+              in linked_missing_human.stdout,
+          str(linked_missing)[:800] + linked_missing_human.stdout[-500:])
+    check("wrong-checkout discovery selects standalone recovery",
+          linked_wrong.get("route") == "standalone-clone"
+          and linked_wrong.get("providers", {}).get("codex", {}).get("discovery", {})
+              .get("status") == "wrong-checkout"
+          and linked_wrong.get("providers", {}).get("codex", {})
+              .get("providerRecoveryRequired") is True
+          and linked_wrong.get("providers", {}).get("codex", {})
+              .get("promotionRequired") is False,
+          str(linked_wrong)[:800])
+    check("linked discovery recovery preserves prepared state",
+          linked_missing.get("standaloneMode") == "preserve-state"
+          and linked_wrong.get("standaloneMode") == "preserve-state",
+          f"missing={linked_missing} wrong={linked_wrong}")
+    check("a normal-checkout runtime error selects provider-access recovery",
+          normal_error.get("route") == "provider-access-blocked"
+          and normal_error.get("standaloneMode") is None,
+          str(normal_error)[:900])
+    check("a no-response hooks/list failure uses provider-access recovery",
+          no_response_error.get("route") == "provider-access-blocked"
+          and no_response_error.get("providers", {}).get("codex", {})
+              .get("promotionRequired") is False
+          and "returned no response" in " ".join(
+              no_response_error.get("providers", {}).get("codex", {})
+                  .get("providerDiagnostics") or []
+          ),
+          str(no_response_error)[:900])
+    check("a failed hooks/list subprocess uses provider-access recovery",
+          subprocess_failure_error.get("route") == "provider-access-blocked"
+          and subprocess_failure_error.get("providers", {}).get("codex", {})
+              .get("promotionRequired") is False
+          and "subprocess exit 9" in " ".join(
+              subprocess_failure_error.get("providers", {}).get("codex", {})
+                  .get("providerDiagnostics") or []
+          ),
+          str(subprocess_failure_error)[:900])
+    check("a linked-worktree runtime error uses the same provider-access classification",
+          linked_error.get("route") == "provider-access-blocked"
+          and linked_error.get("standaloneMode") is None,
+          str(linked_error)[:900])
+    check("provider access remains blocked after standalone-clone recovery",
+          recovery_error.get("checkout", {}).get("shape") == "normal"
+          and recovery_error.get("route") == "provider-access-blocked"
+          and recovery_error.get("standaloneMode") is None,
+          str(recovery_error)[:900])
+    normal_error_codex = normal_error.get("providers", {}).get("codex", {})
+    linked_error_codex = linked_error.get("providers", {}).get("codex", {})
+    check("indeterminate discovery does not fabricate a promotion requirement",
+          normal_error_codex.get("status") == "provider-access-blocked"
+          and normal_error_codex.get("providerAccessBlocked") is True
+          and normal_error_codex.get("promotionRequired") is False
+          and linked_error_codex.get("promotionRequired") is False,
+          f"normal={normal_error_codex} linked={linked_error_codex}")
+    check("the SQLite failure diagnostic survives the checkpoint unchanged",
+          "failed to initialize sqlite state runtime" in
+              " ".join(normal_error_codex.get("providerDiagnostics") or [])
+          and normal_error.get("blockedProviders") == ["codex"],
+          str(normal_error_codex))
+    check("machine-readable recovery requires state access and forbids promotion",
+          "~/.codex" in (normal_error.get("nextAction") or "")
+          and "do not promote" in (normal_error.get("nextAction") or "").lower(),
+          str(normal_error)[:1000])
+    check("human recovery names provider access without calling it promotion required",
+          "provider access blocked; promotion not established" in normal_error_human.stdout
+          and "~/.codex" in normal_error_human.stdout
+          and "do not promote" in normal_error_human.stdout.lower()
+          and "codex        promotion required" not in normal_error_human.stdout.lower(),
+          normal_error_human.stdout[-1200:])
 
     previous_path = os.environ.get("PATH")
     previous_claude_config = os.environ.get("CLAUDE_CONFIG_DIR")
     previous_hook_mode = os.environ.get("CODEX_HOOK_MODE")
+    previous_hook_source = os.environ.get("CODEX_HOOK_SOURCE")
+    previous_hook_trust = os.environ.get("CODEX_HOOK_TRUST")
     os.environ["PATH"] = str(bin_dir) + os.pathsep + (previous_path or "")
     os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config)
     os.environ["CODEX_HOOK_MODE"] = "exact"
+    os.environ.pop("CODEX_HOOK_SOURCE", None)
+    os.environ["CODEX_HOOK_TRUST"] = "trusted"
     try:
         codex_state = agentkit_mod.provider_promotion_state(source, "codex", compat)
         claude_state = agentkit_mod.provider_promotion_state(source, "claude-code", compat)
+        os.environ["CODEX_HOOK_MODE"] = "sqlite-error"
+        sqlite_blocked_state = agentkit_mod.provider_promotion_state(source, "codex", compat)
+        os.environ["CODEX_HOOK_MODE"] = "exact"
+        os.environ["PATH"] = os.defpath
+        unavailable_state = agentkit_mod.provider_promotion_state(source, "codex", compat)
+        os.environ["PATH"] = str(bin_dir) + os.pathsep + (previous_path or "")
         (source / "docs-note.md").write_text("documentation only\n", encoding="utf-8")
         docs_only_state = agentkit_mod.provider_promotion_state(source, "codex", compat)
 
@@ -1717,12 +1892,33 @@ for raw in sys.stdin:
             os.environ.pop("CODEX_HOOK_MODE", None)
         else:
             os.environ["CODEX_HOOK_MODE"] = previous_hook_mode
+        if previous_hook_source is None:
+            os.environ.pop("CODEX_HOOK_SOURCE", None)
+        else:
+            os.environ["CODEX_HOOK_SOURCE"] = previous_hook_source
+        if previous_hook_trust is None:
+            os.environ.pop("CODEX_HOOK_TRUST", None)
+        else:
+            os.environ["CODEX_HOOK_TRUST"] = previous_hook_trust
 
     section("migration skill — current promotion evidence is a fast path")
     check("matching Codex evidence and exact trusted discovery are current",
           codex_state["current"], str(codex_state))
     check("matching Claude evidence and persisted workspace trust are current",
           claude_state["current"], str(claude_state))
+    check("a SQLite discovery failure blocks provider access without inventing promotion drift",
+          sqlite_blocked_state["status"] == "provider-access-blocked"
+          and sqlite_blocked_state["providerAccessBlocked"] is True
+          and sqlite_blocked_state["promotionRequired"] is False
+          and "failed to initialize sqlite state runtime" in
+              " ".join(sqlite_blocked_state["providerDiagnostics"]),
+          str(sqlite_blocked_state))
+    check("an unavailable provider runtime is distinct from promotion-required state",
+          unavailable_state["status"] == "provider-access-blocked"
+          and unavailable_state["providerAccessBlocked"] is True
+          and unavailable_state["promotionRequired"] is False
+          and "codex is unavailable" in " ".join(unavailable_state["providerDiagnostics"]),
+          str(unavailable_state))
     check("a documentation-only change does not demand live promotion",
           docs_only_state["current"], str(docs_only_state))
     check("explicit promotion flags reuse current evidence without provider probes",
@@ -1730,7 +1926,9 @@ for raw in sys.stdin:
           and "current checkout evidence reused: codex, claude-code" in fast_output.getvalue(),
           fast_output.getvalue()[-800:])
     check("changed adapter bytes invalidate the fast path",
-          invalidated["promotionRequired"]
+          invalidated["status"] == "promotion-required"
+          and invalidated["promotionRequired"]
+          and invalidated["providerAccessBlocked"] is False
           and any("adapter bytes differ" in reason for reason in invalidated["reasons"]),
           str(invalidated))
     check("one provider failure does not discard another provider's successful proof",
@@ -2658,14 +2856,14 @@ def test_legacy_cli_upgrade(tmp: Path) -> None:
     section("apply — 0.3.8 command transition is backward compatible")
     check("the 0.3.8 fixture upgrades successfully", upgraded.returncode == 0,
           upgraded.stdout[-500:] + upgraded.stderr[-500:])
-    check("the upgrade records 0.4.1 and vendors both executable entrypoints",
-          upgraded_compat.get("agentkitVersion") == "0.4.1"
+    check("the upgrade records 0.4.2 and vendors both executable entrypoints",
+          upgraded_compat.get("agentkitVersion") == "0.4.2"
           and os.access(repo / "kit" / "repocharter", os.X_OK)
           and os.access(repo / "kit" / "agentkit", os.X_OK),
           str(upgraded_compat))
-    check("the old command delegates to the canonical 0.4.1 identity",
+    check("the old command delegates to the canonical 0.4.2 identity",
           compatibility_version.returncode == 0
-          and compatibility_version.stdout.strip() == "RepoCharter 0.4.1"
+          and compatibility_version.stdout.strip() == "RepoCharter 0.4.2"
           and not compatibility_version.stderr,
           compatibility_version.stdout + compatibility_version.stderr)
     check("the managed lane moves to repocharter without touching user hook content",

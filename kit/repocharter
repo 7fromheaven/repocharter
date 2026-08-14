@@ -33,7 +33,7 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.4.1"
+KIT_VERSION = "0.4.2"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -267,37 +267,47 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
         read_json(repo / ".agents" / "compatibility.json", {}) or {}
     )
     if harness not in {"codex", "claude-code"}:
+        reason = f"{harness} has no provider-specific promotion implementation"
         return {
             "current": False,
+            "status": "promotion-required",
             "promotionRequired": True,
+            "providerAccessBlocked": False,
+            "providerRecoveryRequired": False,
             "installedVersion": None,
-            "reasons": [f"{harness} has no provider-specific promotion implementation"],
+            "promotionReasons": [reason],
+            "providerDiagnostics": [],
+            "recoveryReasons": [],
+            "recovery": None,
+            "reasons": [reason],
             "discovery": None,
         }
 
     executable = "codex" if harness == "codex" else "claude"
-    reasons: list[str] = []
+    promotion_reasons: list[str] = []
+    provider_diagnostics: list[str] = []
+    recovery_reasons: list[str] = []
     enforcement = (compat.get("enforcement") or {}).get(harness, "advisory")
     if enforcement != "blocking":
-        reasons.append("enforcement declaration is advisory")
+        promotion_reasons.append("enforcement declaration is advisory")
     if compat.get("agentkitVersion") != KIT_VERSION:
-        reasons.append(
+        promotion_reasons.append(
             f"manifest version {compat.get('agentkitVersion')!r} does not match kit {KIT_VERSION!r}"
         )
 
     evidence = (compat.get("enforcementEvidence") or {}).get(harness)
     if not isinstance(evidence, dict):
-        reasons.append("tracked live evidence is missing")
+        promotion_reasons.append("tracked live evidence is missing")
         evidence = None
 
     digest = claude_adapter_digest(repo) if harness == "claude-code" \
         else codex_adapter_digest(repo)
     if evidence is not None and digest != evidence.get("adapterSha256"):
-        reasons.append("adapter bytes differ from the tracked evidence")
+        promotion_reasons.append("adapter bytes differ from the tracked evidence")
 
     version = ""
     if shutil.which(executable) is None:
-        reasons.append(f"{executable} is unavailable in this environment")
+        provider_diagnostics.append(f"{executable} is unavailable in this environment")
     else:
         try:
             proc = subprocess.run(
@@ -305,20 +315,30 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
                 text=True, timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            reasons.append(f"could not read {executable} version: {exc}")
+            provider_diagnostics.append(f"could not read {executable} version: {exc}")
         else:
             version = proc.stdout.strip()
             if proc.returncode != 0 or not version:
-                reasons.append(f"could not read {executable} version")
+                detail = proc.stderr.strip()
+                diagnostic = f"could not read {executable} version"
+                if proc.returncode != 0:
+                    diagnostic += f" (exit {proc.returncode})"
+                if detail:
+                    diagnostic += f": {detail}"
+                provider_diagnostics.append(diagnostic)
             elif evidence is not None and version != evidence.get("harnessVersion"):
-                reasons.append("installed provider version differs from the tracked evidence")
+                promotion_reasons.append(
+                    "installed provider version differs from the tracked evidence"
+                )
 
     local_path = checkout_evidence_path(repo, harness)
     local = read_json(local_path) if local_path is not None else None
     expected_local = checkout_evidence_record(repo, harness, evidence) \
         if evidence is not None else None
     if local != expected_local:
-        reasons.append("checkout-local attestation is missing, stale, or belongs elsewhere")
+        promotion_reasons.append(
+            "checkout-local attestation is missing, stale, or belongs elsewhere"
+        )
 
     discovery = None
     if harness == "codex" and version:
@@ -332,17 +352,50 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
             "errors": list(discovered.errors),
         }
         problem = codex_hooks_lib.discovery_problem(repo, discovered)
-        if problem:
-            reasons.append(problem)
-        elif discovered.warnings:
-            reasons.append("Codex reported project-hook discovery warnings")
+        if discovered.status in {"error", "unavailable"} \
+                or discovered.errors or discovered.warnings:
+            provider_diagnostics.append(
+                problem or "Codex project-hook discovery returned indeterminate diagnostics"
+            )
+        elif problem:
+            recovery_reasons.append(problem)
         elif not discovered.trust_statuses or any(
                 value != "trusted" for value in discovered.trust_statuses):
-            reasons.append("the exact Codex hook definitions have not all been trusted")
+            promotion_reasons.append(
+                "the exact Codex hook definitions have not all been trusted"
+            )
     elif harness == "claude-code" and version:
         failures, trust_root = claude_checkout_preflight(repo)
-        reasons.extend(failures)
+        promotion_reasons.extend(failures)
         discovery = {"trustRoot": str(trust_root) if trust_root is not None else None}
+
+    access_blocked = bool(provider_diagnostics)
+    recovery_required = bool(recovery_reasons)
+    promotion_required = bool(promotion_reasons)
+    if access_blocked:
+        status = "provider-access-blocked"
+        if harness == "codex":
+            recovery = (
+                "Ensure Codex is available and can read and write its configured state directory "
+                "(normally ~/.codex), then rerun the checkpoint. Do not promote Codex while "
+                "hooks/list is indeterminate."
+            )
+        else:
+            recovery = (
+                "Ensure Claude Code is available and can read its configured provider state, "
+                "then rerun the checkpoint. Do not promote while provider state is indeterminate."
+            )
+    elif recovery_required:
+        status = "provider-recovery-required"
+        recovery = None
+    elif promotion_required:
+        status = "promotion-required"
+        recovery = None
+    else:
+        status = "current"
+        recovery = None
+
+    reasons = [*promotion_reasons, *recovery_reasons, *provider_diagnostics]
 
     return {
         "enforcement": enforcement,
@@ -351,8 +404,15 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
         "adapterSha256": digest,
         "localAttestation": str(local_path) if local_path is not None else None,
         "discovery": discovery,
-        "current": not reasons,
-        "promotionRequired": bool(reasons),
+        "current": status == "current",
+        "status": status,
+        "promotionRequired": promotion_required,
+        "providerAccessBlocked": access_blocked,
+        "providerRecoveryRequired": recovery_required,
+        "promotionReasons": promotion_reasons,
+        "providerDiagnostics": provider_diagnostics,
+        "recoveryReasons": recovery_reasons,
+        "recovery": recovery,
         "reasons": reasons,
     }
 
