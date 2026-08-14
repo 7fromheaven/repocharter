@@ -14,6 +14,7 @@ export const metadata = {
     "AGENTS.md",
     "Claude Code",
     "Codex",
+    "Cursor Agent",
     "agent context",
     "AI developer tools",
   ],

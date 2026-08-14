@@ -79,6 +79,10 @@ def run_hook(name: str, payload, repo: Path,
         env["AGENTKIT_HARNESS"] = "codex"
         if isinstance(payload, dict) and "permission_mode" not in payload:
             payload = {**payload, "permission_mode": "default"}
+    elif harness == "cursor":
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["CURSOR_PROJECT_DIR"] = str(repo)
+        env["AGENTKIT_HARNESS"] = "cursor"
     else:
         env["CLAUDE_PROJECT_DIR"] = str(repo)
     body = payload if isinstance(payload, str) else json.dumps(payload)
@@ -91,14 +95,20 @@ def decision(code: int, out: str) -> str:
     if code == 2:
         return "blocked-exit2"
     try:
-        return json.loads(out)["hookSpecificOutput"]["permissionDecision"]
+        parsed = json.loads(out)
+        return parsed.get("permission") or parsed["hookSpecificOutput"]["permissionDecision"]
     except Exception:
         return "allow"
 
 
 def context_of(out: str) -> str:
     try:
-        return json.loads(out)["hookSpecificOutput"].get("additionalContext", "")
+        parsed = json.loads(out)
+        return (
+            parsed.get("additional_context")
+            or parsed.get("agent_message")
+            or parsed["hookSpecificOutput"].get("additionalContext", "")
+        )
     except Exception:
         return ""
 
@@ -149,9 +159,9 @@ def test_cli_entrypoints(tmp: Path) -> None:
         [sys.executable, str(REPO_CHARTER), "--version"], capture_output=True, text=True)
     compatibility_version = subprocess.run(
         [sys.executable, str(AGENTKIT_COMPAT), "--version"], capture_output=True, text=True)
-    check("the canonical command identifies RepoCharter 0.4.2",
+    check("the canonical command identifies RepoCharter 0.5.0",
           canonical_version.returncode == 0
-          and canonical_version.stdout.strip() == "RepoCharter 0.4.2"
+          and canonical_version.stdout.strip() == "RepoCharter 0.5.0"
           and not canonical_version.stderr,
           canonical_version.stdout + canonical_version.stderr)
     check("the compatibility command has identical version behavior",
@@ -335,6 +345,35 @@ def test_bash_gate(tmp: Path) -> None:
     check("Codex without an approval path still denies an ask", decision(code, out) == "deny", out[:240])
     check("the denial names the unavailable approval path", "no active approval path" in out, out[:240])
 
+    section("Bash gate — Cursor uses native deny, ask, and allow decisions")
+    for label, command, expected in (
+        ("a hard denial", "git commit --no-verify -m x", "deny"),
+        ("a confirmation", "git reset --hard HEAD~1", "ask"),
+        ("an ordinary read", "ls -la", "allow"),
+    ):
+        code, out, _ = run_hook(
+            "pretooluse-bash.sh", {"command": command}, repo, harness="cursor"
+        )
+        check(f"Cursor emits {expected} for {label}", decision(code, out) == expected, out[:240])
+
+    cursor_root = make_repo(tmp / "cursor-root", policy={"denyBashPatterns": [
+        {"pattern": "^cursor-only-danger$", "reason": "proves the active checkout wins"},
+    ]})
+    foreign_root = make_repo(tmp / "foreign-bash-root")
+    env = dict(os.environ)
+    env.update({
+        "AGENTKIT_HARNESS": "cursor",
+        "CURSOR_PROJECT_DIR": str(cursor_root),
+        "CLAUDE_PROJECT_DIR": str(foreign_root),
+    })
+    proc = subprocess.run(
+        [str(HOOKS / "pretooluse-bash.sh")],
+        input=json.dumps({"command": "cursor-only-danger"}),
+        capture_output=True, text=True, env=env, cwd=cursor_root, timeout=30,
+    )
+    check("Cursor's root wins over an inherited Claude root",
+          decision(proc.returncode, proc.stdout) == "deny", proc.stdout[:240] + proc.stderr[:120])
+
     section("Bash gate — what it must NOT refuse")
     for label, command in [
         ("plain ls",                 "ls -la"),
@@ -490,6 +529,42 @@ def test_write_gate(tmp: Path) -> None:
     )
     check("an unrecognised Codex patch shape fails closed", code == 2, f"exit {code}: {err[:120]}")
 
+    section("Write gate — Cursor uses the shared policy without a fork")
+    code, out, _ = run_hook(
+        "pretooluse-write.py",
+        {"tool_name": "Write", "tool_input": {"file_path": denied, "content": "{}"}},
+        repo, harness="cursor",
+    )
+    check("Cursor denies a declared path", decision(code, out) == "deny", out[:200])
+    cursor_config = str(repo / ".cursor" / "hooks.json")
+    code, out, _ = run_hook(
+        "pretooluse-write.py",
+        {"tool_name": "Write", "tool_input": {"file_path": cursor_config, "content": "{}"}},
+        repo, harness="cursor",
+    )
+    check("Cursor cannot rewrite its own project hook file", decision(code, out) == "deny", out[:200])
+    code, out, _ = run_hook(
+        "pretooluse-write.py",
+        {"tool_name": "Write", "tool_input": {"file_path": allowed, "content": "ok"}},
+        repo, harness="cursor",
+    )
+    check("Cursor emits explicit JSON on an allowed write", decision(code, out) == "allow", out[:160])
+
+    foreign_root = make_repo(tmp / "foreign-write-root")
+    env = dict(os.environ)
+    env.update({
+        "AGENTKIT_HARNESS": "cursor",
+        "CURSOR_PROJECT_DIR": str(repo),
+        "CLAUDE_PROJECT_DIR": str(foreign_root),
+    })
+    proc = subprocess.run(
+        [str(HOOKS / "pretooluse-write.py")],
+        input=json.dumps({"tool_name": "Write", "tool_input": {"file_path": denied}}),
+        capture_output=True, text=True, env=env, cwd=repo, timeout=30,
+    )
+    check("Cursor write policy uses its root despite an inherited Claude root",
+          decision(proc.returncode, proc.stdout) == "deny", proc.stdout[:240] + proc.stderr[:120])
+
     section("Edit/Write gate — configured before/after measurement")
     target = repo / "lib" / "content" / "loc.json"
     target.write_text(json.dumps({"title": "Привет мир"}, ensure_ascii=False), encoding="utf-8")
@@ -502,6 +577,20 @@ def test_write_gate(tmp: Path) -> None:
     ctx = context_of(out)
     check("after-measurement reports a delta", "AFTER" in ctx and "Cyrillic" in ctx, ctx[:200])
     check("a shrinking script count is flagged CHANGED", "CHANGED" in ctx, ctx[:200])
+
+    code, _, _ = run_hook(
+        "pretooluse-write.py",
+        {"tool_name": "Write", "tool_input": {"file_path": str(target), "content": "x"}},
+        repo, harness="cursor",
+    )
+    target.write_text(json.dumps({"title": "Пр"}, ensure_ascii=False), encoding="utf-8")
+    code, out, _ = run_hook(
+        "posttooluse-write.py",
+        {"tool_name": "Write", "tool_input": {"file_path": str(target), "content": "x"}},
+        repo, harness="cursor",
+    )
+    check("Cursor postToolUse returns its supported additional_context field",
+          "AFTER" in context_of(out), out[:240])
 
     section("Edit/Write gate — corrupt policy fails CLOSED")
     broken = make_repo(tmp / "broken")
@@ -549,6 +638,48 @@ def test_mcp_gate(tmp: Path) -> None:
 
     code, _, err = run_hook("pretooluse-mcp.py", {"tool_input": {}}, repo, harness="codex")
     check("an MCP payload without a tool name fails closed", code == 2, f"exit {code}")
+    code, _, err = run_hook(
+        "pretooluse-mcp.py", {"tool_name": 17, "tool_input": {}}, repo, harness="codex"
+    )
+    check("a non-string MCP tool name fails closed", code == 2, f"exit {code}: {err[:120]}")
+    code, _, err = run_hook(
+        "pretooluse-mcp.py", {"tool_name": "mcp__a__b", "tool_input": ""}, repo,
+        harness="codex",
+    )
+    check("a non-object MCP tool input fails closed", code == 2, f"exit {code}: {err[:120]}")
+
+    section("MCP gate — Cursor reconstructs a server-qualified policy identity")
+    cursor_payload = {
+        "tool_name": "deploy_to_vercel",
+        "mcp_server_name": "plugin-vercel-vercel",
+        "tool_input": json.dumps({"target": "production"}),
+    }
+    code, out, _ = run_hook(
+        "pretooluse-mcp.py", cursor_payload, repo, harness="cursor"
+    )
+    check("Cursor production deploy is denied", decision(code, out) == "deny", out[:240])
+    check("the denial names the reconstructed full tool",
+          "mcp__plugin-vercel-vercel__deploy_to_vercel" in out, out[:240])
+    cursor_payload["tool_input"] = json.dumps({"target": "preview"})
+    code, out, _ = run_hook(
+        "pretooluse-mcp.py", cursor_payload, repo, harness="cursor"
+    )
+    check("Cursor preview deploy remains allowed", decision(code, out) == "allow", out[:160])
+    missing_server = {"tool_name": "deploy_to_vercel", "tool_input": "{}"}
+    code, _, err = run_hook(
+        "pretooluse-mcp.py", missing_server, repo, harness="cursor"
+    )
+    check("Cursor refuses when MCP server identity is missing", code == 2, err[:200])
+    empty_server = {"tool_name": "deploy_to_vercel", "mcp_server_name": "", "tool_input": "{}"}
+    code, _, err = run_hook(
+        "pretooluse-mcp.py", empty_server, repo, harness="cursor"
+    )
+    check("Cursor refuses an empty MCP server identity", code == 2, err[:200])
+    invalid_input = {**cursor_payload, "tool_input": "{not-json"}
+    code, _, err = run_hook(
+        "pretooluse-mcp.py", invalid_input, repo, harness="cursor"
+    )
+    check("Cursor refuses malformed stringified MCP input", code == 2, err[:200])
 
 
 # ── the ConfigChange guard ────────────────────────────────────────────────────────────
@@ -964,6 +1095,7 @@ def test_apply(tmp: Path) -> None:
     check("settings.json created", (repo / ".claude" / "settings.json").exists())
     check("hooks installed", (repo / ".claude" / "hooks" / "agentkit" / "pretooluse-bash.sh").exists())
     check("Codex hooks.json installed", (repo / ".codex" / "hooks.json").exists())
+    check("Cursor hooks.json installed", (repo / ".cursor" / "hooks.json").exists())
     check("the durable project-memory skill is seeded",
           (repo / ".agents" / "skills" / "project-memory" / "SKILL.md").is_file())
     migration_skill = repo / ".agents" / "skills" / "migrate-repocharter"
@@ -991,8 +1123,8 @@ def test_apply(tmp: Path) -> None:
 
     settings = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
     compat = json.loads((repo / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
-    check("the compatibility manifest records RepoCharter 0.4.2",
-          compat["agentkitVersion"] == "0.4.2", str(compat))
+    check("the compatibility manifest records RepoCharter 0.5.0",
+          compat["agentkitVersion"] == "0.5.0", str(compat))
     check("auto memory defaults OFF in compatibility.json", compat["autoMemory"] == "off", str(compat))
     check("apply disables Claude auto memory by default", settings["autoMemoryEnabled"] is False, str(settings))
     matchers = [g.get("matcher") for g in settings["hooks"]["PreToolUse"]]
@@ -1014,6 +1146,31 @@ def test_apply(tmp: Path) -> None:
     check("Codex post-write measurement is installed",
           any("posttooluse-write.py" in command for command in codex_commands),
           str(codex_commands))
+
+    cursor_hooks = json.loads(
+        (repo / ".cursor" / "hooks.json").read_text(encoding="utf-8")
+    )["hooks"]
+    cursor_commands = [entry["command"] for entries in cursor_hooks.values() for entry in entries]
+    check("Cursor has Shell, Write/Delete, post-write, and MCP events",
+          set(cursor_hooks) == {
+              "beforeShellExecution", "preToolUse", "postToolUse", "beforeMCPExecution"
+          }, str(cursor_hooks))
+    check("every Cursor command selects Cursor wire semantics and exact project root",
+          all("AGENTKIT_HARNESS=cursor" in command
+              and "${CURSOR_PROJECT_DIR}/.claude/hooks/agentkit/" in command
+              for command in cursor_commands), str(cursor_commands))
+    critical_cursor_entries = [
+        *cursor_hooks["beforeShellExecution"],
+        *cursor_hooks["preToolUse"],
+        *cursor_hooks["beforeMCPExecution"],
+    ]
+    check("every security-critical Cursor hook is fail-closed",
+          all(entry.get("failClosed") is True for entry in critical_cursor_entries),
+          str(critical_cursor_entries))
+    check("Cursor is declared native and advisory until live promotion",
+          compat["enforcement"]["cursor"] == "advisory"
+          and any(adapter.get("harness") == "cursor" and adapter.get("kind") == "native"
+                  for adapter in compat["adapters"]), str(compat))
 
     migration_body = migration_skill / "SKILL.md"
     expected_migration_body = (KIT / "skills" / "migrate-repocharter" / "SKILL.md").read_bytes()
@@ -1214,6 +1371,88 @@ def test_apply(tmp: Path) -> None:
           and len([group for group in pre_groups if group.get("matcher") == "^Bash$"]) == 1,
           legacy_upgrade.stderr + str(pre_groups))
 
+    section("apply — must preserve foreign Cursor hooks too")
+    cursor_config_path = repo / ".cursor" / "hooks.json"
+    cursor_config = json.loads(cursor_config_path.read_text(encoding="utf-8"))
+    cursor_config["hooks"].setdefault("beforeSubmitPrompt", []).append({
+        "command": "python3 tools/their-cursor-prompt.py",
+    })
+    cursor_config["customUserKey"] = "kept"
+    cursor_config_path.write_text(json.dumps(cursor_config, indent=2) + "\n", encoding="utf-8")
+    cursor_apply = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    after_cursor = json.loads(cursor_config_path.read_text(encoding="utf-8"))
+    check("foreign Cursor beforeSubmitPrompt hook survives",
+          after_cursor["hooks"]["beforeSubmitPrompt"] == [{
+              "command": "python3 tools/their-cursor-prompt.py"
+          }], str(after_cursor))
+    check("foreign Cursor top-level key survives", after_cursor.get("customUserKey") == "kept")
+    check("apply reports preserved Cursor wiring",
+          "preserved 1 existing Cursor hook entry" in cursor_apply.stdout,
+          cursor_apply.stdout[:500])
+    cursor_again = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("re-apply over foreign Cursor hooks is idempotent",
+          "0 change(s)" in cursor_again.stdout, cursor_again.stdout[-300:])
+
+    malformed_cursor = json.loads(json.dumps(after_cursor))
+    malformed_cursor["hooks"] = []
+    cursor_config_path.write_text(
+        json.dumps(malformed_cursor, indent=2) + "\n", encoding="utf-8")
+    invalid_cursor_hooks = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("apply refuses a non-object Cursor hooks block",
+          invalid_cursor_hooks.returncode == 2
+          and "`hooks` is not an object" in invalid_cursor_hooks.stderr,
+          invalid_cursor_hooks.stderr[-300:])
+
+    malformed_cursor = json.loads(json.dumps(after_cursor))
+    malformed_cursor["hooks"]["beforeShellExecution"] = {}
+    cursor_config_path.write_text(
+        json.dumps(malformed_cursor, indent=2) + "\n", encoding="utf-8")
+    invalid_cursor_event = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("apply refuses a non-list Cursor event",
+          invalid_cursor_event.returncode == 2
+          and "beforeShellExecution is not a list" in invalid_cursor_event.stderr,
+          invalid_cursor_event.stderr[-300:])
+
+    malformed_cursor = json.loads(json.dumps(after_cursor))
+    malformed_cursor["hooks"]["beforeShellExecution"].append("not-an-object")
+    cursor_config_path.write_text(
+        json.dumps(malformed_cursor, indent=2) + "\n", encoding="utf-8")
+    invalid_cursor_entry = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("apply refuses a non-object Cursor hook entry",
+          invalid_cursor_entry.returncode == 2
+          and "contains a non-object entry" in invalid_cursor_entry.stderr,
+          invalid_cursor_entry.stderr[-300:])
+
+    malformed_cursor = json.loads(json.dumps(after_cursor))
+    malformed_cursor["version"] = 2
+    cursor_config_path.write_text(
+        json.dumps(malformed_cursor, indent=2) + "\n", encoding="utf-8")
+    invalid_cursor_version = subprocess.run(
+        [sys.executable, str(KIT / "agentkit"), "apply", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("apply refuses an unknown Cursor hook schema version",
+          invalid_cursor_version.returncode == 2
+          and "unsupported version" in invalid_cursor_version.stderr,
+          invalid_cursor_version.stderr[-300:])
+    cursor_config_path.write_text(
+        json.dumps(after_cursor, indent=2) + "\n", encoding="utf-8")
+
     # A user key must survive re-apply: apply owns hooks and permissions.deny, nothing else.
     settings["permissions"]["allow"].append("Bash(pnpm build:*)")
     settings["customUserKey"] = "kept"
@@ -1264,6 +1503,16 @@ def _stub_codex(bin_dir: Path, version: str) -> Path:
     """A fake `codex --version` for checkout-attestation verifier tests."""
     bin_dir.mkdir(parents=True, exist_ok=True)
     stub = bin_dir / "codex"
+    stub.write_text(f'#!/bin/sh\n[ "$1" = "--version" ] && echo "{version}" && exit 0\nexit 1\n',
+                    encoding="utf-8")
+    stub.chmod(0o755)
+    return stub
+
+
+def _stub_cursor(bin_dir: Path, version: str) -> Path:
+    """A fake Cursor CLI for version, attestation, and provider-state tests."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "cursor-agent"
     stub.write_text(f'#!/bin/sh\n[ "$1" = "--version" ] && echo "{version}" && exit 0\nexit 1\n',
                     encoding="utf-8")
     stub.chmod(0o755)
@@ -2412,6 +2661,262 @@ def test_claude_enforcement_evidence(tmp: Path) -> None:
           and not errors_with("codex is declared blocking but this checkout", codex_bin))
 
 
+def test_cursor_enforcement_evidence(tmp: Path) -> None:
+    """Cursor blocking evidence must prove exact trust, bytes, version, and this checkout."""
+    repo = make_repo(tmp)
+    git_init(repo)
+    (repo / "CLAUDE.md").unlink()
+    installed = subprocess.run(
+        [sys.executable, str(REPO_CHARTER), "apply", "--repo", str(repo), "--allow-dirty"],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("the Cursor evidence fixture starts from a complete install",
+          installed.returncode == 0, installed.stdout[-300:] + installed.stderr[-300:])
+    compat_path = repo / ".agents" / "compatibility.json"
+    cursor_data = tmp / "cursor-data"
+    stub_bin = tmp / "cursor-stubbin"
+    version = "cursor-agent fixture 9.9.9"
+    _stub_cursor(stub_bin, version)
+    git_bin = str(Path(shutil.which("git") or "/usr/bin/git").parent)
+    base_test_path = os.pathsep.join(dict.fromkeys((git_bin, "/usr/bin", "/bin")))
+
+    previous_path = os.environ.get("PATH")
+    previous_cursor_data = os.environ.get("CURSOR_DATA_DIR")
+    os.environ["PATH"] = str(stub_bin) + os.pathsep + base_test_path
+    os.environ["CURSOR_DATA_DIR"] = str(cursor_data)
+    try:
+        trust_marker = agentkit_mod.cursor_trust_marker(repo)
+
+        def persist_trust(workspace: Path = repo) -> None:
+            trust_marker.parent.mkdir(parents=True, exist_ok=True)
+            trust_marker.write_text(json.dumps({
+                "workspacePath": str(workspace.resolve()),
+                "trustMethod": "fixture",
+            }) + "\n", encoding="utf-8")
+
+        def declare(enforcement: str, evidence: dict | None = None) -> dict:
+            compat = json.loads(compat_path.read_text(encoding="utf-8"))
+            compat.setdefault("enforcement", {})["cursor"] = enforcement
+            evidence_map = compat.setdefault("enforcementEvidence", {})
+            if evidence is None:
+                evidence_map.pop("cursor", None)
+            else:
+                evidence_map["cursor"] = evidence
+            if not evidence_map:
+                compat.pop("enforcementEvidence", None)
+            compat_path.write_text(json.dumps(compat, indent=2) + "\n", encoding="utf-8")
+            return compat
+
+        def report_with() -> dict:
+            env = dict(os.environ)
+            proc = subprocess.run(
+                [sys.executable, str(RESIDUE), "--repo", str(repo), "--json"],
+                capture_output=True, text=True, timeout=60, env=env,
+            )
+            try:
+                return json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                return {"errors": [f"residue crashed: {proc.stderr[:300]}"], "notes": []}
+
+        def errors_with(fragment: str) -> bool:
+            return any(fragment in error for error in report_with().get("errors", []))
+
+        section("Cursor promotion — static wiring and blocking evidence are inseparable")
+        declare("blocking")
+        check("a Cursor blocking claim without live evidence is refused",
+              errors_with("Cursor is declared blocking but has no live enforcementEvidence"))
+        declare("advisory")
+        check("advisory Cursor wiring does not fabricate an evidence requirement",
+              not errors_with("Cursor is declared blocking"))
+
+        true_digest = agentkit_mod.cursor_adapter_digest(repo)
+        check("the Cursor digest covers hooks.json and every shared script it invokes",
+              isinstance(true_digest, str) and len(true_digest) == 64, str(true_digest))
+        good = {
+            "verifiedOn": "2026-08-14",
+            "harnessVersion": version,
+            "adapterSha256": true_digest,
+            "method": "live-deny-and-observe",
+        }
+        declare("blocking", {**good, "adapterSha256": "0" * 64})
+        check("a Cursor evidence hash for different adapter bytes is stale",
+              errors_with("Cursor blocking evidence is stale"))
+
+        persist_trust()
+        declare("blocking", good)
+        local_evidence = agentkit_mod.checkout_evidence_path(repo, "cursor")
+        check("portable Cursor evidence alone cannot certify a fresh checkout",
+              errors_with("cursor is declared blocking but this checkout has no matching local"))
+        check("matching Cursor evidence can be written only to this checkout's Git state",
+              local_evidence is not None
+              and agentkit_mod.write_checkout_evidence(repo, "cursor", good)
+              and repo.resolve() / ".git" in local_evidence.parents,
+              str(local_evidence))
+        clean_report = report_with()
+        check("matching bytes, version, exact trust, and local evidence verify clean",
+              not any("Cursor" in error or "cursor" in error
+                      for error in clean_report.get("errors", [])),
+              str(clean_report.get("errors", []))[:500])
+
+        persist_trust(repo.parent / "other-checkout")
+        check("a Cursor trust marker for another checkout is rejected",
+              errors_with("exact checkout has no persisted workspace trust"))
+        persist_trust()
+
+        hooks_path = repo / ".cursor" / "hooks.json"
+        hooks_original = hooks_path.read_text(encoding="utf-8")
+        hooks_path.write_text(hooks_original + "\n", encoding="utf-8")
+        check("editing Cursor adapter bytes invalidates the live evidence",
+              errors_with("Cursor blocking evidence is stale"))
+        hooks_path.write_text(hooks_original, encoding="utf-8")
+
+        hooks_config = json.loads(hooks_original)
+        hooks_config["hooks"]["beforeShellExecution"][0].pop("failClosed", None)
+        hooks_path.write_text(json.dumps(hooks_config, indent=2) + "\n", encoding="utf-8")
+        declare("advisory")
+        check("a security-critical Cursor hook without failClosed is rejected even advisory",
+              errors_with("security-critical but does not set failClosed: true"))
+        hooks_path.write_text(hooks_original, encoding="utf-8")
+        declare("blocking", good)
+
+        _stub_cursor(stub_bin, "cursor-agent fixture 9.9.10")
+        check("a different installed Cursor version invalidates the evidence",
+              errors_with("but this machine runs"))
+        _stub_cursor(stub_bin, version)
+
+        section("Cursor promotion — provider state distinguishes drift from unavailable state")
+        current = agentkit_mod.provider_promotion_state(repo, "cursor")
+        check("matching Cursor evidence is a current-checkout fast path",
+              current["current"] and current["discovery"]["status"] == "exact",
+              str(current))
+
+        trust_marker.unlink()
+        missing = agentkit_mod.provider_promotion_state(repo, "cursor")
+        check("missing exact trust requires promotion without claiming provider failure",
+              missing["status"] == "promotion-required"
+              and missing["promotionRequired"] is True
+              and missing["providerAccessBlocked"] is False,
+              str(missing))
+
+        trust_marker.write_text("{not-json", encoding="utf-8")
+        malformed = agentkit_mod.provider_promotion_state(repo, "cursor")
+        check("malformed Cursor state is provider-access-blocked, not proven trust drift",
+              malformed["status"] == "provider-access-blocked"
+              and malformed["providerAccessBlocked"] is True
+              and malformed["promotionRequired"] is False
+              and "Do not promote Cursor" in (malformed.get("recovery") or ""),
+              str(malformed))
+        persist_trust()
+
+        original_cursor_executable = agentkit_mod.cursor_executable
+        agentkit_mod.cursor_executable = lambda: None
+        try:
+            unavailable = agentkit_mod.provider_promotion_state(repo, "cursor")
+        finally:
+            agentkit_mod.cursor_executable = original_cursor_executable
+        check("an unavailable Cursor runtime is not mislabeled promotion required",
+              unavailable["status"] == "provider-access-blocked"
+              and unavailable["providerAccessBlocked"] is True
+              and unavailable["promotionRequired"] is False,
+              str(unavailable))
+
+        tool_start = json.dumps({"type": "tool_call", "subtype": "started"})
+        denied_stream = tool_start + "\n" + json.dumps({
+            "type": "tool_call", "subtype": "completed",
+            "result": "AGENTKIT_CURSOR_BASH_PROBE_DENIED",
+        })
+        denied_marker = repo / "cursor-denied-marker"
+        check("Cursor denial proof requires one structured tool start and no side effect",
+              agentkit_mod.cursor_probe_held(
+                  denied_stream, "AGENTKIT_CURSOR_BASH_PROBE_DENIED", denied_marker, False))
+        check("reason prose without a structured tool start is not live evidence",
+              not agentkit_mod.cursor_probe_held(
+                  "AGENTKIT_CURSOR_BASH_PROBE_DENIED", "AGENTKIT_CURSOR_BASH_PROBE_DENIED",
+                  denied_marker, False))
+        mcp_discovery = json.dumps({
+            "type": "tool_call", "subtype": "started",
+            "tool_call": {"getMcpToolsToolCall": {"args": {"toolName": "danger"}}},
+        })
+        mcp_attempt = json.dumps({
+            "type": "tool_call", "subtype": "started",
+            "tool_call": {"mcpToolCall": {"args": {"toolName": "danger"}}},
+        })
+        mcp_stream = "\n".join((
+            mcp_discovery, mcp_attempt, "AGENTKIT_CURSOR_MCP_PROBE_DENIED",
+        ))
+        check("Cursor MCP proof counts schema discovery separately from one real call",
+              agentkit_mod.cursor_probe_held(
+                  mcp_stream, "AGENTKIT_CURSOR_MCP_PROBE_DENIED", denied_marker, False,
+                  tool_kind="mcpToolCall"))
+        unrelated_start = json.dumps({
+            "type": "tool_call", "subtype": "started",
+            "tool_call": {"shellToolCall": {"args": {"command": "true"}}},
+        })
+        check("Cursor MCP proof rejects an unrelated tool in the same turn",
+              not agentkit_mod.cursor_probe_held(
+                  mcp_stream + "\n" + unrelated_start,
+                  "AGENTKIT_CURSOR_MCP_PROBE_DENIED", denied_marker, False,
+                  tool_kind="mcpToolCall"))
+        allowed_marker = repo / "cursor-allowed-marker"
+        allowed_marker.write_text("ran\n", encoding="utf-8")
+        check("Cursor allow proof requires the requested side effect",
+              agentkit_mod.cursor_probe_held(tool_start, "", allowed_marker, True))
+        matrix = agentkit_mod.cursor_probes(repo, repo / "cursor-mcp-marker")
+        check("the live Cursor matrix covers deny and allow on all three surfaces",
+              len(matrix) == 8
+              and {entry[0] for entry in matrix} == {
+                  "Shell denial", "Write denial", "Delete denial", "MCP denial",
+                  "Shell allow", "Write allow and measurement", "Delete allow", "MCP allow",
+              }, str([entry[0] for entry in matrix]))
+
+        section("Cursor promotion — one provider can succeed or fail independently")
+        declare("advisory")
+        if local_evidence is not None:
+            local_evidence.unlink(missing_ok=True)
+        original_cursor_live = agentkit_mod.live_cursor_self_test
+        agentkit_mod.live_cursor_self_test = lambda _repo: ([], version)
+        promoted_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(promoted_output):
+                promoted = agentkit_mod.cmd_self_test(repo, promote_cursor=True)
+        finally:
+            agentkit_mod.live_cursor_self_test = original_cursor_live
+        promoted_compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        check("a successful Cursor live probe promotes only Cursor",
+              promoted == 0
+              and promoted_compat["enforcement"]["cursor"] == "blocking"
+              and promoted_compat["enforcement"]["codex"] == "advisory"
+              and promoted_compat["enforcement"]["claude-code"] == "advisory"
+              and "cursor" in promoted_compat.get("enforcementEvidence", {}),
+              promoted_output.getvalue()[-900:])
+
+        declare("advisory")
+        if local_evidence is not None:
+            local_evidence.unlink(missing_ok=True)
+        agentkit_mod.live_cursor_self_test = lambda _repo: (["fixture Cursor failure"], version)
+        failed_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(failed_output):
+                failed = agentkit_mod.cmd_self_test(repo, promote_cursor=True)
+        finally:
+            agentkit_mod.live_cursor_self_test = original_cursor_live
+        failed_compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        check("a failed Cursor live probe writes no blocking claim or evidence",
+              failed == 1
+              and failed_compat["enforcement"]["cursor"] == "advisory"
+              and "cursor" not in failed_compat.get("enforcementEvidence", {}),
+              failed_output.getvalue()[-900:])
+    finally:
+        if previous_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = previous_path
+        if previous_cursor_data is None:
+            os.environ.pop("CURSOR_DATA_DIR", None)
+        else:
+            os.environ["CURSOR_DATA_DIR"] = previous_cursor_data
+
+
 def test_policy_and_supersede(tmp: Path) -> None:
     sys.path.insert(0, str(KIT / "lib"))
     import scaffold as sc
@@ -2856,14 +3361,14 @@ def test_legacy_cli_upgrade(tmp: Path) -> None:
     section("apply — 0.3.8 command transition is backward compatible")
     check("the 0.3.8 fixture upgrades successfully", upgraded.returncode == 0,
           upgraded.stdout[-500:] + upgraded.stderr[-500:])
-    check("the upgrade records 0.4.2 and vendors both executable entrypoints",
-          upgraded_compat.get("agentkitVersion") == "0.4.2"
+    check("the upgrade records 0.5.0 and vendors both executable entrypoints",
+          upgraded_compat.get("agentkitVersion") == "0.5.0"
           and os.access(repo / "kit" / "repocharter", os.X_OK)
           and os.access(repo / "kit" / "agentkit", os.X_OK),
           str(upgraded_compat))
-    check("the old command delegates to the canonical 0.4.2 identity",
+    check("the old command delegates to the canonical 0.5.0 identity",
           compatibility_version.returncode == 0
-          and compatibility_version.stdout.strip() == "RepoCharter 0.4.2"
+          and compatibility_version.stdout.strip() == "RepoCharter 0.5.0"
           and not compatibility_version.stderr,
           compatibility_version.stdout + compatibility_version.stderr)
     check("the managed lane moves to repocharter without touching user hook content",
@@ -2953,6 +3458,7 @@ def main() -> int:
         test_migration_workflow(tmp / "migration-workflow")
         test_codex_foreign_hook_closure(tmp / "codex-foreign-hook")
         test_claude_enforcement_evidence(tmp / "claude-enforcement")
+        test_cursor_enforcement_evidence(tmp / "cursor-enforcement")
         test_policy_and_supersede(tmp / "policy")
         test_apply(tmp / "applytest")
         test_measure(tmp / "measure")

@@ -32,15 +32,23 @@ def fail_closed(message: str) -> None:
 
 
 def project_dir() -> Path:
-    """Return the repo root under either supported harness.
+    """Return the exact repo root for the active harness.
 
-    Claude supplies ``CLAUDE_PROJECT_DIR``. Codex deliberately does not expose an
-    equivalent stable variable and may launch a session from a subdirectory, so walking
-    upward to the declaration is the provider-neutral fallback. Hook commands also run
-    from the session cwd, which makes this work in a worktree without resolving through a
-    machine-specific absolute path.
+    Prefer the active provider's own root variable before considering variables inherited
+    from another nested harness. Codex may launch from a subdirectory without exporting a
+    stable root, so walking upward to the declaration remains the provider-neutral fallback.
+    Hook commands run from the session cwd, which keeps that fallback worktree-local.
     """
-    explicit = os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("CODEX_PROJECT_DIR")
+    wire = os.environ.get("AGENTKIT_HARNESS", "claude-code")
+    variables = {
+        "claude-code": ("CLAUDE_PROJECT_DIR", "CODEX_PROJECT_DIR", "CURSOR_PROJECT_DIR"),
+        "codex": ("CODEX_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CURSOR_PROJECT_DIR"),
+        "cursor": ("CURSOR_PROJECT_DIR", "CODEX_PROJECT_DIR", "CLAUDE_PROJECT_DIR"),
+    }.get(wire, ())
+    explicit = next(
+        (value for name in variables if (value := os.environ.get(name))),
+        None,
+    )
     if explicit:
         return Path(explicit).resolve()
 
@@ -55,11 +63,11 @@ def harness() -> str:
     """The hook wire protocol in use.
 
     Claude is the default because its settings do not inject a harness marker. The Codex
-    adapter sets ``AGENTKIT_HARNESS=codex`` explicitly. Unknown values fail closed to avoid
-    emitting a decision in the wrong wire format.
+    and Cursor adapters set ``AGENTKIT_HARNESS`` explicitly. Unknown values fail
+    closed to avoid emitting a decision in the wrong wire format.
     """
     value = os.environ.get("AGENTKIT_HARNESS", "claude-code")
-    if value not in {"claude-code", "codex"}:
+    if value not in {"claude-code", "codex", "cursor"}:
         fail_closed(f"unknown AGENTKIT_HARNESS value {value!r}.")
     return value
 
@@ -104,12 +112,12 @@ _PATCH_MOVE = re.compile(r"^\*\*\* Move to:\s*(.+?)\s*$")
 
 
 def write_paths(payload: dict) -> list[str]:
-    """Return every path affected by a Claude write or Codex ``apply_patch`` call.
+    """Return every path affected by a Claude/Cursor write or Codex ``apply_patch`` call.
 
-    Claude sends an absolute ``file_path``/``notebook_path``. Codex sends the entire patch
-    in ``tool_input.command`` and may change several files in one tool call. Treating that
-    command as one path silently allowed forbidden writes, so every Add/Update/Delete and
-    Move destination is extracted and checked independently.
+    Claude and Cursor send an absolute ``file_path``/``notebook_path``. Codex sends the
+    entire patch in ``tool_input.command`` and may change several files in one tool call.
+    Treating that command as one path silently allowed forbidden writes, so every
+    Add/Update/Delete and Move destination is extracted and checked independently.
     """
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -148,6 +156,13 @@ def write_paths(payload: dict) -> list[str]:
 
 def deny(reason: str) -> None:
     """Emit a structured deny. Exit 0 is correct here: the JSON carries the decision."""
+    if harness() == "cursor":
+        print(json.dumps({
+            "permission": "deny",
+            "user_message": reason,
+            "agent_message": reason,
+        }))
+        sys.exit(ALLOW)
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -160,12 +175,25 @@ def deny(reason: str) -> None:
 
 def add_context(text: str) -> None:
     """Allow, but inject context the agent must act on."""
+    if harness() == "cursor":
+        # Cursor's preToolUse wire can deny or rewrite input, but it has no supported
+        # additional-context field on an allow. The paired postToolUse hook reports the
+        # before/after delta through Cursor's supported additional_context field.
+        print(json.dumps({"permission": "allow"}))
+        sys.exit(ALLOW)
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "additionalContext": text,
         }
     }))
+    sys.exit(ALLOW)
+
+
+def allow() -> None:
+    """Emit an explicit allow where the provider requires JSON on successful hooks."""
+    if harness() == "cursor":
+        print(json.dumps({"permission": "allow"}))
     sys.exit(ALLOW)
 
 

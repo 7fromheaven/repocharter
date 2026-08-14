@@ -1,6 +1,6 @@
 ---
 name: migrate-repocharter
-description: Migrate, upgrade, resume, promote, verify, or integrate RepoCharter in a repository. Use when adopting RepoCharter, updating its vendored kit, recovering an interrupted migration, proving Claude Code or Codex enforcement, handling Codex hooks in a linked worktree, or finishing a prepared migration branch.
+description: Migrate, upgrade, resume, promote, verify, or integrate RepoCharter in a repository. Use when adopting RepoCharter, updating its vendored kit, recovering an interrupted migration, proving Claude Code, Codex, or Cursor enforcement, handling provider trust in a linked worktree, or finishing a prepared migration branch.
 ---
 
 # Migrate RepoCharter
@@ -40,8 +40,9 @@ Follow its route:
 - `in-place`: continue in the exact checkout.
 - `provider-access-blocked`: stop provider work and rerun the checkpoint in an environment where
   the named provider can access its runtime state. For Codex, the process must be able to read and
-  write the configured state directory (normally `~/.codex`). Preserve the reported diagnostic;
-  do not promote while `hooks/list` is indeterminate.
+  write the configured state directory (normally `~/.codex`); Cursor similarly needs its configured
+  state directory (normally `~/.cursor`). Preserve the reported diagnostic; do not promote while
+  discovery or workspace trust is indeterminate.
 - `standalone-clone`: create an independent normal clone with the mode named by the checkpoint:
 
   ```sh
@@ -70,7 +71,8 @@ Follow its route:
    true, and never while its `providerAccessBlocked` or `providerRecoveryRequired` field is true.
    Runtime unavailability, missing discovery, and wrong-checkout discovery are not evidence of
    stale trust. A provider marked current has matching adapter bytes, CLI version, checkout-local
-   attestation, effective settings, and—under Codex—the exact trusted project hook source.
+   attestation, effective settings, and—under Codex—the exact trusted project hook source or—under
+   Cursor—the exact persisted workspace-trust marker.
 6. After any provider promotion, run one final fixed-point, strict/effective verification,
    measurement, and repository validation pass. Commit only the migration branch unless the user
    separately authorized integration.
@@ -95,6 +97,9 @@ When promotion is actually required:
   `/hooks`, then run `repocharter self-test --repo . --promote-codex`.
 - Claude Code: start a fresh session in the target checkout, establish workspace trust, then run
   `repocharter self-test --repo . --promote-claude`.
+- Cursor Agent/CLI: review and trust the exact target workspace, then run
+  `repocharter self-test --repo . --promote-cursor`. This proves local Agent/CLI Shell, Write, and
+  MCP paths; it does not claim Cursor Tab or Cloud MCP.
 
 An approval-capable agent may operate both installed provider CLIs. Provider identity is not the
 boundary; the target checkout, fresh settings, native trust, and live deny/allow evidence are.

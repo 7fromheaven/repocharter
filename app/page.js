@@ -19,6 +19,13 @@ const providers = [
     verified: true,
   },
   {
+    name: "Cursor Agent/CLI",
+    monogram: "CR",
+    context: "Native context",
+    guardrails: "Verified locally",
+    verified: true,
+  },
+  {
     name: "OpenCode",
     monogram: "OC",
     context: "Native context",
@@ -61,7 +68,7 @@ const steps = [
     number: "03",
     title: "Wire each harness",
     body: "Small provider adapters connect the same charter and policy to the controls each coding-agent harness really exposes.",
-    file: "CLAUDE.md  ·  .codex/hooks.json",
+    file: "CLAUDE.md  ·  .codex/hooks.json  ·  .cursor/hooks.json",
   },
   {
     number: "04",
@@ -152,6 +159,10 @@ export default function Home() {
                   label="Claude"
                   command="/migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions."
                 />
+                <CopyCommand
+                  label="Cursor"
+                  command="/migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions."
+                />
                 <p className="command-note">
                   Available before target installation. No global skill setup or prompt shuttling.
                 </p>
@@ -221,8 +232,8 @@ export default function Home() {
                   <CheckBadge />
                 </div>
                 <div className="agent-node agent-node--open">
-                  <span className="agent-node__icon">OC</span>
-                  <span><b>OpenCode</b><small>native</small></span>
+                  <span className="agent-node__icon">CR</span>
+                  <span><b>Cursor</b><small>native</small></span>
                   <CheckBadge />
                 </div>
 
@@ -236,7 +247,7 @@ export default function Home() {
           </div>
 
           <div className="shell proof-strip reveal reveal--5" aria-label="RepoCharter facts">
-            <div><strong>396</strong><span>negative-first tests</span></div>
+            <div><strong>467</strong><span>dependency-free checks</span></div>
             <div><strong>0</strong><span>CLI runtime dependencies</span></div>
             <div><strong>1</strong><span>canonical charter</span></div>
             <div><strong>5+</strong><span>agent harnesses reached</span></div>
@@ -297,11 +308,11 @@ export default function Home() {
                 <p className="feature-card__eyebrow">Portable by construction</p>
                 <h3>Switch agents. Keep the map.</h3>
                 <p>
-                  Claude Code, Codex, OpenCode, Hermes Agent, and ZCode all reach the same checked-in
+                  Claude Code, Codex, Cursor, OpenCode, Hermes Agent, and ZCode all reach the same checked-in
                   instructions and procedures through explicit, reviewable adapters.
                 </p>
                 <div className="provider-orbit" aria-hidden="true">
-                  <span>CL</span><span>CX</span><span>OC</span><span>HA</span><span>ZC</span>
+                  <span>CL</span><span>CX</span><span>CR</span><span>OC</span><span>HA</span>
                   <div><LogoMark /></div>
                 </div>
               </article>
@@ -399,7 +410,8 @@ export default function Home() {
             </div>
             <p className="compatibility-note">
               <InfoIcon /> Verified enforcement is earned per provider, checkout, hook hash, and probe matrix.
-              Advisory means “use the shared context and pre-commit gate,” not “mechanically blocked.”
+              Cursor verification covers local Agent/CLI, not Tab or Cloud MCP. Advisory means “use
+              the shared context and pre-commit gate,” not “mechanically blocked.”
             </p>
           </div>
         </section>
@@ -448,7 +460,7 @@ export default function Home() {
             <p className="kicker">Agent-operated migration</p>
             <h2>Bring a repository under one charter.</h2>
             <p>
-              Clone RepoCharter, open the checkout in Codex or Claude Code, and invoke the bundled
+              Clone RepoCharter, open the checkout in Codex, Claude Code, or Cursor, and invoke the bundled
               migration skill. It measures first, owns the upgrade, and stops before external
               actions.
             </p>

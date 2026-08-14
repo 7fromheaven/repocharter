@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _policy import (  # noqa: E402
-    ALLOW, add_context, deny, fail_closed, harness, load_policy, path_matches,
+    add_context, allow, deny, fail_closed, harness, load_policy, path_matches,
     read_payload, script_lengths, write_paths,
 )
 
@@ -60,16 +60,20 @@ def main() -> None:
     policy = load_policy()
 
     for file_path in paths:
-        # Codex has no ConfigChange event. Protect the repo-local files that activate its
-        # own hooks at the write-tool boundary; legitimate regeneration goes through
-        # `repocharter apply`, whose Bash invocation is separately gated and reviewable.
-        if harness() == "codex" and any(
+        # Codex and Cursor have no equivalent live ConfigChange guard. Protect the
+        # repo-local files that activate their hooks at the write-tool boundary; legitimate
+        # regeneration goes through `repocharter apply`, whose Bash invocation is gated.
+        if harness() in {"codex", "cursor"} and any(
             path_matches(file_path, protected)
-            for protected in (".codex/hooks.json", ".codex/config.toml")
+            for protected in (
+                (".codex/hooks.json", ".codex/config.toml")
+                if harness() == "codex" else (".cursor/hooks.json",)
+            )
         ):
             deny(
-                f"RepoCharter policy: Codex may not edit its own enforcement file {file_path} "
-                "through apply_patch. Change the source kit and run `repocharter apply`."
+                f"RepoCharter policy: {harness()} may not edit its own enforcement file "
+                f"{file_path} through an agent write. Change the source kit and run "
+                "`repocharter apply`."
             )
 
         for rule in policy.get("denyWritePaths") or []:
@@ -104,7 +108,7 @@ def main() -> None:
             "if a count moves in a direction you did not intend, stop and say so."
         )
 
-    sys.exit(ALLOW)
+    allow()
 
 
 if __name__ == "__main__":

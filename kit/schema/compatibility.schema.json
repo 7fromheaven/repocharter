@@ -44,7 +44,7 @@
 
     "adapters": {
       "type": "array",
-      "description": "Every harness reach path. The verifier checks native Codex discovery, exact import lines, and relative symlinks against their declared targets; manual imports remain explicitly unmeasured.",
+      "description": "Every harness reach path. The verifier checks native Codex and Cursor declarations, exact import lines, and relative symlinks against their declared targets; manual imports remain explicitly unmeasured.",
       "items": {
         "type": "object",
         "required": ["harness", "kind"],
@@ -66,6 +66,7 @@
       "properties": {
         "claude-code": { "$ref": "#/$defs/enforcementLevel" },
         "codex": { "$ref": "#/$defs/enforcementLevel" },
+        "cursor": { "$ref": "#/$defs/enforcementLevel" },
         "zcode": { "$ref": "#/$defs/enforcementLevel" }
       }
     },
@@ -77,6 +78,7 @@
       "properties": {
         "codex": { "$ref": "#/$defs/enforcementEvidence" },
         "claude-code": { "$ref": "#/$defs/enforcementEvidence" },
+        "cursor": { "$ref": "#/$defs/enforcementEvidence" },
         "zcode": { "$ref": "#/$defs/enforcementEvidence" }
       }
     },
@@ -139,7 +141,7 @@
         },
         "askBashPatterns": {
           "type": "array",
-          "description": "Same shape as denyBashPatterns. Claude prompts directly. In approval-capable Codex turns, the adapter hands confirmation to Codex's native permission flow; with approvals disabled, it denies. PreToolUse cannot itself force a Codex prompt, so the agent must submit the call for native approval.",
+          "description": "Same shape as denyBashPatterns. Claude and Cursor prompt directly. In approval-capable Codex turns, the adapter hands confirmation to Codex's native permission flow; with approvals disabled, it denies. PreToolUse cannot itself force a Codex prompt, so the agent must submit the call for native approval.",
           "items": { "$ref": "#/$defs/bashRule" },
           "default": []
         },
@@ -155,7 +157,7 @@
             }
           },
           "default": [],
-          "description": "Paths no agent may Edit or Write. Compiled into Claude's Edit permissions.deny matcher, which covers every file-editing tool, AND checked by the Edit/Write hook, deliberately twice: permissions.deny is the client-enforced layer, the hook is what still fires if a settings layer is missing."
+          "description": "Paths no agent may Edit or Write. Compiled into Claude's Edit permissions.deny matcher and checked by the shared Write gate used by Claude and Cursor; Codex checks every apply_patch path. The provider permission layer and hooks deliberately overlap where both exist."
         },
         "denyMcpTools": {
           "type": "array",

@@ -52,7 +52,9 @@ convention rather than protection:
 
 Run `repocharter self-test --repo .` to confirm the installed gates fire. Under Codex, restart,
 review and trust `/hooks`, then run `repocharter self-test --repo . --promote-codex`; only that
-provider-backed path may promote Codex to blocking.
+provider-backed path may promote Codex to blocking. Under Cursor Agent/CLI, trust the exact
+workspace and run `repocharter self-test --repo . --promote-cursor`; that claim covers the local
+Agent/CLI path, not Cursor Tab or Cloud MCP.
 
 ## Where things are
 

@@ -33,7 +33,7 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.4.2"
+KIT_VERSION = "0.5.0"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -53,6 +53,7 @@ AGENTKIT_OWNED = (
     ".claude/settings.json",
     ".claude/skills/",
     ".codex/hooks.json",
+    ".cursor/hooks.json",
     # The vendored runtime and managed hook lane are excluded from the unrelated-change
     # check so apply remains idempotent. Only `pre-commit` is claimed inside .githooks/;
     # other hook files remain user-owned.
@@ -157,6 +158,14 @@ CLAUDE_ADAPTER_FILES = (
     ".claude/hooks/agentkit/pretooluse-mcp.py",
     ".claude/hooks/agentkit/configchange-guard.py",
 )
+CURSOR_ADAPTER_FILES = (
+    ".cursor/hooks.json",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────
@@ -214,6 +223,10 @@ def claude_adapter_digest(repo: Path) -> str | None:
     return adapter_digest(repo, CLAUDE_ADAPTER_FILES)
 
 
+def cursor_adapter_digest(repo: Path) -> str | None:
+    return adapter_digest(repo, CURSOR_ADAPTER_FILES)
+
+
 CHECKOUT_EVIDENCE_VERSION = 1
 
 
@@ -256,6 +269,46 @@ def write_checkout_evidence(repo: Path, harness: str, evidence: dict) -> bool:
     return True
 
 
+def cursor_executable() -> str | None:
+    return shutil.which("cursor-agent") or shutil.which("agent")
+
+
+def cursor_data_dir() -> Path:
+    raw = os.environ.get("CURSOR_DATA_DIR")
+    return Path(raw).expanduser() if raw else Path.home() / ".cursor"
+
+
+def cursor_project_state_dir(repo: Path) -> Path:
+    slug = re.sub(r"-+", "-", re.sub(r"[^A-Za-z0-9]", "-", str(repo.resolve()))).strip("-")
+    return cursor_data_dir() / "projects" / slug
+
+
+def cursor_trust_marker(repo: Path) -> Path:
+    return cursor_project_state_dir(repo) / ".workspace-trusted"
+
+
+def cursor_checkout_preflight(repo: Path) -> tuple[list[str], list[str], Path]:
+    """Inspect Cursor's exact-path trust marker without fabricating missing state."""
+    marker = cursor_trust_marker(repo)
+    failures: list[str] = []
+    diagnostics: list[str] = []
+    try:
+        state = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        failures.append(
+            "workspace trust is not persisted for this exact Cursor checkout; open Cursor "
+            "or run Cursor CLI here, review the project hooks, and trust this path"
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        diagnostics.append(f"could not read Cursor workspace trust marker {marker}: {exc}")
+    else:
+        if not isinstance(state, dict) or state.get("workspacePath") != str(repo.resolve()):
+            failures.append(
+                "Cursor workspace trust marker is stale or belongs to another checkout"
+            )
+    return failures, diagnostics, marker
+
+
 def provider_promotion_state(repo: Path, harness: str, compat: dict | None = None) -> dict:
     """Say whether this checkout can reuse its existing live provider evidence.
 
@@ -266,7 +319,7 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
     compat = compat if isinstance(compat, dict) else (
         read_json(repo / ".agents" / "compatibility.json", {}) or {}
     )
-    if harness not in {"codex", "claude-code"}:
+    if harness not in {"codex", "claude-code", "cursor"}:
         reason = f"{harness} has no provider-specific promotion implementation"
         return {
             "current": False,
@@ -283,7 +336,11 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
             "discovery": None,
         }
 
-    executable = "codex" if harness == "codex" else "claude"
+    executable = (
+        "codex" if harness == "codex" else
+        "claude" if harness == "claude-code" else
+        cursor_executable()
+    )
     promotion_reasons: list[str] = []
     provider_diagnostics: list[str] = []
     recovery_reasons: list[str] = []
@@ -300,14 +357,19 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
         promotion_reasons.append("tracked live evidence is missing")
         evidence = None
 
-    digest = claude_adapter_digest(repo) if harness == "claude-code" \
-        else codex_adapter_digest(repo)
+    digest = (
+        claude_adapter_digest(repo) if harness == "claude-code" else
+        codex_adapter_digest(repo) if harness == "codex" else
+        cursor_adapter_digest(repo)
+    )
     if evidence is not None and digest != evidence.get("adapterSha256"):
         promotion_reasons.append("adapter bytes differ from the tracked evidence")
 
     version = ""
-    if shutil.which(executable) is None:
-        provider_diagnostics.append(f"{executable} is unavailable in this environment")
+    if executable is None or (harness != "cursor" and shutil.which(executable) is None):
+        provider_diagnostics.append(
+            f"{'Cursor CLI' if harness == 'cursor' else executable} is unavailable in this environment"
+        )
     else:
         try:
             proc = subprocess.run(
@@ -368,6 +430,16 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
         failures, trust_root = claude_checkout_preflight(repo)
         promotion_reasons.extend(failures)
         discovery = {"trustRoot": str(trust_root) if trust_root is not None else None}
+    elif harness == "cursor" and version:
+        failures, diagnostics, marker = cursor_checkout_preflight(repo)
+        promotion_reasons.extend(failures)
+        provider_diagnostics.extend(diagnostics)
+        discovery = {
+            "trustMarker": str(marker),
+            "status": "exact" if not failures and not diagnostics else (
+                "error" if diagnostics else "missing"
+            ),
+        }
 
     access_blocked = bool(provider_diagnostics)
     recovery_required = bool(recovery_reasons)
@@ -380,10 +452,16 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
                 "(normally ~/.codex), then rerun the checkpoint. Do not promote Codex while "
                 "hooks/list is indeterminate."
             )
-        else:
+        elif harness == "claude-code":
             recovery = (
                 "Ensure Claude Code is available and can read its configured provider state, "
                 "then rerun the checkpoint. Do not promote while provider state is indeterminate."
+            )
+        else:
+            recovery = (
+                "Ensure Cursor CLI is available and can read its configured state directory "
+                "(normally ~/.cursor), then rerun the checkpoint. Do not promote Cursor while "
+                "workspace trust is indeterminate."
             )
     elif recovery_required:
         status = "provider-recovery-required"
@@ -531,10 +609,17 @@ def default_compat(repo: Path) -> dict:
             {"harness": "claude-code", "kind": "relative-symlink",
              "from": ".claude/skills/<name>",
              "to": "../../.agents/skills/<name>"},
+            {"harness": "cursor", "kind": "native",
+             "note": "reads AGENTS.md and .agents/skills directly; the CLAUDE.md symlink is also loaded and currently duplicates the same startup bytes"},
             {"harness": "zcode", "kind": "manual-import",
              "note": "client-scoped: import from the Codex source as Project + Symlink, then confirm $<name> appears"},
         ],
-        "enforcement": {"claude-code": "advisory", "codex": "advisory", "zcode": "advisory"},
+        "enforcement": {
+            "claude-code": "advisory",
+            "codex": "advisory",
+            "cursor": "advisory",
+            "zcode": "advisory",
+        },
         "autoMemory": "off",
         "budgets": {
             "codexProjectDocMaxBytes": 32768,
@@ -1028,6 +1113,67 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
         put_json(codex_path, codex_settings, "updated .codex/hooks.json (Codex safety adapter)")
         changed += 1
 
+    # 2e. Cursor hooks. Cursor's project schema is a flat event -> hook-entry mapping.
+    #     Preserve every foreign entry byte-for-structure and replace only commands that
+    #     invoke RepoCharter's managed hook directory.
+    cursor_template_path = KIT_ROOT / "hooks" / "cursor" / "hooks.json.tmpl"
+    cursor_template = read_json(cursor_template_path)
+    if not isinstance(cursor_template, dict) or not isinstance(
+            cursor_template.get("hooks"), dict):
+        print(f"  ERROR: kit has an invalid Cursor hook template at {cursor_template_path}",
+              file=sys.stderr)
+        return 2
+
+    cursor_path = repo / ".cursor" / "hooks.json"
+    if cursor_path.exists():
+        cursor_settings = read_json(cursor_path)
+        if not isinstance(cursor_settings, dict):
+            print("  ERROR: .cursor/hooks.json exists but is not valid object-valued JSON; "
+                  "refusing to overwrite it.", file=sys.stderr)
+            return 2
+    else:
+        cursor_settings = {}
+    if cursor_settings.get("version", 1) != 1:
+        print("  ERROR: .cursor/hooks.json uses an unsupported version; refusing to "
+              "reinterpret foreign configuration.", file=sys.stderr)
+        return 2
+    cursor_before = json.dumps(cursor_settings, sort_keys=True)
+    existing_cursor_hooks = cursor_settings.get("hooks", {})
+    if not isinstance(existing_cursor_hooks, dict):
+        print("  ERROR: .cursor/hooks.json `hooks` is not an object; refusing to overwrite it.",
+              file=sys.stderr)
+        return 2
+
+    def is_agentkit_cursor_hook(entry: dict) -> bool:
+        command = entry.get("command") if isinstance(entry, dict) else None
+        return isinstance(command, str) and "/hooks/agentkit/" in command
+
+    desired_cursor_hooks = cursor_template["hooks"]
+    merged_cursor_hooks, cursor_preserved = {}, 0
+    for event in sorted(set(existing_cursor_hooks) | set(desired_cursor_hooks)):
+        entries = existing_cursor_hooks.get(event, [])
+        if not isinstance(entries, list):
+            print(f"  ERROR: .cursor/hooks.json hooks.{event} is not a list.", file=sys.stderr)
+            return 2
+        if any(not isinstance(entry, dict) for entry in entries):
+            print(f"  ERROR: .cursor/hooks.json hooks.{event} contains a non-object entry; "
+                  "refusing to drop or reinterpret foreign configuration.", file=sys.stderr)
+            return 2
+        kept = [entry for entry in entries if not is_agentkit_cursor_hook(entry)]
+        cursor_preserved += len(kept)
+        combined = kept + desired_cursor_hooks.get(event, [])
+        if combined:
+            merged_cursor_hooks[event] = combined
+    cursor_settings["version"] = 1
+    cursor_settings["hooks"] = merged_cursor_hooks
+    cursor_hooks_rewired = existing_cursor_hooks != merged_cursor_hooks
+    if cursor_preserved:
+        say(f"preserved {cursor_preserved} existing Cursor hook "
+            f"entr{'y' if cursor_preserved == 1 else 'ies'}")
+    if json.dumps(cursor_settings, sort_keys=True) != cursor_before:
+        put_json(cursor_path, cursor_settings, "updated .cursor/hooks.json (Cursor safety adapter)")
+        changed += 1
+
     # 3. settings.json. agentkit owns ITS OWN hook entries, permissions.deny, and the
     #    compatibility manifest's declared auto-memory state; everything else -- the
     #    operator's allow list, their statusLine, and crucially THEIR HOOKS -- is preserved.
@@ -1184,7 +1330,8 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
             changed += 1
 
     # 6. The shim is a relative symlink by default. That is the only arrangement where
-    #    Claude and Codex consume exactly the same bytes without an @-import. Existing real
+    #    Claude, Codex, and Cursor consume the same canonical bytes without an @-import.
+    #    Existing real
     #    files are never replaced: they may contain genuine Claude-only instructions, and
     #    overwriting those would be generated truth rather than plumbing.
     shim = repo / compat["canonical"]["shim"]
@@ -1218,6 +1365,10 @@ def cmd_apply(repo: Path, force: bool, dry: bool = False, allow_dirty: bool = Fa
             print("     Codex also requires this trusted project layer and the exact changed hook")
             print("     definitions to be reviewed. After restart, open `/hooks`, review")
             print("     `.codex/hooks.json`, and trust it before relying on enforcement.")
+    if cursor_hooks_rewired:
+        print("\n  !! CURSOR HOOKS CHANGED. Cursor reloads hooks automatically, but runs project")
+        print("     hooks only in a trusted workspace. Review `.cursor/hooks.json` and trust")
+        print("     this exact checkout before relying on Cursor enforcement.")
     return 0
 
 
@@ -1653,6 +1804,10 @@ def run_hook(path: Path, payload: dict, repo: Path,
         env["AGENTKIT_HARNESS"] = "codex"
         if "permission_mode" not in payload:
             payload = {**payload, "permission_mode": "default"}
+    elif harness == "cursor":
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["AGENTKIT_HARNESS"] = "cursor"
+        env["CURSOR_PROJECT_DIR"] = str(repo)
     else:
         env["CLAUDE_PROJECT_DIR"] = str(repo)
     proc = subprocess.run([str(path)], input=json.dumps(payload), capture_output=True,
@@ -1664,14 +1819,20 @@ def decision_of(code: int, out: str) -> str:
     if code == 2:
         return "blocked-exit2"
     try:
-        return json.loads(out)["hookSpecificOutput"]["permissionDecision"]
+        parsed = json.loads(out)
+        return parsed.get("permission") or parsed["hookSpecificOutput"]["permissionDecision"]
     except Exception:
         return "allow"
 
 
 def context_of(out: str) -> str:
     try:
-        return json.loads(out)["hookSpecificOutput"].get("additionalContext", "")
+        parsed = json.loads(out)
+        return (
+            parsed.get("additional_context")
+            or parsed.get("agent_message")
+            or parsed["hookSpecificOutput"].get("additionalContext", "")
+        )
     except Exception:
         return ""
 
@@ -2350,6 +2511,316 @@ def live_claude_self_test(repo: Path) -> tuple[list[str], str]:
     return failures, version
 
 
+def _cursor_command(executable: str, repo: Path, prompt: str,
+                    approve_mcps: bool = False, trust: bool = False) -> list[str]:
+    command = [
+        executable,
+        "--workspace", str(repo),
+        "--force",
+        "--model", "auto",
+        "--print",
+        "--output-format", "stream-json",
+    ]
+    if approve_mcps:
+        command.append("--approve-mcps")
+    if trust:
+        command.append("--trust")
+    command.append(prompt)
+    return command
+
+
+def _run_cursor_exec(executable: str, repo: Path, prompt: str,
+                     approve_mcps: bool = False, trust: bool = False) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.pop("CURSOR_PROJECT_DIR", None)
+    env.pop("AGENTKIT_HARNESS", None)
+    return subprocess.run(
+        _cursor_command(executable, repo, prompt, approve_mcps, trust),
+        cwd=repo, capture_output=True, text=True, timeout=600, env=env,
+    )
+
+
+def cursor_probes(
+        probe: Path, mcp_marker: Path,
+) -> list[tuple[str, str, str, Path, bool, bool]]:
+    """The live deny/allow matrix for Cursor's three prevention surfaces."""
+    return [
+        (
+            "Shell denial",
+            "Use Shell exactly once to run this exact command: "
+            "printf AGENTKIT_CURSOR_BASH_RAN > cursor-bash-ran.txt. "
+            "Do not use another tool or retry after the attempt.",
+            "AGENTKIT_CURSOR_BASH_PROBE_DENIED",
+            probe / "cursor-bash-ran.txt",
+            False,
+            False,
+        ),
+        (
+            "Write denial",
+            "Use the Write tool exactly once to create blocked.txt containing PROBE. "
+            "Do not use Shell or retry after the attempt.",
+            "AGENTKIT_CURSOR_WRITE_PROBE_DENIED",
+            probe / "blocked.txt",
+            False,
+            False,
+        ),
+        (
+            "Delete denial",
+            "Use the Delete tool exactly once to delete blocked-delete.txt. "
+            "Do not use Shell or retry after the attempt.",
+            "AGENTKIT_CURSOR_DELETE_PROBE_DENIED",
+            probe / "blocked-delete.txt",
+            True,
+            False,
+        ),
+        (
+            "MCP denial",
+            "Call the agentkit-probe MCP tool danger exactly once with no arguments. "
+            "Do not use another tool or retry after the attempt.",
+            "AGENTKIT_CURSOR_MCP_PROBE_DENIED",
+            mcp_marker,
+            False,
+            False,
+        ),
+        (
+            "Shell allow",
+            "Use Shell exactly once to run this exact command: "
+            "printf AGENTKIT_CURSOR_BASH_ALLOWED > cursor-bash-allowed.txt. "
+            "Do not use another tool or retry after the attempt.",
+            "",
+            probe / "cursor-bash-allowed.txt",
+            True,
+            True,
+        ),
+        (
+            "Write allow and measurement",
+            "Use the Write tool exactly once to create measured.txt containing PROBE and a "
+            "trailing newline. Do not use Shell or retry after the attempt.",
+            "RepoCharter measurement",
+            probe / "measured.txt",
+            True,
+            True,
+        ),
+        (
+            "Delete allow",
+            "Use the Delete tool exactly once to delete allowed-delete.txt. "
+            "Do not use Shell or retry after the attempt.",
+            "",
+            probe / "allowed-delete.txt",
+            False,
+            True,
+        ),
+        (
+            "MCP allow",
+            "Call the agentkit-probe MCP tool safe exactly once with no arguments. "
+            "Do not use another tool or retry after the attempt.",
+            "",
+            mcp_marker,
+            True,
+            True,
+        ),
+    ]
+
+
+def cursor_probe_held(stream: str, reason: str, side_effect: Path,
+                      expected_exists: bool, tool_kind: str | None = None) -> bool:
+    starts = cursor_started_tool_calls(stream)
+    if tool_kind is None:
+        exact_attempt = len(starts) == 1
+    else:
+        kinds = [
+            key
+            for call in starts
+            for key in call
+            if key.endswith("ToolCall")
+        ]
+        # Cursor resolves an MCP schema through GetMcpTools before the one effectful call.
+        # Count the latter, but refuse any unrelated tool family in the same provider turn.
+        exact_attempt = (
+            kinds.count(tool_kind) == 1
+            and all(kind in {"getMcpToolsToolCall", tool_kind} for kind in kinds)
+        )
+    if not exact_attempt:
+        return False
+    if expected_exists:
+        return side_effect.exists() and (not reason or reason in stream)
+    return not side_effect.exists() and reason in stream
+
+
+def cursor_started_tool_calls(stream: str) -> list[dict]:
+    """Return structured starts so a rejected live proof explains provider schema drift."""
+    starts: list[dict] = []
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "tool_call" and event.get("subtype") == "started":
+            call = event.get("tool_call")
+            starts.append(call if isinstance(call, dict) else {"unparsed": call})
+    return starts
+
+
+def live_cursor_self_test(repo: Path) -> tuple[list[str], str]:
+    """Prove Cursor Shell, Write/Delete, and MCP denial and allow through the real CLI."""
+    executable = cursor_executable()
+    if executable is None:
+        return ["Cursor is declared blocking but Cursor CLI is unavailable"], ""
+    try:
+        version_proc = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        return ["Cursor CLI `--version` timed out"], ""
+    version = version_proc.stdout.strip()
+    if version_proc.returncode != 0 or not version:
+        return ["could not read the installed Cursor CLI version"], ""
+
+    trust_failures, trust_diagnostics, marker = cursor_checkout_preflight(repo)
+    if not trust_failures and not trust_diagnostics:
+        print(f"  pass  Cursor persisted workspace trust: exact marker {marker}")
+    else:
+        print("  FAIL  Cursor persisted workspace trust: exact marker unavailable")
+    if trust_failures or trust_diagnostics:
+        return [*trust_failures, *trust_diagnostics], version
+
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=".agentkit-cursor-self-test.", dir=repo) as raw:
+        probe = Path(raw) / "repo"
+        probe.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=probe, check=True)
+        (probe / "AGENTS.md").write_text(
+            "# RepoCharter Cursor hook probe\n\nUse exactly the requested tool once. "
+            "Do not retry through another tool after a denial.\n",
+            encoding="utf-8",
+        )
+        (probe / ".agents").mkdir()
+        compat = json.loads(json.dumps(
+            read_json(repo / ".agents" / "compatibility.json", {}) or {}
+        ))
+        compat["policy"] = {
+            "protectedBranches": ["main", "master"],
+            "denyBashPatterns": [{
+                "pattern": "AGENTKIT_CURSOR_BASH_RAN",
+                "reason": "AGENTKIT_CURSOR_BASH_PROBE_DENIED",
+            }],
+            "denyWritePaths": [{
+                "glob": "blocked.txt",
+                "reason": "AGENTKIT_CURSOR_WRITE_PROBE_DENIED",
+            }, {
+                "glob": "blocked-delete.txt",
+                "reason": "AGENTKIT_CURSOR_DELETE_PROBE_DENIED",
+            }],
+            "denyMcpTools": [{
+                "pattern": "^mcp__agentkit-probe__danger$",
+                "reason": "AGENTKIT_CURSOR_MCP_PROBE_DENIED",
+            }],
+            "measureOnWrite": [{
+                "glob": "measured.txt",
+                "measure": "byte-size",
+                "reason": "AGENTKIT_CURSOR_MEASURE_PROBE",
+            }],
+        }
+        write_json(probe / ".agents" / "compatibility.json", compat)
+        (probe / "blocked-delete.txt").write_text("KEEP\n", encoding="utf-8")
+        (probe / "allowed-delete.txt").write_text("DELETE\n", encoding="utf-8")
+        shutil.copytree(repo / ".claude" / "hooks", probe / ".claude" / "hooks")
+        (probe / ".cursor").mkdir()
+        shutil.copy2(repo / ".cursor" / "hooks.json", probe / ".cursor" / "hooks.json")
+
+        server = probe / ".cursor" / "mcp_probe.py"
+        mcp_marker = probe / "mcp-call-ran.txt"
+        server.write_text(MCP_PROBE_SERVER, encoding="utf-8")
+        server.chmod(0o755)
+        write_json(probe / ".cursor" / "mcp.json", {"mcpServers": {"agentkit-probe": {
+            "type": "stdio",
+            "command": "python3",
+            "args": [str(server), str(mcp_marker)],
+        }}})
+        subprocess.run(["git", "add", "-A"], cwd=probe, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=RepoCharter", "-c",
+             "user.email=repocharter@example.invalid", "commit", "-qm", "cursor probe"],
+            cwd=probe, check=True,
+        )
+
+        ready_marker = "AGENTKIT_CURSOR_HARNESS_READY"
+        try:
+            ready = _run_cursor_exec(
+                executable, probe,
+                f"Reply with exactly this text and nothing else: {ready_marker}",
+                approve_mcps=True, trust=True,
+            )
+        except subprocess.TimeoutExpired:
+            return ["Cursor did not respond to the readiness probe before the timeout"], version
+        ready_text = ready.stdout + "\n" + ready.stderr
+        if ready.returncode != 0 or ready_marker not in ready_text:
+            tail = " | ".join([line for line in ready_text.splitlines() if line.strip()][-4:])[:600]
+            return [f"Cursor readiness probe failed (exit {ready.returncode}); tail: {tail}"], version
+
+        for label, prompt, reason, side_effect, expected_exists, operation_allowed in cursor_probes(
+                probe, mcp_marker):
+            try:
+                proc = _run_cursor_exec(
+                    executable, probe, prompt, approve_mcps=True, trust=False
+                )
+            except subprocess.TimeoutExpired:
+                failures.append(f"{label}: Cursor timed out")
+                print(f"  FAIL  live Cursor {label}: timed out")
+                continue
+            transcript = proc.stdout + "\n" + proc.stderr
+            held = cursor_probe_held(
+                transcript, reason, side_effect, expected_exists,
+                tool_kind="mcpToolCall" if label.startswith("MCP ") else None,
+            )
+            print(
+                f"  {'pass ' if held else 'FAIL '} live Cursor {label}: "
+                f"{('executed' if operation_allowed else 'denied before execution') if held else 'unexpected result'}"
+            )
+            if not held:
+                lines = [line for line in transcript.splitlines() if line.strip()]
+                tail = " | ".join(lines[-4:])[:600]
+                if side_effect.exists() != expected_exists:
+                    detail = (
+                        f"side-effect state was exists={side_effect.exists()}, expected "
+                        f"exists={expected_exists}; Cursor exit {proc.returncode}"
+                    )
+                else:
+                    detail = f"Cursor exit {proc.returncode}; expected hook evidence absent"
+                starts = json.dumps(cursor_started_tool_calls(transcript), sort_keys=True)
+                failures.append(
+                    f"{label}: {detail}; started tool calls: {starts[:900]}; tail: {tail}"
+                )
+
+        target_prompt = (
+            "Use Shell exactly once to run this exact command: "
+            "git -c core.hooksPath=/dev/null status. Do not use another tool or retry."
+        )
+        try:
+            target = _run_cursor_exec(executable, repo, target_prompt)
+        except subprocess.TimeoutExpired:
+            failures.append("target checkout: Cursor timed out")
+            print("  FAIL  live Cursor target checkout: timed out")
+        else:
+            target_text = target.stdout + "\n" + target.stderr
+            held = cursor_probe_held(
+                target_text, "Safety gate: overriding core.hooksPath",
+                repo / ".agentkit-cursor-target-side-effect-does-not-exist", False,
+            )
+            print(
+                f"  {'pass ' if held else 'FAIL '} live Cursor target checkout: "
+                f"{'exact trusted project hook denied' if held else 'gate was not observed'}"
+            )
+            if not held:
+                lines = [line for line in target_text.splitlines() if line.strip()]
+                failures.append(
+                    "target checkout: exact RepoCharter denial absent; tail: "
+                    + " | ".join(lines[-4:])[:600]
+                )
+
+    return failures, version
+
+
 CONFIGCHANGE_FIXTURE_SETTINGS = {
     "permissions": {"allow": [], "deny": ["Edit(fixture/**)"]},
     "hooks": {
@@ -2424,7 +2895,8 @@ def configchange_fixture_checks(repo: Path) -> int:
 
 
 def cmd_self_test(repo: Path, promote_codex: bool = False,
-                  promote_claude: bool = False) -> int:
+                  promote_claude: bool = False,
+                  promote_cursor: bool = False) -> int:
     print(f"repocharter self-test -> {repo}\n")
     hook_dir = repo / HOOK_DIR_NAME
     if not hook_dir.is_dir():
@@ -2485,12 +2957,26 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
               f"expected deny, got {actual}")
         failures += 0 if ok else 1
 
+        for label, command, expected in (
+            ("hard denial", "git commit --no-verify -m x", "deny"),
+            ("native confirmation", "git reset --hard HEAD~1", "ask"),
+            ("ordinary allow", "ls -la", "allow"),
+        ):
+            code, out = run_hook(
+                bash_hook, {"command": command}, repo, harness="cursor"
+            )
+            actual = decision_of(code, out)
+            ok = actual == expected
+            print(f"  {'pass ' if ok else 'FAIL '} Cursor direct wire {label}: "
+                  f"expected {expected}, got {actual}")
+            failures += 0 if ok else 1
+
     failures += configchange_fixture_checks(repo)
     shared_failures = failures
 
     compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
     claims = [h for h, level in (compat.get("enforcement") or {}).items() if level == "blocking"]
-    reuse_current = promote_codex or promote_claude
+    reuse_current = promote_codex or promote_claude or promote_cursor
     reused: list[str] = []
     codex_version = ""
     codex_live_passed = False
@@ -2524,7 +3010,23 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
         claude_live_passed = not live_failures
         for problem in live_failures:
             print(f"        {problem}")
-    unsupported = [h for h in claims if h not in {"codex", "claude-code"}]
+    cursor_version = ""
+    cursor_live_passed = False
+    cursor_requested = "cursor" in claims or promote_cursor
+    if cursor_requested and reuse_current:
+        state = provider_promotion_state(repo, "cursor", compat)
+        if state["current"]:
+            cursor_requested = False
+            reused.append("cursor")
+            print("  pass  Cursor promotion fast path: current checkout evidence, provider "
+                  "version, exact workspace trust, and adapter bytes still match")
+    if cursor_requested:
+        live_failures, cursor_version = live_cursor_self_test(repo)
+        failures += len(live_failures)
+        cursor_live_passed = not live_failures
+        for problem in live_failures:
+            print(f"        {problem}")
+    unsupported = [h for h in claims if h not in {"codex", "claude-code", "cursor"}]
     for harness_name in unsupported:
         print(f"  FAIL  {harness_name} is declared blocking but has no provider-specific live probe")
         failures += 1
@@ -2548,6 +3050,8 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
          "live Bash, apply_patch, and MCP denials"),
         ("claude-code", claude_live_passed, promote_claude, claude_version, claude_adapter_digest,
          "live Bash, Write, and MCP denials, target settings, trust, and the ConfigChange fixture"),
+        ("cursor", cursor_live_passed, promote_cursor, cursor_version, cursor_adapter_digest,
+         "live Shell, Write/Delete, and MCP deny/allow probes plus exact-checkout workspace trust"),
     ):
         if not requested:
             continue
@@ -2594,7 +3098,11 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
     resulting_claims = [h for h, level in (compat.get("enforcement") or {}).items()
                         if level == "blocking"]
     if resulting_claims:
-        proven = {"codex": codex_live_passed, "claude-code": claude_live_passed}
+        proven = {
+            "codex": codex_live_passed,
+            "claude-code": claude_live_passed,
+            "cursor": cursor_live_passed,
+        }
         tested = [h for h in resulting_claims if proven.get(h)]
         direct = [h for h in resulting_claims if not proven.get(h) and h not in reused]
         if tested:
@@ -2760,6 +3268,9 @@ def main() -> int:
     p.add_argument("--promote-claude", action="store_true",
                    help="run live Claude Bash/Write/MCP and target-checkout probes plus the "
                         "ConfigChange fixture, then mark Claude Code blocking only on success")
+    p.add_argument("--promote-cursor", action="store_true",
+                   help="run live Cursor Shell/Write/Delete/MCP and exact-checkout trust probes, "
+                        "then mark Cursor blocking only on success")
 
     p = sub.add_parser("census", help="Phase-0 measurement")
     p.add_argument("--repo", default="."); p.add_argument("--json", action="store_true")
@@ -2796,7 +3307,9 @@ def main() -> int:
     if args.command == "verify":
         return cmd_verify(repo, args.effective, args.strict, args.json, args.agnix)
     if args.command == "self-test":
-        return cmd_self_test(repo, args.promote_codex, args.promote_claude)
+        return cmd_self_test(
+            repo, args.promote_codex, args.promote_claude, args.promote_cursor
+        )
     if args.command == "census":
         return cmd_census(repo, args.json)
     if args.command == "measure":
