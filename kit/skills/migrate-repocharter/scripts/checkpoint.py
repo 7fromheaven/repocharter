@@ -129,6 +129,14 @@ def checkpoint(repo: Path, effective: bool) -> dict:
 
     codex = providers.get("codex") or {}
     codex_discovery = codex.get("discovery") or {}
+    blocked_providers = [
+        harness for harness, state in providers.items()
+        if state.get("providerAccessBlocked") is True
+    ]
+    recovery_providers = [
+        harness for harness, state in providers.items()
+        if state.get("providerRecoveryRequired") is True
+    ]
     broken_linked_discovery = (
         checkout_shape == "linked-worktree"
         and codex_discovery.get("status") in {"missing", "wrong-checkout"}
@@ -145,13 +153,45 @@ def checkpoint(repo: Path, effective: bool) -> dict:
         if operating_agentkit is not None else list(porcelain)
     unrelated = unrelated or []
     dirty_requires_clone = bool(unrelated) and upgrade_required
-    route = "standalone-clone" if broken_linked_discovery or dirty_requires_clone else "in-place"
+    if blocked_providers:
+        route = "provider-access-blocked"
+    elif broken_linked_discovery or dirty_requires_clone:
+        route = "standalone-clone"
+    else:
+        route = "in-place"
     standalone_mode = None
     if route == "standalone-clone":
         # Source substitution means migration changes are already prepared in this checkout;
         # preserving them is the point of the fallback. Other dirty trees conservatively start
         # from clean HEAD so unrelated work remains only in the untouched source checkout.
         standalone_mode = "preserve-state" if broken_linked_discovery else "clean-head"
+    if route == "provider-access-blocked":
+        if "codex" in blocked_providers:
+            next_action = (
+                "rerun the checkpoint where Codex can read and write its configured state "
+                "directory (normally ~/.codex); do not promote while hooks/list is indeterminate"
+            )
+        else:
+            next_action = (
+                "rerun the checkpoint where the blocked provider runtime and state are accessible; "
+                "do not promote from this indeterminate result"
+            )
+    elif ready_without_promotion:
+        next_action = "continue with validation/integration; do not rerun live provider probes"
+    elif route == "standalone-clone":
+        next_action = (
+            f"prepare_standalone.py --mode {standalone_mode}; continue in the resulting checkout"
+        )
+    elif recovery_providers:
+        next_action = (
+            "resolve the named provider recovery findings, then rerun the checkpoint; promote "
+            "only if promotionRequired remains true after recovery"
+        )
+    else:
+        next_action = (
+            "fix verification findings, then promote only providers whose promotionRequired "
+            "field is true"
+        )
     return {
         "repo": str(repo),
         "checkout": {
@@ -167,10 +207,13 @@ def checkpoint(repo: Path, effective: bool) -> dict:
         "manifestVersion": compat.get("agentkitVersion"),
         "strictVerification": verification,
         "providers": providers,
+        "blockedProviders": blocked_providers,
+        "recoveryProviders": recovery_providers,
         "route": route,
         "standaloneMode": standalone_mode,
         "unrelatedChanges": unrelated,
         "readyWithoutPromotion": ready_without_promotion,
+        "nextAction": next_action,
     }
 
 
@@ -186,16 +229,43 @@ def print_human(report: dict) -> None:
     label = "PASS" if verify.get("passed") else ("FAIL" if verify.get("ran") else "NOT RUN")
     print(f"  verification {label}{' (effective)' if verify.get('effective') else ''}")
     for harness, state in report["providers"].items():
-        print(f"  {harness:<12} {'current; no promotion' if state['current'] else 'promotion required'}")
-        for reason in state["reasons"]:
-            print(f"    - {reason}")
+        if state.get("current"):
+            provider_label = "current; no promotion"
+        elif state.get("providerAccessBlocked"):
+            provider_label = (
+                "provider access blocked; separate promotion drift proven"
+                if state.get("promotionRequired")
+                else "provider access blocked; promotion not established"
+            )
+        elif state.get("providerRecoveryRequired"):
+            provider_label = (
+                "provider recovery required; separate promotion drift proven"
+                if state.get("promotionRequired")
+                else "provider recovery required; promotion not established"
+            )
+        else:
+            provider_label = (
+                "promotion required" if state.get("promotionRequired") else "not current"
+            )
+        print(f"  {harness:<12} {provider_label}")
+        promotion_reasons = state.get("promotionReasons")
+        recovery_reasons = state.get("recoveryReasons")
+        provider_diagnostics = state.get("providerDiagnostics")
+        if (promotion_reasons is None and recovery_reasons is None
+                and provider_diagnostics is None):
+            promotion_reasons = state.get("reasons") or []
+            recovery_reasons = []
+            provider_diagnostics = []
+        for reason in promotion_reasons or []:
+            print(f"    - promotion: {reason}")
+        for reason in recovery_reasons or []:
+            print(f"    - recovery: {reason}")
+        for diagnostic in provider_diagnostics or []:
+            print(f"    - diagnostic: {diagnostic}")
+        if state.get("recovery"):
+            print(f"    - recovery: {state['recovery']}")
     print(f"  route        {report['route']}")
-    if report["readyWithoutPromotion"]:
-        print("  next         continue with validation/integration; do not rerun live provider probes")
-    elif report["route"] == "standalone-clone":
-        print(f"  next         prepare_standalone.py --mode {report['standaloneMode']}; continue there")
-    else:
-        print("  next         fix verification findings, then promote only providers named above")
+    print(f"  next         {report['nextAction']}")
 
 
 def main() -> int:

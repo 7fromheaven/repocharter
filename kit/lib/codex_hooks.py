@@ -187,6 +187,8 @@ def query_discovery(
 
     if response is None:
         message = "Codex hooks/list timed out" if timed_out else "Codex hooks/list returned no response"
+        if not timed_out and proc.returncode not in (None, 0):
+            message += f" (subprocess exit {proc.returncode})"
         detail = next((line.strip() for line in reversed(stderr_lines) if line.strip()), "")
         if detail:
             message += f": {detail}"
