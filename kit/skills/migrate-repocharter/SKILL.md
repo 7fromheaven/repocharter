@@ -1,6 +1,6 @@
 ---
 name: migrate-repocharter
-description: Migrate, upgrade, resume, promote, verify, or integrate RepoCharter in a repository. Use when adopting RepoCharter, updating its vendored kit, recovering an interrupted migration, proving Claude Code, Codex, or Cursor enforcement, handling provider trust in a linked worktree, or finishing a prepared migration branch.
+description: Migrate, upgrade, resume, promote, verify, or integrate RepoCharter in a repository. Use when adopting RepoCharter, updating its vendored kit, recovering an interrupted migration, proving Claude Code, Codex, Cursor, or OpenCode enforcement, handling provider trust in a linked worktree, or finishing a prepared migration branch.
 ---
 
 # Migrate RepoCharter
@@ -41,7 +41,8 @@ Follow its route:
 - `provider-access-blocked`: stop provider work and rerun the checkpoint in an environment where
   the named provider can access its runtime state. For Codex, the process must be able to read and
   write the configured state directory (normally `~/.codex`); Cursor similarly needs its configured
-  state directory (normally `~/.cursor`). Preserve the reported diagnostic; do not promote while
+  state directory (normally `~/.cursor`), and OpenCode needs its selected user config directory.
+  Preserve the reported diagnostic; do not promote while
   discovery or workspace trust is indeterminate.
 - `standalone-clone`: create an independent normal clone with the mode named by the checkpoint:
 
@@ -72,7 +73,8 @@ Follow its route:
    Runtime unavailability, missing discovery, and wrong-checkout discovery are not evidence of
    stale trust. A provider marked current has matching adapter bytes, CLI version, checkout-local
    attestation, effective settings, and—under Codex—the exact trusted project hook source or—under
-   Cursor—the exact persisted workspace-trust marker.
+   Cursor—the exact persisted workspace-trust marker. OpenCode state also binds the managed
+   user-level plugin; `--pure` sessions are outside that claim.
 6. After any provider promotion, run one final fixed-point, strict/effective verification,
    measurement, and repository validation pass. Commit only the migration branch unless the user
    separately authorized integration.
@@ -100,6 +102,12 @@ When promotion is actually required:
 - Cursor Agent/CLI: review and trust the exact target workspace, then run
   `repocharter self-test --repo . --promote-cursor`. This proves local Agent/CLI Shell, Write, and
   MCP paths; it does not claim Cursor Tab or Cloud MCP.
+- OpenCode local CLI/TUI: explicitly authorize the user-config mutation, then run
+  `repocharter self-test --repo . --promote-opencode`. If OpenCode has no configured default model,
+  add `--opencode-model <ollama-model>`; the probe then uses `ollama launch opencode`. Promotion
+  installs one managed user-level plugin and no repo-local `.opencode` startup file. Restart every
+  running OpenCode TUI after the plugin changes. OpenCode `ask` decisions fail closed as denials;
+  `--pure`, attached/remote/cloud surfaces, and ambiguous sanitized MCP identities are unclaimed.
 
 An approval-capable agent may operate both installed provider CLIs. Provider identity is not the
 boundary; the target checkout, fresh settings, native trust, and live deny/allow evidence are.

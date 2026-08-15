@@ -19,9 +19,9 @@ With RepoCharter, you get:
   project knowledge.
 - **No service to run and no package to install**—just Python 3 and files committed with your repo.
 
-> Current version: **RepoCharter 0.5.0** · CLI: `kit/repocharter`
+> Current version: **RepoCharter 0.6.0** · CLI: `kit/repocharter`
 >
-> **467 tests** · **zero runtime dependencies**
+> **503 tests** · **zero runtime dependencies**
 
 `kit/repocharter` is the canonical command. Existing repositories and automation can keep using
 `kit/agentkit`; it is a silent compatibility wrapper around the same implementation, not a second
@@ -86,7 +86,7 @@ authoritative project state.
 | **Codex** | Native `AGENTS.md` and `.agents/skills/` discovery | Project hooks for Bash, `apply_patch`, MCP, and post-write measurement | **Checkout-verified enforcement** — exact-hook trust and live deny/allow proof required per checkout |
 | **Claude Code** | `CLAUDE.md` and skill symlinks reach the same canonical files | Hooks for Bash, writes, MCP, config changes, and post-write measurement | **Checkout-verified enforcement** — live deny/allow proof required per checkout |
 | **Cursor Agent/CLI** | Native `AGENTS.md` and `.agents/skills/` discovery | Project hooks for Shell, Write/Delete, local MCP, and post-write measurement | **Checkout-verified enforcement** for local Agent/CLI — exact-workspace trust and live deny/allow proof required per checkout |
-| **OpenCode** | Native `AGENTS.md` and `.agents/skills/` discovery | No RepoCharter tool-call adapter yet; pre-commit verification still applies | **Advisory** |
+| **OpenCode** | Native `AGENTS.md` and `.agents/skills/` discovery | Explicitly promoted user-level plugin for Bash, write/edit/patch, uniquely mapped MCP, and post-write measurement | **Checkout-verified enforcement** for the exact local CLI/TUI version; `ask` fails closed as deny |
 | **Hermes Agent** | Native `AGENTS.md`; canonical skills require an external-directory setting | No RepoCharter tool-call adapter yet; pre-commit verification still applies | **Advisory** |
 | **ZCode** | Native `AGENTS.md`; project skill imported as a symlink | No live-tested safety adapter yet | **Advisory** |
 | **Other harnesses** | Read `AGENTS.md` and canonical skill paths directly | Explicit fallback until an adapter exists | **Advisory** |
@@ -100,9 +100,11 @@ is scoped to the exact checkout, adapter hash, harness version, and probe matrix
 
 RepoCharter does not pretend every provider exposes the same control surface. Context portability
 and safety enforcement are reported separately. OpenCode and Hermes Agent can use local or
-self-hosted models; model location does not upgrade advisory integration into verified enforcement.
-Cursor's claim covers the local Agent/CLI path only. Cursor Tab and Cloud MCP are separate surfaces
-and remain unclaimed.
+self-hosted models; model location does not itself establish enforcement. OpenCode's claim covers
+ordinary local CLI/TUI sessions with external plugins and project config enabled, not `--pure`,
+project-config-disabled launches, attached servers, or remote/cloud surfaces. Cursor's claim covers
+the local Agent/CLI path only. Cursor Tab and Cloud MCP
+are separate surfaces and remain unclaimed.
 
 ---
 
@@ -121,6 +123,7 @@ Name the target explicitly:
 Codex:      $migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions.
 Claude Code: /migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions.
 Cursor:      /migrate-repocharter Migrate /absolute/path/to/repository and stop before external actions.
+OpenCode:    Use the migrate-repocharter skill to migrate /absolute/path/to/repository and stop before external actions.
 ```
 
 The workflow resolves that target, moves into its exact checkout, and owns the state transitions.
@@ -158,7 +161,7 @@ kit/repocharter apply --repo ~/dev/your-repo --dry-run
 kit/repocharter apply --repo ~/dev/your-repo
 ```
 
-`apply` refuses a dirty worktree by default, preserves unrelated Claude, Codex, and Cursor configuration,
+`apply` refuses a dirty worktree by default, preserves unrelated Claude, Codex, Cursor, and OpenCode configuration,
 and reports every file it changes.
 
 Once applied, RepoCharter is vendored into the target repository:
@@ -285,6 +288,50 @@ plan used for the release proof allowed Auto but rejected named-model turns, so 
 claim a Grok-backed test. See Cursor's [official hooks documentation](https://cursor.com/docs/hooks)
 for the provider event and cloud-support matrix.
 
+### 8. Earn the local OpenCode CLI/TUI claim
+
+OpenCode already reads the canonical `AGENTS.md` and `.agents/skills/`. RepoCharter deliberately
+does not add `.opencode/rules`, a project plugin, or another repo-authored startup file. Promotion
+instead installs one marked, user-level plugin after explicit authorization. That plugin remains
+inert for advisory repositories and will not execute a repository bridge unless an exact private
+checkout attestation—or the bounded promotion process—matches the adapter digest:
+
+```sh
+kit/repocharter self-test --repo . --promote-opencode
+```
+
+When ordinary OpenCode has no usable default model, select the local Ollama model explicitly:
+
+```sh
+kit/repocharter self-test --repo . --promote-opencode \
+  --opencode-model qwen3.8:27b-mlx
+```
+
+That flag selects the model only for the promotion probes. For an ordinary interactive OpenCode
+session backed by the same local model, launch the TUI with:
+
+```sh
+ollama launch opencode --model qwen3.8:27b-mlx
+```
+
+The live matrix uses exact, narrowly permitted calls and structured `tool_use` results. A
+side-effect-free turn that never makes the intended call may retry once, but the scored turn must
+contain exactly that one tool call. It proves
+Bash denial and allow, confirmation-class denial, direct write denial and allow with post-write
+measurement, uniquely reconstructed MCP denial and allow, frozen checked arguments, malformed
+policy refusal, and a harmless denial in the actual checkout. After candidate evidence is written,
+a fresh session with no promotion authorization must repeat that checkout denial through the
+private attestation or the claim is rolled back. The evidence binds the exact OpenCode version,
+user plugin, repository-side bridge and shared gates, absolute checkout, and private Git
+attestation.
+
+OpenCode 1.18.18 does not expose a dependable plugin API that can request its native confirmation
+UI. RepoCharter therefore maps `ask` to deny rather than silently treating it as approval. External
+plugin load failure is provider-level fail-open and `--pure` intentionally skips plugins, so the
+claim is narrow: ordinary local CLI/TUI sessions with the exact attested bytes and version. Attached
+servers, Desktop/web/cloud execution, `--pure`, `OPENCODE_DISABLE_PROJECT_CONFIG=1`, and MCP names
+that collide after OpenCode's lossy sanitization remain unclaimed.
+
 ---
 
 ## What RepoCharter enforces
@@ -293,20 +340,21 @@ The universal policy provides a conservative floor. Repository policy adds the b
 generic tool can infer, such as production deploys, credential surfaces, generated files, and
 live-data operations.
 
-| Surface | Claude Code | Codex | Cursor Agent/CLI | Examples |
-|---|---|---|---|---|
-| Shell | `Bash` hook | `Bash` project hook | `beforeShellExecution` | force-push, checks bypass, destructive Git and database commands |
-| File writes | Edit/Write hooks and permissions | `apply_patch` project hook | `preToolUse` on Write/Delete | protected paths and agent configuration |
-| MCP | `mcp__.*` hook | `mcp__.*` project hook | local `beforeMCPExecution` | production deploys or argument-scoped tool denials |
-| Post-write | Edit/Write hook | `apply_patch` project hook | `postToolUse` on Write/Delete | measurements the operator needs after a change |
-| Configuration | `ConfigChange` guard | write guard | write guard on `.cursor/hooks.json` | disabling or replacing the installed safety layer |
+| Surface | Claude Code | Codex | Cursor Agent/CLI | OpenCode local CLI/TUI | Examples |
+|---|---|---|---|---|---|
+| Shell | `Bash` hook | `Bash` project hook | `beforeShellExecution` | user-plugin `tool.execute.before` → shared Bash gate | force-push, checks bypass, destructive Git and database commands |
+| File writes | Edit/Write hooks and permissions | `apply_patch` project hook | `preToolUse` on Write/Delete | write/edit/patch pre-hook → shared path gate | protected paths and agent configuration |
+| MCP | `mcp__.*` hook | `mcp__.*` project hook | local `beforeMCPExecution` | uniquely reconstructed tool identity → shared MCP gate | production deploys or argument-scoped tool denials |
+| Post-write | Edit/Write hook | `apply_patch` project hook | `postToolUse` on Write/Delete | tool after-hook appends measurement context | measurements the operator needs after a change |
+| Configuration | `ConfigChange` guard | write guard | write guard on `.cursor/hooks.json` | bridge/runtime write guard; user plugin is outside the repo | disabling or replacing the installed safety layer |
 
 Gate scripts fail closed when they cannot parse input, read policy, or compile a pattern. Cursor's
 security-critical entries additionally set the provider's `failClosed: true`. Claude and Cursor can
 pause directly on an interactive `ask`. Codex's `PreToolUse` hook cannot create that prompt, so an
 approval-capable turn hands the call to Codex's native permission flow and a no-approval turn denies
 it. The agent must submit confirmation-class calls for native approval; unconditional `deny` rules
-remain blocking either way.
+remain blocking either way. OpenCode has no equivalent dependable handoff today, so its adapter
+denies confirmation-class calls.
 
 Hooks are guardrails, not an operating-system security boundary. Credentials and production
 capabilities should still use the narrowest permissions their providers offer. Verified
@@ -343,7 +391,7 @@ the [mechanical reference](kit/README.md#only-when-replacing-a-supported-legacy-
 |---|---|
 | `census` | Inspect startup context and existing agent configuration before changing anything |
 | `apply` | Install or update the mechanical layer idempotently |
-| `self-test` | Exercise universal allow/deny behavior; optionally prove live Codex, Claude Code, or Cursor hooks |
+| `self-test` | Exercise universal allow/deny behavior; optionally prove live Codex, Claude Code, Cursor, or OpenCode hooks |
 | `measure` | Fire every declared repository rule and report real coverage |
 | `verify` | Validate schema, adapters, budgets, residue, and repository checks |
 | `fleet` | Run the census across repositories under one root |
@@ -370,7 +418,7 @@ optionally adds the network-fetched shared rule catalogue.
 
 ## Current status
 
-RepoCharter is used in production repositories today. Its 467-test suite is intentionally
+RepoCharter is used in production repositories today. Its 503-test suite is intentionally
 heavy on negative cases: dangerous calls must be refused, malformed inputs must fail closed,
 foreign configuration must survive, and a gate that never ran must not report success.
 
@@ -380,20 +428,24 @@ adapter has provider-backed Bash, Write, and MCP deny-and-allow evidence, struct
 proof, an observed post-write measurement, persisted covering trust, and a target effective-settings
 probe. The Cursor Agent/CLI adapter has provider-backed Shell, Write/Delete, and local MCP
 deny-and-allow evidence, native confirmation, fail-closed malformed-output proof, exact-workspace
-trust, and linked-worktree proof. All three providers pair the tracked digest/version record with a
+trust, and linked-worktree proof. The OpenCode adapter has local Ollama-backed Bash, write, MCP,
+measurement, malformed-policy, argument-freeze, and exact-checkout evidence, with confirmation
+rules deliberately denied. All four providers pair the tracked digest/version record with a
 checkout-private Git attestation. ConfigChange's handler logic and exact wiring are fixture-verified
-because the headless promotion harness emits no watcher event for settings mutations. OpenCode,
-Hermes Agent, and ZCode currently provide portable context without RepoCharter tool-call
-enforcement. Cursor Tab and Cloud MCP are not included in the local Agent/CLI claim.
+because the headless promotion harness emits no watcher event for settings mutations. Hermes Agent
+and ZCode currently provide portable context without RepoCharter tool-call enforcement. Cursor Tab
+and Cloud MCP are not included in the local Agent/CLI claim.
 
 ## Honest limits
 
 - Context is portable; enforcement is always provider- and checkout-specific.
 - RepoCharter cannot make a broadly privileged credential read-only. Use provider-side least
   privilege.
-- OpenCode, Hermes Agent, ZCode, and generic harnesses remain advisory until live-tested safety
-  adapters exist.
-- Cursor Agent/CLI enforcement does not imply Cursor Tab or Cloud MCP enforcement, and the 0.5.0
+- OpenCode enforcement excludes `--pure`, project-config-disabled launches,
+  attached/remote/cloud surfaces, native confirmation, and ambiguous sanitized MCP identities; its
+  `ask` rules deny.
+- Hermes Agent, ZCode, and generic harnesses remain advisory until live-tested safety adapters exist.
+- Cursor Agent/CLI enforcement does not imply Cursor Tab or Cloud MCP enforcement, and the 0.6.0
   release does not claim a named Grok-backed probe.
 - The specialized migration utilities recognize a particular legacy directory layout and a narrow
   hand-written Claude shell-gate shape; they are not universal importers for arbitrary context or
@@ -425,14 +477,14 @@ README.md          this file — the design, the commands, and the honest limits
 kit/repocharter    the canonical RepoCharter CLI. Python 3, no dependencies.
 kit/agentkit       silent compatibility wrapper for existing automation
 kit/skills/        bundled workflow bodies; one canonical copy of each procedure
-.agents/skills/    Codex and Cursor bootstrap link to the migration workflow
+.agents/skills/    Codex, Cursor, and OpenCode bootstrap link to the migration workflow
 .claude/skills/    Claude Code bootstrap link through the canonical skill path
-kit/hooks/         Claude, Codex, and Cursor adapters over one policy engine
+kit/hooks/         Claude, Codex, Cursor, and OpenCode adapters over one policy engine
 kit/lib/           harvest, migrate, supersede, measure
 kit/verify/        the residue checks — what no shared catalogue covers
 kit/schema/        the JSON Schema for .agents/compatibility.json
 kit/templates/     AGENTS.md skeleton, linter config, CI workflow
-kit/tests/         467 tests, no dependencies, mostly negative
+kit/tests/         503 tests, no dependencies, mostly negative
 LICENSE            Apache License 2.0
 NOTICE             contributor and upstream attribution
 ```

@@ -6,7 +6,7 @@ repository, one version stamp, one command to install and one to check.
 `kit/repocharter` is the canonical executable. `kit/agentkit` remains a silent compatibility
 wrapper so existing repositories and automation continue to work.
 
-**Status: in production across a fleet of repositories.** 467 tests, no dependencies:
+**Status: in production across a fleet of repositories.** 503 tests, no dependencies:
 `python3 kit/tests/run_tests.py`.
 
 For most repositories, the complete path is `census` → `apply` → `self-test` / `measure` →
@@ -15,7 +15,8 @@ legacy layouts; they are not required for normal adoption.
 
 For an agent-owned adoption, upgrade, provider promotion, or integration, use
 `kit/skills/migrate-repocharter/SKILL.md`. The public distribution exposes that one bundled body as
-`$migrate-repocharter` in Codex and `/migrate-repocharter` in Claude Code or Cursor before target installation;
+`$migrate-repocharter` in Codex, `/migrate-repocharter` in Claude Code or Cursor, and the
+native `migrate-repocharter` skill in OpenCode before target installation;
 name the target repository in the invocation. `apply` installs the same workflow through the
 existing project-skills adapter. Its checkpoint distinguishes current evidence, proven stale
 evidence, deterministic provider recovery, and an unavailable provider runtime, so a branch switch
@@ -47,6 +48,13 @@ conforming repo reports `0 change(s)`.
 **Never writes:** `AGENTS.md`'s body or anything under `docs/project/`. Those files contain
 project-specific knowledge and remain human-authored. Copy `kit/templates/AGENTS.md.tmpl`
 and fill it in yourself.
+
+`apply` also never creates `.opencode/`. OpenCode context and skills are already native, and a
+repo-local plugin would become a third repo-controlled startup file. Only the explicit
+`--promote-opencode` self-test may install or refresh the marked user-level plugin under the active
+OpenCode config directory; it refuses a foreign file at the same path. The plugin stays inert for
+advisory repositories and executes a vendored bridge only when the exact adapter digest is covered
+by checkout-private evidence or by the bounded promotion process.
 
 `migrate-repocharter` is the one product-managed project skill and is refreshed on upgrade;
 otherwise a fixed workflow could remain stale in the exact repositories that need it. Existing
@@ -93,6 +101,11 @@ kit/repocharter verify --repo ~/dev/foo --effective
 kit/repocharter self-test --repo ~/dev/foo --promote-claude
 # Under Cursor Agent/CLI: review and trust the exact workspace, then:
 kit/repocharter self-test --repo ~/dev/foo --promote-cursor
+# Under OpenCode local CLI/TUI: explicitly authorize the user-config plugin, then:
+kit/repocharter self-test --repo ~/dev/foo --promote-opencode
+# If ordinary OpenCode has no default model, add: --opencode-model <ollama-model>
+# Start an ordinary local-model session separately with:
+ollama launch opencode --model <ollama-model>
 ```
 
 ### Only when replacing a supported legacy system
@@ -243,6 +256,25 @@ an `ask` to Cursor's native confirmation UI. Write/Delete use `preToolUse`. MCP 
 verified local Agent/CLI claim. The adapter is model-neutral; no named Grok proof was scored for
 0.5.0 because the measured Free plan accepted only Auto turns.
 
+For OpenCode local CLI/TUI, `--promote-opencode` explicitly installs one marked user-level plugin
+and starts every probe in a fresh ordinary session. A side-effect-free turn that omits the intended
+call may retry once; only a turn containing exactly one intended structured call is scored. The
+plugin is policy-free: it normalizes Bash,
+write/edit/patch, and uniquely attributable MCP calls into the repository's vendored bridge, which
+then invokes the same shared gates. The matrix parses structured `tool_use` state and requires both
+deny and allow side effects, an observed post-write measurement, confirmation-as-deny, malformed
+policy refusal, frozen checked arguments, and a harmless denial in the actual checkout. Native
+permissions explicitly allow only the disposable calls, so a provider denial cannot impersonate a
+RepoCharter result. Candidate evidence must then authorize the same harmless denial in a fresh
+ordinary session with no promotion environment; failure rolls the candidate claim back.
+
+The OpenCode evidence binds the exact CLI version, user plugin, repository bridge/shared scripts,
+absolute checkout, and private Git attestation. OpenCode 1.18.18 exposes no dependable
+plugin-to-native approval request; `ask` therefore denies. External plugin import failures are
+provider-level fail-open and `--pure` bypasses external plugins deliberately. Project-config-
+disabled launches, attached servers, Desktop/web/cloud execution, native confirmation, and MCP
+identities ambiguous after OpenCode's lossy name sanitization are outside the claim.
+
 `verify` re-derives each recorded adapter hash and re-reads the installed provider version. When a
 provider CLI is present, it also requires an exact checkout-local record under the worktree's
 absolute Git directory. A clone, sibling worktree, edited gate, upgraded CLI, or changed RepoCharter
@@ -251,25 +283,27 @@ still performs portable byte checks and reports the unavailable provider check a
 
 An explicit promotion request reuses current checkout evidence when all of those bindings still
 match, Claude workspace trust/effective settings remain valid, Codex reports the exact trusted
-hook source, and Cursor retains exact-workspace trust. Otherwise it runs the live provider probes and fails closed. This makes integration of
+hook source, Cursor retains exact-workspace trust, and OpenCode's user plugin remains byte-exact.
+Otherwise it runs the live provider probes and fails closed. This makes integration of
 an unchanged migration commit cheap without making tracked `blocking` text self-certifying.
 
 ## The gates
 
-| Policy surface | Claude Code | Codex | Cursor Agent/CLI | Enforces |
-|---|---|---|---|---|
-| Shell | `Bash` | `Bash` | `beforeShellExecution` | force-push, checks-bypass, `core.hooksPath` override, destructive git, recursive rm, repo policy |
-| Writes | `Edit\|Write\|NotebookEdit` | `apply_patch` | `preToolUse` `Write\|Delete` | `denyWritePaths`; Codex parses every path in a multi-file patch |
-| MCP | `mcp__.*` | `mcp__.*` | local `beforeMCPExecution` | `denyMcpTools`, narrowable by argument |
-| Post-write | `Edit\|Write` | `apply_patch` | `postToolUse` `Write\|Delete` | takes the after-measurement and reports the delta |
-| Config | `ConfigChange` | write guard on `.codex/hooks.json` and `.codex/config.toml` | write guard on `.cursor/hooks.json` | refuses provider-specific disarm paths |
+| Policy surface | Claude Code | Codex | Cursor Agent/CLI | OpenCode local CLI/TUI | Enforces |
+|---|---|---|---|---|---|
+| Shell | `Bash` | `Bash` | `beforeShellExecution` | `tool.execute.before` → Bash gate | force-push, checks-bypass, `core.hooksPath` override, destructive git, recursive rm, repo policy |
+| Writes | `Edit\|Write\|NotebookEdit` | `apply_patch` | `preToolUse` `Write\|Delete` | write/edit/patch pre-hook → path gate | `denyWritePaths`; patch adapters parse every affected path |
+| MCP | `mcp__.*` | `mcp__.*` | local `beforeMCPExecution` | unique sanitized ID → canonical MCP gate | `denyMcpTools`, narrowable by argument |
+| Post-write | `Edit\|Write` | `apply_patch` | `postToolUse` `Write\|Delete` | write/edit/patch after-hook | takes the after-measurement and reports the delta |
+| Config | `ConfigChange` | write guard on `.codex/hooks.json` and `.codex/config.toml` | write guard on `.cursor/hooks.json` | bridge/runtime write guard | refuses provider-specific disarm paths |
 
 Codex does not support an interactive `ask` decision in `PreToolUse`. In an approval-capable turn,
 the adapter labels the call as confirmation-required and hands it to Codex's native permission
 flow; with approvals disabled, it denies the call. Because `PreToolUse` cannot itself open the
 prompt, the agent must submit confirmation-class calls for native approval. Unconditional `deny`
 rules remain blocking in either mode. Cursor's `beforeShellExecution` supports native `ask`
-directly; the release proof observed that confirmation UI before the command ran.
+directly; the release proof observed that confirmation UI before the command ran. OpenCode has no
+dependable dynamic handoff from its plugin hook, so confirmation-class calls fail closed as deny.
 
 **Everything fails closed.** A gate that cannot parse its input, read its policy, or compile
 a pattern exits 2. Claude Code treats exit 1 as non-blocking and proceeds; exit 2 blocks. Cursor's
@@ -315,7 +349,7 @@ line count. The hook performs the measurement directly instead of relying on a p
 python3 kit/tests/run_tests.py
 ```
 
-467 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
+503 tests, no dependencies. Most of them are negative — what each gate must **refuse** —
 because a gate that allows everything passes any happy-path suite.
 
 ## CI

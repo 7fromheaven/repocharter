@@ -88,6 +88,14 @@ CURSOR_ADAPTER_FILES = (
     ".claude/hooks/agentkit/posttooluse-write.py",
     ".claude/hooks/agentkit/pretooluse-mcp.py",
 )
+OPENCODE_ADAPTER_FILES = (
+    "kit/hooks/opencode/bridge.py",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+)
 
 CURSOR_HOOK_WIRING = (
     ("beforeShellExecution", None, "pretooluse-bash.sh", True),
@@ -308,6 +316,37 @@ def claude_adapter_digest(root: Path) -> str | None:
 
 def cursor_adapter_digest(root: Path) -> str | None:
     return adapter_digest(root, CURSOR_ADAPTER_FILES)
+
+
+def opencode_config_dir() -> Path:
+    explicit = os.environ.get("OPENCODE_CONFIG_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg).expanduser() if xdg else Path.home() / ".config") / "opencode"
+
+
+def opencode_plugin_path() -> Path:
+    return opencode_config_dir() / "plugins" / "repocharter.js"
+
+
+def opencode_adapter_digest(root: Path) -> str | None:
+    plugin = opencode_plugin_path()
+    if not plugin.is_file():
+        return None
+    digest = hashlib.sha256()
+    digest.update(b"user-plugin\0")
+    digest.update(plugin.read_bytes())
+    digest.update(b"\0")
+    for rel in OPENCODE_ADAPTER_FILES:
+        path = root / rel
+        if not path.is_file():
+            return None
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def cursor_executable() -> str | None:
@@ -682,6 +721,8 @@ def check_declaration(root: Path, compat: dict, rep: Report) -> None:
             rep.error("compatibility.json lacks the Claude project-skills symlink adapter")
     if _version_at_least(compat, (0, 5, 0)) and ("cursor", None) not in declared_reach:
         rep.error("compatibility.json lacks the Cursor native adapter declaration")
+    if _version_at_least(compat, (0, 6, 0)) and ("opencode", None) not in declared_reach:
+        rep.error("compatibility.json lacks the OpenCode native adapter declaration")
 
     for exc in compat.get("exceptions") or []:
         rep.note(f"declared exception: {exc.get('rule')} — {exc.get('reason')} (approved {exc.get('approvedBy')}, {exc.get('date')})")
@@ -930,6 +971,104 @@ def check_cursor_hooks(root: Path, compat: dict, rep: Report) -> None:
     rep.note(
         "Cursor evidence covers local Agent/CLI Shell, Write/Delete, and MCP calls. Cursor "
         "Tab and Cloud MCP are separate surfaces and are not claimed by this adapter."
+    )
+
+
+def check_opencode_adapter(root: Path, compat: dict, rep: Report) -> None:
+    """Validate the repository bridge and invalidate stale OpenCode live evidence."""
+    enforcement = (compat.get("enforcement") or {}).get("opencode", "none")
+    native_declared = any(
+        isinstance(adapter, dict)
+        and adapter.get("harness") == "opencode"
+        and adapter.get("kind") == "native"
+        for adapter in (compat.get("adapters") or [])
+    )
+    required = _version_at_least(compat, (0, 6, 0)) and (
+        native_declared or enforcement != "none"
+    )
+    bridge = root / "kit" / "hooks" / "opencode" / "bridge.py"
+    plugin_template = root / "kit" / "hooks" / "opencode" / "repocharter.js"
+    if required:
+        if not bridge.is_file():
+            rep.error("kit/hooks/opencode/bridge.py is missing; re-run `repocharter apply`")
+        if not plugin_template.is_file():
+            rep.error(
+                "kit/hooks/opencode/repocharter.js is missing; re-run `repocharter apply`"
+            )
+        for rel in OPENCODE_ADAPTER_FILES[1:]:
+            if not (root / rel).is_file():
+                rep.error(f"OpenCode adapter references missing shared gate {rel}")
+
+    if enforcement != "blocking":
+        return
+
+    evidence = (compat.get("enforcementEvidence") or {}).get("opencode")
+    if not isinstance(evidence, dict):
+        rep.error(
+            "OpenCode is declared blocking but has no live enforcementEvidence. Run "
+            "`repocharter self-test --repo . --promote-opencode` with the local CLI."
+        )
+        return
+    plugin = opencode_plugin_path()
+    if not plugin.is_file():
+        rep.error(
+            f"OpenCode is declared blocking but the user-level RepoCharter plugin is missing "
+            f"at {plugin}. Re-run the OpenCode promotion."
+        )
+    elif plugin_template.is_file() and plugin.read_bytes() != plugin_template.read_bytes():
+        rep.error(
+            "OpenCode blocking evidence is stale: the installed user plugin differs from "
+            "this repository's vendored template. Re-run the OpenCode promotion."
+        )
+    actual_digest = opencode_adapter_digest(root)
+    if actual_digest is None or evidence.get("adapterSha256") != actual_digest:
+        rep.error(
+            "OpenCode blocking evidence is stale: user-plugin or repository gate bytes "
+            "changed. Re-run `repocharter self-test --repo . --promote-opencode`."
+        )
+    if os.environ.get("OPENCODE_PURE"):
+        rep.error(
+            "OPENCODE_PURE is set, so external plugins including RepoCharter are disabled"
+        )
+    if os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG"):
+        rep.error(
+            "OPENCODE_DISABLE_PROJECT_CONFIG is set; that launch mode is outside the "
+            "measured OpenCode claim"
+        )
+    try:
+        proc = subprocess.run(
+            ["opencode", "--version"], capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError:
+        rep.note(
+            "OpenCode binary unavailable here; recorded live evidence could not be "
+            "version-checked"
+        )
+    except subprocess.TimeoutExpired:
+        rep.error(
+            "OpenCode is installed but `opencode --version` timed out; blocking evidence "
+            "cannot be checked"
+        )
+    else:
+        version = proc.stdout.strip()
+        if proc.returncode != 0 or not version:
+            rep.error(
+                "OpenCode is installed but its version could not be read; blocking evidence "
+                "cannot be checked"
+            )
+        elif version != evidence.get("harnessVersion"):
+            rep.error(
+                f"OpenCode blocking evidence was measured on "
+                f"{evidence.get('harnessVersion')!r}, but this machine runs {version!r}. "
+                "Re-run the live self-test."
+            )
+        else:
+            check_checkout_evidence(root, "opencode", evidence, compat, rep)
+    rep.note(
+        "OpenCode evidence covers the exact local CLI/TUI version with external plugins "
+        "enabled. `--pure`, project-config-disabled launches, remote/attached/cloud surfaces, "
+        "dynamic native approval, and ambiguous sanitized MCP identities are not claimed; "
+        "RepoCharter ask rules deny."
     )
 
 
@@ -1493,6 +1632,7 @@ def run(root: Path, effective: bool, strict: bool) -> Report:
     check_dead_references(root, rep)
     check_codex_hooks(root, compat, rep)
     check_cursor_hooks(root, compat, rep)
+    check_opencode_adapter(root, compat, rep)
     check_claude_hooks(root, compat, rep)
     check_precommit(root, rep)
     check_codex_config(root, rep)
