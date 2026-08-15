@@ -159,9 +159,9 @@ def test_cli_entrypoints(tmp: Path) -> None:
         [sys.executable, str(REPO_CHARTER), "--version"], capture_output=True, text=True)
     compatibility_version = subprocess.run(
         [sys.executable, str(AGENTKIT_COMPAT), "--version"], capture_output=True, text=True)
-    check("the canonical command identifies RepoCharter 0.5.0",
+    check("the canonical command identifies RepoCharter 0.6.0",
           canonical_version.returncode == 0
-          and canonical_version.stdout.strip() == "RepoCharter 0.5.0"
+          and canonical_version.stdout.strip() == "RepoCharter 0.6.0"
           and not canonical_version.stderr,
           canonical_version.stdout + canonical_version.stderr)
     check("the compatibility command has identical version behavior",
@@ -1123,8 +1123,8 @@ def test_apply(tmp: Path) -> None:
 
     settings = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
     compat = json.loads((repo / ".agents" / "compatibility.json").read_text(encoding="utf-8"))
-    check("the compatibility manifest records RepoCharter 0.5.0",
-          compat["agentkitVersion"] == "0.5.0", str(compat))
+    check("the compatibility manifest records RepoCharter 0.6.0",
+          compat["agentkitVersion"] == "0.6.0", str(compat))
     check("auto memory defaults OFF in compatibility.json", compat["autoMemory"] == "off", str(compat))
     check("apply disables Claude auto memory by default", settings["autoMemoryEnabled"] is False, str(settings))
     matchers = [g.get("matcher") for g in settings["hooks"]["PreToolUse"]]
@@ -1513,6 +1513,16 @@ def _stub_cursor(bin_dir: Path, version: str) -> Path:
     """A fake Cursor CLI for version, attestation, and provider-state tests."""
     bin_dir.mkdir(parents=True, exist_ok=True)
     stub = bin_dir / "cursor-agent"
+    stub.write_text(f'#!/bin/sh\n[ "$1" = "--version" ] && echo "{version}" && exit 0\nexit 1\n',
+                    encoding="utf-8")
+    stub.chmod(0o755)
+    return stub
+
+
+def _stub_opencode(bin_dir: Path, version: str) -> Path:
+    """A fake OpenCode CLI for version-bound evidence and provider-state tests."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "opencode"
     stub.write_text(f'#!/bin/sh\n[ "$1" = "--version" ] && echo "{version}" && exit 0\nexit 1\n',
                     encoding="utf-8")
     stub.chmod(0o755)
@@ -2917,6 +2927,347 @@ def test_cursor_enforcement_evidence(tmp: Path) -> None:
             os.environ["CURSOR_DATA_DIR"] = previous_cursor_data
 
 
+def test_opencode_adapter_and_evidence(tmp: Path) -> None:
+    """OpenCode stays context-native and earns only exact local-CLI enforcement."""
+    policy = {
+        "protectedBranches": ["main", "master"],
+        "denyBashPatterns": [{
+            "pattern": "opencode-denied[.]txt",
+            "reason": "OPENCODE_BASH_DENIED",
+        }],
+        "askBashPatterns": [{
+            "pattern": "opencode-ask[.]txt",
+            "reason": "OPENCODE_ASK_REQUIRED",
+        }],
+        "denyWritePaths": [{"glob": "blocked.txt", "reason": "OPENCODE_WRITE_DENIED"}],
+        "denyMcpTools": [{
+            "pattern": "^mcp__probe__danger$",
+            "reason": "OPENCODE_MCP_DENIED",
+        }],
+        "measureOnWrite": [{
+            "glob": "measured.txt",
+            "measure": "line-count",
+            "reason": "measure the fixture",
+        }],
+    }
+    repo = make_repo(tmp / "fixture", policy=policy)
+    git_init(repo)
+    (repo / "CLAUDE.md").unlink()
+    installed = subprocess.run(
+        [sys.executable, str(REPO_CHARTER), "apply", "--repo", str(repo), "--allow-dirty"],
+        capture_output=True, text=True, timeout=120,
+    )
+    check("the OpenCode fixture installs cleanly", installed.returncode == 0,
+          installed.stdout[-400:] + installed.stderr[-400:])
+    compat_path = repo / ".agents" / "compatibility.json"
+    compat = json.loads(compat_path.read_text(encoding="utf-8"))
+
+    section("OpenCode apply — native context without a third project startup file")
+    check("compatibility declares native OpenCode context and skills",
+          any(item.get("harness") == "opencode" and item.get("kind") == "native"
+              for item in compat.get("adapters", []) if isinstance(item, dict)))
+    check("OpenCode starts advisory until live promotion",
+          compat.get("enforcement", {}).get("opencode") == "advisory")
+    check("apply creates no repo-local .opencode startup directory",
+          not (repo / ".opencode").exists())
+    check("the vendored bridge and user-plugin template are present",
+          (repo / "kit" / "hooks" / "opencode" / "bridge.py").is_file()
+          and (repo / "kit" / "hooks" / "opencode" / "repocharter.js").is_file())
+
+    bridge = repo / "kit" / "hooks" / "opencode" / "bridge.py"
+
+    def bridge_call(phase: str, tool: str, args: dict,
+                    canonical: str | None = None, project: Path = repo) -> dict:
+        payload = {
+            "phase": phase,
+            "tool": tool,
+            "args": args,
+            "canonicalTool": canonical,
+            "projectDir": str(project.resolve()),
+        }
+        proc = subprocess.run(
+            [sys.executable, str(bridge)], input=json.dumps(payload), capture_output=True,
+            text=True, cwd=repo, timeout=30,
+        )
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return {"decision": "crash", "reason": proc.stderr + proc.stdout}
+
+    section("OpenCode bridge — shared policy decisions are normalized fail closed")
+    bash_deny = bridge_call("before", "bash", {"command": "touch opencode-denied.txt"})
+    check("a repository Bash denial becomes an OpenCode denial",
+          bash_deny.get("decision") == "deny"
+          and "OPENCODE_BASH_DENIED" in bash_deny.get("reason", ""), str(bash_deny))
+    bash_ask = bridge_call("before", "bash", {"command": "touch opencode-ask.txt"})
+    check("an ask becomes deny while OpenCode lacks native approval handoff",
+          bash_ask.get("decision") == "deny"
+          and "OPENCODE_ASK_REQUIRED" in bash_ask.get("reason", "")
+          and "fails closed" in bash_ask.get("reason", ""), str(bash_ask))
+    check("an ordinary Bash call remains allowed",
+          bridge_call("before", "bash", {"command": "ls -la"}).get("decision") == "allow")
+
+    blocked = repo / "blocked.txt"
+    write_deny = bridge_call("before", "write", {
+        "filePath": str(blocked), "content": "PROBE",
+    })
+    check("a direct write denial uses the same path policy",
+          write_deny.get("decision") == "deny"
+          and "OPENCODE_WRITE_DENIED" in write_deny.get("reason", ""), str(write_deny))
+    check("an ordinary write path remains allowed",
+          bridge_call("before", "write", {
+              "filePath": str(repo / "ordinary.txt"), "content": "ok",
+          }).get("decision") == "allow")
+    protected = bridge_call("before", "apply_patch", {
+        "patchText": "*** Begin Patch\n*** Update File: kit/hooks/opencode/bridge.py\n@@\n-x\n+y\n*** End Patch",
+    })
+    check("OpenCode cannot patch its repository-side enforcement bridge",
+          protected.get("decision") == "deny" and "may not edit" in protected.get("reason", ""),
+          str(protected))
+
+    mcp_deny = bridge_call("before", "probe_danger", {}, "mcp__probe__danger")
+    check("a reconstructed full MCP identity reaches the shared MCP gate",
+          mcp_deny.get("decision") == "deny"
+          and "OPENCODE_MCP_DENIED" in mcp_deny.get("reason", ""), str(mcp_deny))
+    check("an unmatched MCP identity remains allowed",
+          bridge_call("before", "probe_safe", {}, "mcp__probe__safe").get("decision") == "allow")
+
+    measured = repo / "measured.txt"
+    before = bridge_call("before", "write", {"filePath": str(measured), "content": "one\ntwo\n"})
+    measured.write_text("one\ntwo\n", encoding="utf-8")
+    after = bridge_call("after", "write", {"filePath": str(measured), "content": "one\ntwo\n"})
+    check("post-write measurement reaches OpenCode tool output context",
+          before.get("decision") == "allow"
+          and after.get("decision") == "allow"
+          and "RepoCharter measurement — AFTER" in after.get("additional_context", ""),
+          str(after))
+
+    healthy = compat_path.read_text(encoding="utf-8")
+    compat_path.write_text("{not json", encoding="utf-8")
+    malformed = bridge_call("before", "bash", {"command": "ls -la"})
+    check("a malformed policy is denied rather than skipped",
+          malformed.get("decision") == "deny" and "could not be" in malformed.get("reason", ""),
+          str(malformed))
+    compat_path.write_text(healthy, encoding="utf-8")
+    mismatch = bridge_call("before", "bash", {"command": "ls -la"}, project=repo.parent)
+    check("a bridge cannot be reused for a different checkout",
+          mismatch.get("decision") == "deny" and "does not match" in mismatch.get("reason", ""),
+          str(mismatch))
+
+    section("OpenCode promotion — user plugin, evidence, and checkout are one claim")
+    config_dir = tmp / "opencode-config"
+    plugin = config_dir / "plugins" / "repocharter.js"
+    plugin.parent.mkdir(parents=True, exist_ok=True)
+    plugin.write_text("// foreign plugin\n", encoding="utf-8")
+    previous_config = os.environ.get("OPENCODE_CONFIG_DIR")
+    previous_path = os.environ.get("PATH")
+    os.environ["OPENCODE_CONFIG_DIR"] = str(config_dir)
+    stub_bin = tmp / "stubbin"
+    version = "opencode fixture 9.9.9"
+    _stub_opencode(stub_bin, version)
+    git_bin = str(Path(shutil.which("git") or "/usr/bin/git").parent)
+    base_path = os.pathsep.join(dict.fromkeys((str(stub_bin), git_bin, "/usr/bin", "/bin")))
+    os.environ["PATH"] = base_path
+    try:
+        changed, collision = agentkit_mod.install_opencode_plugin()
+        check("promotion refuses to overwrite a foreign same-name user plugin",
+              not changed and collision is not None and "refusing" in collision, str(collision))
+        plugin.unlink()
+        changed, problem = agentkit_mod.install_opencode_plugin()
+        installed_source = plugin.read_text(encoding="utf-8") if plugin.is_file() else ""
+        check("explicit promotion installs the managed user-level plugin",
+              changed and problem is None and plugin.is_file()
+              and "localAttestation" in installed_source
+              and "REPO_CHARTER_OPENCODE_PROMOTION_SHA256" in installed_source,
+              str(problem))
+        changed_again, problem_again = agentkit_mod.install_opencode_plugin()
+        check("installing the same user plugin is idempotent",
+              not changed_again and problem_again is None)
+
+        def declare(enforcement: str, evidence: dict | None = None) -> None:
+            value = json.loads(compat_path.read_text(encoding="utf-8"))
+            value.setdefault("enforcement", {})["opencode"] = enforcement
+            evidence_map = value.setdefault("enforcementEvidence", {})
+            if evidence is None:
+                evidence_map.pop("opencode", None)
+            else:
+                evidence_map["opencode"] = evidence
+            if not evidence_map:
+                value.pop("enforcementEvidence", None)
+            compat_path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+        def report(extra: dict | None = None) -> dict:
+            env = dict(os.environ)
+            env.update(extra or {})
+            proc = subprocess.run(
+                [sys.executable, str(RESIDUE), "--repo", str(repo), "--json"],
+                capture_output=True, text=True, timeout=60, env=env,
+            )
+            try:
+                return json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                return {"errors": [proc.stderr + proc.stdout]}
+
+        def errors(fragment: str, extra: dict | None = None) -> bool:
+            return any(fragment in item for item in report(extra).get("errors", []))
+
+        declare("blocking")
+        check("blocking without OpenCode live evidence is refused",
+              errors("OpenCode is declared blocking but has no live enforcementEvidence"))
+        digest = agentkit_mod.opencode_adapter_digest(repo)
+        check("the OpenCode digest binds user plugin and repository gate closure",
+              isinstance(digest, str) and len(digest) == 64, str(digest))
+        good = {
+            "verifiedOn": "2026-08-15",
+            "harnessVersion": version,
+            "adapterSha256": digest,
+            "method": "live-deny-and-observe",
+        }
+        declare("blocking", good)
+        check("portable OpenCode evidence alone cannot certify this checkout",
+              errors("opencode is declared blocking but this checkout has no matching local"))
+        check("matching checkout-local evidence can be written",
+              agentkit_mod.write_checkout_evidence(repo, "opencode", good))
+        clean = report()
+        check("matching plugin, bytes, version, and local evidence verify clean",
+              not any("OpenCode" in item or "opencode" in item
+                      for item in clean.get("errors", [])), str(clean.get("errors", []))[:500])
+
+        original_plugin = plugin.read_text(encoding="utf-8")
+        plugin.write_text(original_plugin + "// drift\n", encoding="utf-8")
+        check("editing the user plugin invalidates blocking evidence",
+              errors("installed user plugin differs"))
+        plugin.write_text(original_plugin, encoding="utf-8")
+        _stub_opencode(stub_bin, "opencode fixture 9.9.10")
+        check("an OpenCode version change invalidates evidence", errors("but this machine runs"))
+        _stub_opencode(stub_bin, version)
+        check("unmeasured OpenCode bypass modes are outside the blocking claim",
+              errors("OPENCODE_PURE is set", {"OPENCODE_PURE": "1"})
+              and errors("OPENCODE_DISABLE_PROJECT_CONFIG is set", {
+                  "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+              }))
+
+        current = agentkit_mod.provider_promotion_state(repo, "opencode")
+        check("exact OpenCode evidence is a current-checkout fast path",
+              current["current"] and current["discovery"]["status"] == "exact", str(current))
+
+        error_event = json.dumps({
+            "type": "tool_use",
+            "part": {"tool": "bash", "state": {
+                "status": "error", "error": "[RepoCharter] FIXTURE_DENIED",
+            }},
+        })
+        marker = repo / "structured-marker"
+        check("structured denial plus absent side effect is accepted as probe evidence",
+              agentkit_mod._opencode_probe_result(
+                  "fixture", subprocess.CompletedProcess([], 0, error_event, ""),
+                  "bash", marker, False, "FIXTURE_DENIED",
+              ) is None)
+        check("reason prose without a structured tool_use is not evidence",
+              agentkit_mod._opencode_probe_result(
+                  "fixture", subprocess.CompletedProcess([], 0, "FIXTURE_DENIED", ""),
+                  "bash", marker, False, "FIXTURE_DENIED",
+              ) is not None)
+        extra_event = json.dumps({
+            "type": "tool_use",
+            "part": {"tool": "write", "state": {"status": "error", "error": "extra"}},
+        })
+        check("an extra or substituted tool call cannot satisfy OpenCode evidence",
+              agentkit_mod._opencode_probe_result(
+                  "fixture", subprocess.CompletedProcess(
+                      [], 0, error_event + "\n" + extra_event, "",
+                  ),
+                  "bash", marker, False, "FIXTURE_DENIED",
+              ) is not None)
+        direct = agentkit_mod._opencode_command(repo, "probe", None)
+        launched = agentkit_mod._opencode_command(repo, "probe", "qwen-fixture")
+        check("ordinary OpenCode probes never use pure mode",
+              direct[:2] == ["opencode", "run"]
+              and "--pure" not in direct and "--auto" not in direct, str(direct))
+        check("a requested Ollama model uses the documented launcher boundary",
+              launched[:7] == ["ollama", "launch", "opencode", "--model",
+                               "qwen-fixture", "--", "run"], str(launched))
+
+        section("OpenCode promotion — success and failure update only measured evidence")
+        declare("advisory")
+        local = agentkit_mod.checkout_evidence_path(repo, "opencode")
+        if local is not None:
+            local.unlink(missing_ok=True)
+        original_live = agentkit_mod.live_opencode_self_test
+        original_run = agentkit_mod._run_opencode
+        agentkit_mod.live_opencode_self_test = lambda _repo, _model: ([], version)
+        agentkit_mod._run_opencode = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, error_event, "",
+        )
+        promoted_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(promoted_output):
+                promoted = agentkit_mod.cmd_self_test(
+                    repo, promote_opencode=True, opencode_model="qwen-fixture"
+                )
+        finally:
+            agentkit_mod.live_opencode_self_test = original_live
+            agentkit_mod._run_opencode = original_run
+        promoted_compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        check("a successful OpenCode probe promotes only OpenCode",
+              promoted == 0
+              and promoted_compat["enforcement"]["opencode"] == "blocking"
+              and promoted_compat["enforcement"]["codex"] == "advisory"
+              and promoted_compat["enforcement"]["claude-code"] == "advisory"
+              and "opencode" in promoted_compat.get("enforcementEvidence", {}),
+              promoted_output.getvalue()[-1000:])
+
+        declare("advisory")
+        if local is not None:
+            local.unlink(missing_ok=True)
+        agentkit_mod.live_opencode_self_test = lambda _repo, _model: ([], version)
+        agentkit_mod._run_opencode = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, "", "",
+        )
+        attestation_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(attestation_output):
+                unattested = agentkit_mod.cmd_self_test(repo, promote_opencode=True)
+        finally:
+            agentkit_mod.live_opencode_self_test = original_live
+            agentkit_mod._run_opencode = original_run
+        unattested_compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        check("a failed ordinary attestation probe rolls back the candidate claim",
+              unattested == 1
+              and unattested_compat["enforcement"]["opencode"] == "advisory"
+              and "opencode" not in unattested_compat.get("enforcementEvidence", {})
+              and (local is None or not local.exists()),
+              attestation_output.getvalue()[-1000:])
+
+        declare("advisory")
+        if local is not None:
+            local.unlink(missing_ok=True)
+        agentkit_mod.live_opencode_self_test = lambda _repo, _model: (
+            ["fixture OpenCode failure"], version,
+        )
+        failed_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(failed_output):
+                failed = agentkit_mod.cmd_self_test(repo, promote_opencode=True)
+        finally:
+            agentkit_mod.live_opencode_self_test = original_live
+        failed_compat = json.loads(compat_path.read_text(encoding="utf-8"))
+        check("a failed OpenCode probe writes no claim or portable evidence",
+              failed == 1
+              and failed_compat["enforcement"]["opencode"] == "advisory"
+              and "opencode" not in failed_compat.get("enforcementEvidence", {}),
+              failed_output.getvalue()[-1000:])
+    finally:
+        if previous_config is None:
+            os.environ.pop("OPENCODE_CONFIG_DIR", None)
+        else:
+            os.environ["OPENCODE_CONFIG_DIR"] = previous_config
+        if previous_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = previous_path
+
+
 def test_policy_and_supersede(tmp: Path) -> None:
     sys.path.insert(0, str(KIT / "lib"))
     import scaffold as sc
@@ -3361,14 +3712,14 @@ def test_legacy_cli_upgrade(tmp: Path) -> None:
     section("apply — 0.3.8 command transition is backward compatible")
     check("the 0.3.8 fixture upgrades successfully", upgraded.returncode == 0,
           upgraded.stdout[-500:] + upgraded.stderr[-500:])
-    check("the upgrade records 0.5.0 and vendors both executable entrypoints",
-          upgraded_compat.get("agentkitVersion") == "0.5.0"
+    check("the upgrade records 0.6.0 and vendors both executable entrypoints",
+          upgraded_compat.get("agentkitVersion") == "0.6.0"
           and os.access(repo / "kit" / "repocharter", os.X_OK)
           and os.access(repo / "kit" / "agentkit", os.X_OK),
           str(upgraded_compat))
-    check("the old command delegates to the canonical 0.5.0 identity",
+    check("the old command delegates to the canonical 0.6.0 identity",
           compatibility_version.returncode == 0
-          and compatibility_version.stdout.strip() == "RepoCharter 0.5.0"
+          and compatibility_version.stdout.strip() == "RepoCharter 0.6.0"
           and not compatibility_version.stderr,
           compatibility_version.stdout + compatibility_version.stderr)
     check("the managed lane moves to repocharter without touching user hook content",
@@ -3459,6 +3810,7 @@ def main() -> int:
         test_codex_foreign_hook_closure(tmp / "codex-foreign-hook")
         test_claude_enforcement_evidence(tmp / "claude-enforcement")
         test_cursor_enforcement_evidence(tmp / "cursor-enforcement")
+        test_opencode_adapter_and_evidence(tmp / "opencode-enforcement")
         test_policy_and_supersede(tmp / "policy")
         test_apply(tmp / "applytest")
         test_measure(tmp / "measure")

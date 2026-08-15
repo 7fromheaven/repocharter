@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -133,6 +134,13 @@ def checkpoint(repo: Path, effective: bool) -> dict:
         )
         if cursor_installed or cursor_claimed:
             harnesses.append("cursor")
+        opencode_installed = shutil.which("opencode") is not None
+        opencode_claimed = (
+            (compat.get("enforcement") or {}).get("opencode") == "blocking"
+            or isinstance((compat.get("enforcementEvidence") or {}).get("opencode"), dict)
+        )
+        if opencode_installed or opencode_claimed:
+            harnesses.append("opencode")
         for harness in harnesses:
             providers[harness] = provider_state(
                 repo, harness, compat, operating_agentkit,

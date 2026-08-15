@@ -33,7 +33,7 @@ from datetime import date
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent
-KIT_VERSION = "0.5.0"
+KIT_VERSION = "0.6.0"
 
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 import migrate as migrate_lib  # noqa: E402
@@ -166,6 +166,15 @@ CURSOR_ADAPTER_FILES = (
     ".claude/hooks/agentkit/posttooluse-write.py",
     ".claude/hooks/agentkit/pretooluse-mcp.py",
 )
+OPENCODE_ADAPTER_FILES = (
+    "kit/hooks/opencode/bridge.py",
+    ".claude/hooks/agentkit/_policy.py",
+    ".claude/hooks/agentkit/pretooluse-bash.sh",
+    ".claude/hooks/agentkit/pretooluse-write.py",
+    ".claude/hooks/agentkit/posttooluse-write.py",
+    ".claude/hooks/agentkit/pretooluse-mcp.py",
+)
+OPENCODE_PLUGIN_MARKER = "// Managed by RepoCharter."
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────
@@ -225,6 +234,69 @@ def claude_adapter_digest(repo: Path) -> str | None:
 
 def cursor_adapter_digest(repo: Path) -> str | None:
     return adapter_digest(repo, CURSOR_ADAPTER_FILES)
+
+
+def opencode_config_dir() -> Path:
+    """Return the user config directory OpenCode loads for this process."""
+    explicit = os.environ.get("OPENCODE_CONFIG_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg).expanduser() if xdg else Path.home() / ".config") / "opencode"
+
+
+def opencode_plugin_path() -> Path:
+    return opencode_config_dir() / "plugins" / "repocharter.js"
+
+
+def opencode_plugin_template() -> Path:
+    return KIT_ROOT / "hooks" / "opencode" / "repocharter.js"
+
+
+def opencode_adapter_digest(repo: Path) -> str | None:
+    """Hash the user-level plugin plus the exact repository-side gate closure."""
+    plugin = opencode_plugin_path()
+    if not plugin.is_file():
+        return None
+    digest = hashlib.sha256()
+    digest.update(b"user-plugin\0")
+    digest.update(plugin.read_bytes())
+    digest.update(b"\0")
+    for rel in OPENCODE_ADAPTER_FILES:
+        path = repo / rel
+        if not path.is_file():
+            return None
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def install_opencode_plugin() -> tuple[bool, str | None]:
+    """Install or refresh the one explicitly managed user-level OpenCode plugin."""
+    source = opencode_plugin_template()
+    destination = opencode_plugin_path()
+    if not source.is_file():
+        return False, f"kit is missing the OpenCode plugin template at {source}"
+    desired = source.read_bytes()
+    if destination.exists():
+        if not destination.is_file() or destination.is_symlink():
+            return False, f"{destination} is not a regular file; refusing to replace it"
+        current = destination.read_bytes()
+        if current == desired:
+            return False, None
+        if not current.startswith(OPENCODE_PLUGIN_MARKER.encode("utf-8")):
+            return False, (
+                f"{destination} already exists and is not managed by RepoCharter; "
+                "refusing to overwrite it"
+            )
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(desired)
+    except OSError as exc:
+        return False, f"could not install {destination}: {exc}"
+    return True, None
 
 
 CHECKOUT_EVIDENCE_VERSION = 1
@@ -319,7 +391,7 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
     compat = compat if isinstance(compat, dict) else (
         read_json(repo / ".agents" / "compatibility.json", {}) or {}
     )
-    if harness not in {"codex", "claude-code", "cursor"}:
+    if harness not in {"codex", "claude-code", "cursor", "opencode"}:
         reason = f"{harness} has no provider-specific promotion implementation"
         return {
             "current": False,
@@ -339,7 +411,8 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
     executable = (
         "codex" if harness == "codex" else
         "claude" if harness == "claude-code" else
-        cursor_executable()
+        cursor_executable() if harness == "cursor" else
+        "opencode"
     )
     promotion_reasons: list[str] = []
     provider_diagnostics: list[str] = []
@@ -360,7 +433,8 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
     digest = (
         claude_adapter_digest(repo) if harness == "claude-code" else
         codex_adapter_digest(repo) if harness == "codex" else
-        cursor_adapter_digest(repo)
+        cursor_adapter_digest(repo) if harness == "cursor" else
+        opencode_adapter_digest(repo)
     )
     if evidence is not None and digest != evidence.get("adapterSha256"):
         promotion_reasons.append("adapter bytes differ from the tracked evidence")
@@ -440,6 +514,21 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
                 "error" if diagnostics else "missing"
             ),
         }
+    elif harness == "opencode" and version:
+        plugin = opencode_plugin_path()
+        discovery = {
+            "plugin": str(plugin),
+            "status": "exact" if plugin.is_file() and digest is not None else "missing",
+        }
+        if os.environ.get("OPENCODE_PURE"):
+            promotion_reasons.append(
+                "OPENCODE_PURE is set, so external plugins including RepoCharter are disabled"
+            )
+        if os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG"):
+            promotion_reasons.append(
+                "OPENCODE_DISABLE_PROJECT_CONFIG is set; that launch mode is outside the "
+                "measured OpenCode claim"
+            )
 
     access_blocked = bool(provider_diagnostics)
     recovery_required = bool(recovery_reasons)
@@ -457,11 +546,16 @@ def provider_promotion_state(repo: Path, harness: str, compat: dict | None = Non
                 "Ensure Claude Code is available and can read its configured provider state, "
                 "then rerun the checkpoint. Do not promote while provider state is indeterminate."
             )
-        else:
+        elif harness == "cursor":
             recovery = (
                 "Ensure Cursor CLI is available and can read its configured state directory "
                 "(normally ~/.cursor), then rerun the checkpoint. Do not promote Cursor while "
                 "workspace trust is indeterminate."
+            )
+        else:
+            recovery = (
+                "Ensure the local OpenCode CLI can read its user config directory, then rerun "
+                "the checkpoint. Do not promote while plugin loading is indeterminate."
             )
     elif recovery_required:
         status = "provider-recovery-required"
@@ -611,6 +705,8 @@ def default_compat(repo: Path) -> dict:
              "to": "../../.agents/skills/<name>"},
             {"harness": "cursor", "kind": "native",
              "note": "reads AGENTS.md and .agents/skills directly; the CLAUDE.md symlink is also loaded and currently duplicates the same startup bytes"},
+            {"harness": "opencode", "kind": "native",
+             "note": "reads AGENTS.md and .agents/skills directly; safety uses an explicitly promoted user-level plugin so no third repo-controlled startup file is added"},
             {"harness": "zcode", "kind": "manual-import",
              "note": "client-scoped: import from the Codex source as Project + Symlink, then confirm $<name> appears"},
         ],
@@ -618,6 +714,7 @@ def default_compat(repo: Path) -> dict:
             "claude-code": "advisory",
             "codex": "advisory",
             "cursor": "advisory",
+            "opencode": "advisory",
             "zcode": "advisory",
         },
         "autoMemory": "off",
@@ -1900,6 +1997,356 @@ def _run_codex_trust_probe(repo: Path) -> subprocess.CompletedProcess:
     return subprocess.run(command, cwd=repo, capture_output=True, text=True, timeout=300)
 
 
+def _opencode_command(directory: Path, prompt: str, model: str | None) -> list[str]:
+    run = [
+        "run", "--dir", str(directory), "--format", "json", prompt,
+    ]
+    if model:
+        return ["ollama", "launch", "opencode", "--model", model, "--", *run]
+    return ["opencode", *run]
+
+
+def _run_opencode(directory: Path, prompt: str, model: str | None,
+                  extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    return subprocess.run(
+        _opencode_command(directory, prompt, model),
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+
+
+def _opencode_tool_events(output: str) -> list[dict]:
+    events: list[dict] = []
+    for line in output.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict) or value.get("type") != "tool_use":
+            continue
+        part = value.get("part")
+        if isinstance(part, dict):
+            events.append(part)
+    return events
+
+
+def _copy_opencode_probe_adapter(repo: Path, probe: Path) -> None:
+    for rel in OPENCODE_ADAPTER_FILES:
+        source = repo / rel
+        destination = probe / rel
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def _opencode_probe_config(server: Path, marker: Path) -> dict:
+    """Constrain the disposable provider run while allowing the named probe surfaces."""
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "permission": {
+            "read": "deny",
+            "glob": "deny",
+            "grep": "deny",
+            "list": "deny",
+            "task": "deny",
+            "skill": "deny",
+            "lsp": "deny",
+            "webfetch": "deny",
+            "websearch": "deny",
+            "todowrite": "deny",
+            "question": "deny",
+            "doom_loop": "deny",
+            "bash": {
+                "*": "deny",
+                "touch opencode-bash-denied.txt": "allow",
+                "touch opencode-ask-denied.txt": "allow",
+                "touch opencode-bash-allowed.txt": "allow",
+                "touch opencode-mutation-safe.txt": "allow",
+            },
+            "edit": "allow",
+            "agentkit_probe_danger": "allow",
+            "agentkit_probe_safe": "allow",
+        },
+        "mcp": {
+            "agentkit_probe": {
+                "type": "local",
+                "command": ["python3", str(server), str(marker)],
+                "enabled": True,
+            },
+        },
+    }
+
+
+def _opencode_probe_result(
+        label: str, proc: subprocess.CompletedProcess, expected_tool: str,
+        side_effect: Path | None, should_exist: bool, reason: str = "",
+        required_output: str = "") -> str | None:
+    transcript = proc.stdout + "\n" + proc.stderr
+    events = _opencode_tool_events(proc.stdout)
+    if len(events) != 1 or events[0].get("tool") != expected_tool:
+        observed = [str(event.get("tool")) for event in events]
+        return (f"{label}: expected exactly one structured {expected_tool} tool_use, "
+                f"saw {observed}")
+    state = events[0].get("state")
+    if not isinstance(state, dict):
+        return f"{label}: structured tool_use has no state object"
+    status = state.get("status")
+    if should_exist:
+        if status != "completed":
+            return f"{label}: expected completed, got {status!r}"
+        if side_effect is not None and not side_effect.exists():
+            return f"{label}: allowed call completed but side effect is absent"
+        if required_output and required_output not in transcript:
+            return f"{label}: completed call did not expose {required_output!r}"
+        return None
+    if status != "error":
+        return f"{label}: expected structured error, got {status!r}"
+    if reason and reason not in str(state.get("error") or ""):
+        return f"{label}: tool error lacks RepoCharter reason {reason!r}"
+    if side_effect is not None and side_effect.exists():
+        return f"{label}: denied call still produced its side effect"
+    return None
+
+
+def _opencode_exact_checkout_problem(proc: subprocess.CompletedProcess) -> str | None:
+    events = _opencode_tool_events(proc.stdout)
+    if len(events) != 1 or events[0].get("tool") != "bash" \
+            or not isinstance(events[0].get("state"), dict):
+        return "no single structured Bash call"
+    state = events[0]["state"]
+    if state.get("status") != "error" or \
+            "RepoCharter" not in str(state.get("error") or ""):
+        return "ordinary user plugin did not return a structured RepoCharter denial"
+    return None
+
+
+def live_opencode_self_test(repo: Path, model: str | None) -> tuple[list[str], str]:
+    """Fire OpenCode Bash/write/MCP deny-and-allow calls and observe side effects."""
+    if shutil.which("opencode") is None:
+        return ["OpenCode is requested but the `opencode` executable is unavailable"], ""
+    if model and shutil.which("ollama") is None:
+        return ["--opencode-model requires the `ollama` executable"], ""
+    try:
+        version_proc = subprocess.run(
+            ["opencode", "--version"], capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"could not read the installed OpenCode version ({exc})"], ""
+    version = version_proc.stdout.strip()
+    if version_proc.returncode != 0 or not version:
+        return ["could not read the installed OpenCode version"], ""
+    if os.environ.get("OPENCODE_PURE"):
+        return ["OPENCODE_PURE is set, so the RepoCharter plugin would be bypassed"], version
+    if os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG"):
+        return [
+            "OPENCODE_DISABLE_PROJECT_CONFIG is set; that launch mode is outside the measured "
+            "OpenCode claim"
+        ], version
+
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=".agentkit-opencode-self-test.", dir=repo) as raw:
+        probe = Path(raw) / "repo"
+        probe.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=probe, check=True)
+        (probe / "AGENTS.md").write_text(
+            "# RepoCharter OpenCode probe\n\nUse exactly the named tool once. "
+            "Do not inspect files, retry, or substitute another tool.\n",
+            encoding="utf-8",
+        )
+        _copy_opencode_probe_adapter(repo, probe)
+        probe_digest = opencode_adapter_digest(probe)
+        if not probe_digest:
+            return ["disposable OpenCode probe adapter could not be digested"], version
+        probe_env = {
+            "REPO_CHARTER_OPENCODE_PROMOTION_ROOT": str(probe.resolve()),
+            "REPO_CHARTER_OPENCODE_PROMOTION_SHA256": probe_digest,
+        }
+        compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
+        compat = json.loads(json.dumps(compat))
+        compat["agentkitVersion"] = KIT_VERSION
+        compat.setdefault("enforcement", {})["opencode"] = "advisory"
+        (compat.get("enforcementEvidence") or {}).pop("opencode", None)
+        compat["policy"] = {
+            "protectedBranches": ["main", "master"],
+            "denyBashPatterns": [{
+                "pattern": "opencode-bash-denied[.]txt",
+                "reason": "AGENTKIT_OPENCODE_BASH_PROBE_DENIED",
+            }],
+            "askBashPatterns": [{
+                "pattern": "opencode-ask-denied[.]txt",
+                "reason": "AGENTKIT_OPENCODE_ASK_PROBE_DENIED",
+            }],
+            "denyWritePaths": [{
+                "glob": "blocked.txt",
+                "reason": "AGENTKIT_OPENCODE_WRITE_PROBE_DENIED",
+            }],
+            "denyMcpTools": [{
+                "pattern": "^mcp__agentkit_probe__danger$",
+                "reason": "AGENTKIT_OPENCODE_MCP_PROBE_DENIED",
+            }],
+            "measureOnWrite": [{
+                "glob": "measured.txt",
+                "measure": "line-count",
+                "reason": "AGENTKIT_OPENCODE_MEASUREMENT",
+            }],
+        }
+        write_json(probe / ".agents" / "compatibility.json", compat)
+
+        server = Path(raw) / "mcp_probe.py"
+        marker = probe / "mcp-call-ran.txt"
+        server.write_text(MCP_PROBE_SERVER, encoding="utf-8")
+        server.chmod(0o755)
+        write_json(probe / "opencode.json", _opencode_probe_config(server, marker))
+
+        cases = [
+            (
+                "Bash denial",
+                "Use bash exactly once to run: touch opencode-bash-denied.txt. Stop after the attempt.",
+                "bash", probe / "opencode-bash-denied.txt", False,
+                "AGENTKIT_OPENCODE_BASH_PROBE_DENIED", "",
+            ),
+            (
+                "confirmation-class denial",
+                "Use bash exactly once to run: touch opencode-ask-denied.txt. Stop after the attempt.",
+                "bash", probe / "opencode-ask-denied.txt", False,
+                "AGENTKIT_OPENCODE_ASK_PROBE_DENIED", "",
+            ),
+            (
+                "write denial",
+                "Use write exactly once to create blocked.txt containing PROBE. Stop after the attempt.",
+                "write", probe / "blocked.txt", False,
+                "AGENTKIT_OPENCODE_WRITE_PROBE_DENIED", "",
+            ),
+            (
+                "MCP denial",
+                "Call agentkit_probe_danger exactly once with no arguments. Stop after the attempt.",
+                "agentkit_probe_danger", marker, False,
+                "AGENTKIT_OPENCODE_MCP_PROBE_DENIED", "",
+            ),
+            (
+                "Bash allow",
+                "Use bash exactly once to run: touch opencode-bash-allowed.txt. Stop after it completes.",
+                "bash", probe / "opencode-bash-allowed.txt", True, "", "",
+            ),
+            (
+                "write allow and measurement",
+                "Use write exactly once to create measured.txt containing two lines: ONE and TWO. Stop after it completes.",
+                "write", probe / "measured.txt", True, "", "RepoCharter measurement — AFTER",
+            ),
+            (
+                "MCP allow",
+                "Call agentkit_probe_safe exactly once with no arguments. Stop after it completes.",
+                "agentkit_probe_safe", marker, True, "", "",
+            ),
+        ]
+        for label, prompt, tool, side_effect, should_exist, reason, required in cases:
+            if side_effect == marker and side_effect.exists():
+                side_effect.unlink()
+            attempts = 0
+            while True:
+                attempts += 1
+                try:
+                    proc = _run_opencode(probe, prompt, model, probe_env)
+                except subprocess.TimeoutExpired:
+                    problem = f"{label}: OpenCode timed out"
+                else:
+                    problem = _opencode_probe_result(
+                        label, proc, tool, side_effect, should_exist, reason, required,
+                    )
+                # A model can occasionally answer without calling the named tool. One fresh
+                # retry is safe only while no effect exists; the scored turn must still contain
+                # exactly one intended structured call. Timeouts and effectful ambiguity fail.
+                retryable = bool(
+                    problem
+                    and "expected exactly one structured" in problem
+                    and not side_effect.exists()
+                    and attempts < 2
+                )
+                if not retryable:
+                    break
+                print(f"  note  live OpenCode {label}: no effectful intended call; retrying once")
+            print(f"  {'pass ' if problem is None else 'FAIL '} live OpenCode {label}")
+            if problem:
+                failures.append(problem)
+
+        # OpenCode runs hooks sequentially over the same mutable output. Exercise the
+        # adapter's deep freeze in-process: both nested mutation and args replacement must
+        # fail, and neither the checked nor replacement command may execute.
+        try:
+            proc = _run_opencode(
+                probe,
+                "Use bash exactly once to run: touch opencode-mutation-safe.txt. Stop after the attempt.",
+                model,
+                {**probe_env, "REPO_CHARTER_OPENCODE_FREEZE_PROBE": "1"},
+            )
+        except subprocess.TimeoutExpired:
+            problem = "post-check argument mutation: OpenCode timed out"
+        else:
+            problem = _opencode_probe_result(
+                "post-check argument mutation", proc, "bash", probe / "opencode-mutation-ran.txt",
+                False, "mutation probe held",
+            )
+            if (probe / "opencode-mutation-safe.txt").exists():
+                problem = "post-check argument mutation: checked command executed after freeze probe"
+        print(f"  {'pass ' if problem is None else 'FAIL '} live OpenCode argument freeze")
+        if problem:
+            failures.append(problem)
+
+        # Corrupt a declaration only inside the disposable repo. A malformed policy must
+        # produce a structured tool error and no side effect, never a skipped plugin allow.
+        compat_path = probe / ".agents" / "compatibility.json"
+        healthy = compat_path.read_text(encoding="utf-8")
+        compat_path.write_text("{not json", encoding="utf-8")
+        malformed_marker = probe / "opencode-malformed-ran.txt"
+        config = read_json(probe / "opencode.json") or {}
+        config["permission"]["bash"]["touch opencode-malformed-ran.txt"] = "allow"
+        write_json(probe / "opencode.json", config)
+        try:
+            proc = _run_opencode(
+                probe,
+                "Use bash exactly once to run: touch opencode-malformed-ran.txt. Stop after the attempt.",
+                model,
+                probe_env,
+            )
+        except subprocess.TimeoutExpired:
+            problem = "malformed policy: OpenCode timed out"
+        else:
+            problem = _opencode_probe_result(
+                "malformed policy", proc, "bash", malformed_marker, False, "RepoCharter",
+            )
+        print(f"  {'pass ' if problem is None else 'FAIL '} live OpenCode malformed policy fails closed")
+        if problem:
+            failures.append(problem)
+        compat_path.write_text(healthy, encoding="utf-8")
+
+    # Fire one harmless denial in the actual checkout. This is the ordinary plugin-loading
+    # proof for the exact path; a disposable project plugin alone could not earn it.
+    target_prompt = (
+        "Use bash exactly once to run: git -c core.hooksPath=/dev/null status. "
+        "Do not retry and stop after the attempt."
+    )
+    target_digest = opencode_adapter_digest(repo)
+    target_env = {
+        "REPO_CHARTER_OPENCODE_PROMOTION_ROOT": str(repo.resolve()),
+        "REPO_CHARTER_OPENCODE_PROMOTION_SHA256": target_digest or "",
+    }
+    try:
+        target_proc = _run_opencode(repo, target_prompt, model, target_env)
+    except subprocess.TimeoutExpired:
+        target_problem = "exact-checkout denial: OpenCode timed out"
+    else:
+        detail = _opencode_exact_checkout_problem(target_proc)
+        target_problem = f"exact-checkout denial: {detail}" if detail else None
+    print(f"  {'pass ' if target_problem is None else 'FAIL '} live OpenCode exact-checkout denial")
+    if target_problem:
+        failures.append(target_problem)
+    return failures, version
+
+
 def copy_codex_probe_adapter(
         repo: Path, probe: Path, closure: codex_hooks_lib.CodexHookClosure) -> None:
     """Install the exact managed and preserved Codex adapter closure into a probe repo."""
@@ -2896,12 +3343,23 @@ def configchange_fixture_checks(repo: Path) -> int:
 
 def cmd_self_test(repo: Path, promote_codex: bool = False,
                   promote_claude: bool = False,
-                  promote_cursor: bool = False) -> int:
+                  promote_cursor: bool = False,
+                  promote_opencode: bool = False,
+                  opencode_model: str | None = None) -> int:
     print(f"repocharter self-test -> {repo}\n")
     hook_dir = repo / HOOK_DIR_NAME
     if not hook_dir.is_dir():
         print("  ERROR: no installed hooks. Run `repocharter apply` first.", file=sys.stderr)
         return 2
+
+    if promote_opencode:
+        installed, problem = install_opencode_plugin()
+        if problem:
+            print(f"  ERROR: {problem}", file=sys.stderr)
+            return 2
+        if installed:
+            print(f"  installed user-level OpenCode adapter at {opencode_plugin_path()}")
+            print("  note: restart any running OpenCode TUI; plugins load once per session")
 
     failures = 0
     for hook_name, payload, expected, label in CASES:
@@ -2976,7 +3434,7 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
 
     compat = read_json(repo / ".agents" / "compatibility.json", {}) or {}
     claims = [h for h, level in (compat.get("enforcement") or {}).items() if level == "blocking"]
-    reuse_current = promote_codex or promote_claude or promote_cursor
+    reuse_current = promote_codex or promote_claude or promote_cursor or promote_opencode
     reused: list[str] = []
     codex_version = ""
     codex_live_passed = False
@@ -3026,7 +3484,24 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
         cursor_live_passed = not live_failures
         for problem in live_failures:
             print(f"        {problem}")
-    unsupported = [h for h in claims if h not in {"codex", "claude-code", "cursor"}]
+    opencode_version = ""
+    opencode_live_passed = False
+    opencode_requested = "opencode" in claims or promote_opencode
+    if opencode_requested and reuse_current:
+        state = provider_promotion_state(repo, "opencode", compat)
+        if state["current"]:
+            opencode_requested = False
+            reused.append("opencode")
+            print("  pass  OpenCode promotion fast path: current checkout evidence, provider "
+                  "version, user plugin, and repository adapter bytes still match")
+    if opencode_requested:
+        live_failures, opencode_version = live_opencode_self_test(repo, opencode_model)
+        failures += len(live_failures)
+        opencode_live_passed = not live_failures
+        for problem in live_failures:
+            print(f"        {problem}")
+    unsupported = [h for h in claims
+                   if h not in {"codex", "claude-code", "cursor", "opencode"}]
     for harness_name in unsupported:
         print(f"  FAIL  {harness_name} is declared blocking but has no provider-specific live probe")
         failures += 1
@@ -3045,6 +3520,22 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
     # can never refresh or invalidate another's.
     recorded: list[str] = []
     pending_evidence: list[tuple[str, bool, dict, str]] = []
+    missing = object()
+    previous_opencode_level = (compat.get("enforcement") or {}).get("opencode", missing)
+    previous_opencode_evidence = (
+        compat.get("enforcementEvidence") or {}
+    ).get("opencode", missing)
+    opencode_local_path = checkout_evidence_path(repo, "opencode")
+    try:
+        previous_opencode_local = (
+            opencode_local_path.read_bytes()
+            if opencode_local_path is not None and opencode_local_path.is_file()
+            else None
+        )
+    except OSError as exc:
+        print(f"  ERROR: could not preserve existing OpenCode checkout evidence ({exc}).",
+              file=sys.stderr)
+        return 1
     for harness_name, requested, promote, version, digest_of, summary in (
         ("codex", codex_live_passed, promote_codex, codex_version, codex_adapter_digest,
          "live Bash, apply_patch, and MCP denials"),
@@ -3052,6 +3543,10 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
          "live Bash, Write, and MCP denials, target settings, trust, and the ConfigChange fixture"),
         ("cursor", cursor_live_passed, promote_cursor, cursor_version, cursor_adapter_digest,
          "live Shell, Write/Delete, and MCP deny/allow probes plus exact-checkout workspace trust"),
+        ("opencode", opencode_live_passed, promote_opencode, opencode_version,
+         opencode_adapter_digest,
+         "live Bash/write/MCP deny/allow, ask-as-deny, measurement, malformed-policy, "
+         "argument-freeze, and exact-checkout probes"),
     ):
         if not requested:
             continue
@@ -3095,6 +3590,51 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
             print(f"  compatibility.json sets {harness_name} enforcement to blocking.")
     if recorded:
         write_json(repo / ".agents" / "compatibility.json", compat)
+
+    # The promotion environment authorizes only the bootstrap matrix. Once candidate
+    # evidence exists, start one ordinary session with no authorization variables and prove
+    # that the user plugin accepts the exact private attestation. Roll back only OpenCode's
+    # candidate records if this last operational step fails.
+    if "opencode" in recorded:
+        prompt = (
+            "Use bash exactly once to run: git -c core.hooksPath=/dev/null status. "
+            "Do not retry and stop after the attempt."
+        )
+        try:
+            attested_proc = _run_opencode(repo, prompt, opencode_model)
+        except subprocess.TimeoutExpired:
+            attested_problem = "OpenCode timed out"
+        else:
+            attested_problem = _opencode_exact_checkout_problem(attested_proc)
+        if attested_problem:
+            print(f"  FAIL  live OpenCode ordinary attested checkout: {attested_problem}")
+            failures += 1
+            opencode_live_passed = False
+            recorded.remove("opencode")
+            enforcement = compat.setdefault("enforcement", {})
+            evidence = compat.setdefault("enforcementEvidence", {})
+            if previous_opencode_level is missing:
+                enforcement.pop("opencode", None)
+            else:
+                enforcement["opencode"] = previous_opencode_level
+            if previous_opencode_evidence is missing:
+                evidence.pop("opencode", None)
+            else:
+                evidence["opencode"] = previous_opencode_evidence
+            write_json(repo / ".agents" / "compatibility.json", compat)
+            try:
+                if opencode_local_path is not None:
+                    if previous_opencode_local is None:
+                        opencode_local_path.unlink(missing_ok=True)
+                    else:
+                        opencode_local_path.write_bytes(previous_opencode_local)
+            except OSError as exc:
+                print(f"  ERROR: could not restore prior OpenCode checkout evidence ({exc}).",
+                      file=sys.stderr)
+                return 1
+            print("  OpenCode candidate claim and checkout evidence rolled back.")
+        else:
+            print("  pass  live OpenCode ordinary attested exact-checkout denial")
     resulting_claims = [h for h, level in (compat.get("enforcement") or {}).items()
                         if level == "blocking"]
     if resulting_claims:
@@ -3102,6 +3642,7 @@ def cmd_self_test(repo: Path, promote_codex: bool = False,
             "codex": codex_live_passed,
             "claude-code": claude_live_passed,
             "cursor": cursor_live_passed,
+            "opencode": opencode_live_passed,
         }
         tested = [h for h in resulting_claims if proven.get(h)]
         direct = [h for h in resulting_claims if not proven.get(h) and h not in reused]
@@ -3271,6 +3812,12 @@ def main() -> int:
     p.add_argument("--promote-cursor", action="store_true",
                    help="run live Cursor Shell/Write/Delete/MCP and exact-checkout trust probes, "
                         "then mark Cursor blocking only on success")
+    p.add_argument("--promote-opencode", action="store_true",
+                   help="install the managed user plugin, run live OpenCode Bash/write/MCP "
+                        "and exact-checkout probes, then mark local CLI enforcement blocking")
+    p.add_argument("--opencode-model", default=None,
+                   help="run OpenCode probes through `ollama launch opencode --model MODEL`; "
+                        "omit when ordinary OpenCode already has a usable default model")
 
     p = sub.add_parser("census", help="Phase-0 measurement")
     p.add_argument("--repo", default="."); p.add_argument("--json", action="store_true")
@@ -3308,7 +3855,8 @@ def main() -> int:
         return cmd_verify(repo, args.effective, args.strict, args.json, args.agnix)
     if args.command == "self-test":
         return cmd_self_test(
-            repo, args.promote_codex, args.promote_claude, args.promote_cursor
+            repo, args.promote_codex, args.promote_claude, args.promote_cursor,
+            args.promote_opencode, args.opencode_model
         )
     if args.command == "census":
         return cmd_census(repo, args.json)

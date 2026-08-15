@@ -29,7 +29,8 @@ const providers = [
     name: "OpenCode",
     monogram: "OC",
     context: "Native context",
-    guardrails: "Advisory",
+    guardrails: "Verified local CLI",
+    verified: true,
   },
   {
     name: "Hermes Agent",
@@ -68,7 +69,7 @@ const steps = [
     number: "03",
     title: "Wire each harness",
     body: "Small provider adapters connect the same charter and policy to the controls each coding-agent harness really exposes.",
-    file: "CLAUDE.md  ·  .codex/hooks.json  ·  .cursor/hooks.json",
+    file: "CLAUDE.md  ·  provider hooks  ·  promoted user plugin",
   },
   {
     number: "04",
@@ -247,7 +248,7 @@ export default function Home() {
           </div>
 
           <div className="shell proof-strip reveal reveal--5" aria-label="RepoCharter facts">
-            <div><strong>467</strong><span>dependency-free checks</span></div>
+            <div><strong>503</strong><span>dependency-free checks</span></div>
             <div><strong>0</strong><span>CLI runtime dependencies</span></div>
             <div><strong>1</strong><span>canonical charter</span></div>
             <div><strong>5+</strong><span>agent harnesses reached</span></div>
@@ -410,8 +411,10 @@ export default function Home() {
             </div>
             <p className="compatibility-note">
               <InfoIcon /> Verified enforcement is earned per provider, checkout, hook hash, and probe matrix.
-              Cursor verification covers local Agent/CLI, not Tab or Cloud MCP. Advisory means “use
-              the shared context and pre-commit gate,” not “mechanically blocked.”
+              Cursor verification covers local Agent/CLI, not Tab or Cloud MCP. OpenCode covers
+              ordinary local CLI/TUI sessions, not pure, attached, or cloud execution; confirmation
+              rules deny. Advisory means “use the shared context and pre-commit gate,” not
+              “mechanically blocked.”
             </p>
           </div>
         </section>
@@ -460,7 +463,7 @@ export default function Home() {
             <p className="kicker">Agent-operated migration</p>
             <h2>Bring a repository under one charter.</h2>
             <p>
-              Clone RepoCharter, open the checkout in Codex, Claude Code, or Cursor, and invoke the bundled
+              Clone RepoCharter, open the checkout in Codex, Claude Code, Cursor, or OpenCode, and invoke the bundled
               migration skill. It measures first, owns the upgrade, and stops before external
               actions.
             </p>
